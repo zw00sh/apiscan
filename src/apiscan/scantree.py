@@ -131,13 +131,10 @@ class ScanTree:
     # ------------------------------------------------------------------
 
     async def initialize(self, send_fn) -> None:
-        """Establish root baselines with random + error-shape probes.
+        """Establish root baselines by probing random paths.
 
-        Sends probes in parallel for all methods.  Each method gets:
-        - 2 random-path probes (default handler)
-        - 1 encoded-traversal probe (WAF/proxy rejection)
-        - 1 extension probe (extension-specific handlers)
-        - 1 trailing-slash probe (slash-specific behaviour)
+        Sends 2 random-path probes per method in parallel to capture the
+        default handler response for each HTTP verb.
         """
         async def _probe(method: str, path: str) -> tuple[str, ResponseSignature | None]:
             try:
@@ -146,18 +143,13 @@ class ScanTree:
             except Exception:
                 return method, None
 
-        # Build all probe tasks
         tasks = []
         for method in _ALTERNATE_METHODS:
             tasks.append(_probe(method, f"/{_random_segment()}"))
             tasks.append(_probe(method, f"/{_random_segment()}"))
-            tasks.append(_probe(method, "/%2e%2e"))
-            tasks.append(_probe(method, f"/{_random_segment()}.php"))
-            tasks.append(_probe(method, f"/{_random_segment()}/"))
 
         results = await asyncio.gather(*tasks)
 
-        # Group by method, build baselines
         by_method: dict[str, list[ResponseSignature]] = {}
         for method, sig in results:
             if sig is not None:
@@ -170,18 +162,18 @@ class ScanTree:
     # Depth-first walk with parallel prefix probing
     # ------------------------------------------------------------------
 
-    async def walk(self, send_fn) -> AsyncIterator[Route | BoundaryProbe]:
+    async def walk(self, send_fn, tracker=None) -> AsyncIterator[Route | BoundaryProbe]:
         """Depth-first iteration.  Probes intermediate nodes and yields
         boundary discoveries before yielding routes."""
-        async for item in self._walk(self._root, "", send_fn):
+        async for item in self._walk(self._root, "", send_fn, tracker):
             yield item
 
     async def _walk(
-        self, node: _Node, prefix: str, send_fn,
+        self, node: _Node, prefix: str, send_fn, tracker=None,
     ) -> AsyncIterator[Route | BoundaryProbe]:
         # Probe this node for handler boundaries (if it has children)
         if node.children and prefix:
-            async for bp in self._probe_node(node, prefix, send_fn):
+            async for bp in self._probe_node(node, prefix, send_fn, tracker):
                 yield bp
 
         # Yield this node's routes
@@ -191,13 +183,20 @@ class ScanTree:
         # Recurse into children in insertion order
         for seg in node._insertion_order:
             child_prefix = f"{prefix}/{seg}" if prefix else f"/{seg}"
-            async for item in self._walk(node.children[seg], child_prefix, send_fn):
+            async for item in self._walk(node.children[seg], child_prefix, send_fn, tracker):
                 yield item
 
     async def _probe_node(
-        self, node: _Node, prefix: str, send_fn,
+        self, node: _Node, prefix: str, send_fn, tracker=None,
     ) -> AsyncIterator[BoundaryProbe]:
         """Probe a node in parallel for all methods, yield boundary discoveries."""
+        # Count methods that actually need probing
+        methods_to_probe = [m for m in _ALTERNATE_METHODS
+                            if m not in node.baselines
+                            and self.lookup_baseline(prefix, m) is not None
+                            and (self.lookup_baseline(prefix, m) or (None,))[0] != prefix]
+        if methods_to_probe and tracker:
+            tracker.plan(len(methods_to_probe))
 
         async def _probe_method(method: str) -> tuple[str, ResponseSignature | None, Baseline | None]:
             if method in node.baselines:
@@ -224,19 +223,31 @@ class ScanTree:
         # Fire all method probes in parallel
         results = await asyncio.gather(*[_probe_method(m) for m in _ALTERNATE_METHODS])
 
-        # Process results: register baselines, yield boundary probes
-        for method, probe_sig, ancestor_baseline in results:
-            if probe_sig is None:
-                continue
+        # Collect methods that need a second variance probe
+        discoveries = [(m, sig, bl) for m, sig, bl in results if sig is not None]
+        if not discoveries:
+            return
 
-            # Second probe for variance detection
+        # Add variance probes to the total
+        if tracker:
+            tracker.plan(len(discoveries))
+
+        # Fire all variance probes in parallel
+        async def _variance_probe(method: str) -> tuple[str, ResponseSignature | None]:
             extra_path = f"{prefix.rstrip('/')}/{_random_segment()}"
             try:
-                extra_sig = await send_fn(method, extra_path, None, None)
-                sigs = [probe_sig, extra_sig]
+                sig = await send_fn(method, extra_path, None, None)
+                return method, sig
             except Exception:
-                sigs = [probe_sig]
+                return method, None
 
+        variance_results = await asyncio.gather(*[_variance_probe(m) for m, _, _ in discoveries])
+        variance_by_method = {m: sig for m, sig in variance_results}
+
+        # Register baselines and yield boundary probes
+        for method, probe_sig, ancestor_baseline in discoveries:
+            extra_sig = variance_by_method.get(method)
+            sigs = [probe_sig, extra_sig] if extra_sig else [probe_sig]
             node.baselines[method] = build_baseline(sigs)
             yield BoundaryProbe(
                 prefix=prefix,

@@ -161,3 +161,25 @@ class TestScanIntegration:
         # The /admin boundary should be reported (403 json vs 404 html root)
         boundary_results = [r for r in results if "probe:" in r.reason]
         assert len(boundary_results) >= 1
+
+    @pytest.mark.asyncio
+    async def test_progress_count_matches_route_count(self, test_server_url):
+        """Progress completed count should equal route count, not inflated by
+        boundary probes or multi-finding alternate methods."""
+        routes = [
+            Route(template_path="/api/v1/users", method="GET"),
+            Route(template_path="/admin/dashboard", method="GET"),
+            Route(template_path="/admin/settings", method="GET"),
+        ]
+        progress_calls = []
+
+        def on_progress(findings_delta: int) -> None:
+            progress_calls.append(findings_delta)
+
+        await scan(
+            test_server_url, routes, concurrency=1, timeout=5.0,
+            on_progress=on_progress,
+        )
+        # Exactly one on_progress call per route (3 routes = 3 calls)
+        # Boundary probes should NOT increment progress
+        assert len(progress_calls) == len(routes)

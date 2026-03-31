@@ -183,6 +183,47 @@ class TestPrefixProbing:
         assert tree.lookup_baseline("/foo/bar", "GET")[0] == "/"
 
     @pytest.mark.asyncio
+    async def test_initialize_only_random_probes(self):
+        """Initialization should only send random-path probes, not error shape probes.
+
+        Error shape probes (/%2e%2e, .php, trailing slash) can return different
+        responses that poison the baseline, making content_length and status_code
+        unstable and causing false positives.
+        """
+        tree = ScanTree()
+        probed_paths: list[str] = []
+
+        async def mock_send(method, path, headers=None, body=None):
+            probed_paths.append(path)
+            return _sig(status_code=404, content_type="application/json", content_length=48)
+
+        await tree.initialize(mock_send)
+
+        # All probes should be random hex paths — no %2e%2e, .php, or trailing slash
+        for path in probed_paths:
+            assert "%2e" not in path, f"Error shape probe found: {path}"
+            assert ".php" not in path, f"Error shape probe found: {path}"
+            # Trailing slash check: only root-level random paths, not /{random}/
+            segments = [s for s in path.split("/") if s]
+            assert len(segments) == 1, f"Multi-segment probe found: {path}"
+
+    @pytest.mark.asyncio
+    async def test_initialize_baseline_stable(self):
+        """Root baseline should have stable fields when target returns consistent responses."""
+        tree = ScanTree()
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=404, content_type="application/json", content_length=48)
+
+        await tree.initialize(mock_send)
+
+        bl = tree._root.baselines.get("GET")
+        assert bl is not None
+        assert "status_code" in bl.stable_fields
+        assert "content_type" in bl.stable_fields
+        assert "content_length" in bl.stable_fields
+
+    @pytest.mark.asyncio
     async def test_boundary_probes_before_routes(self):
         """BoundaryProbe events should come before routes at the same node."""
         tree = ScanTree([_route("/api/v1/users")])

@@ -241,11 +241,13 @@ class InferenceEngine:
         status_blacklist: set[int] | None = None,
         status_whitelist: set[int] | None = None,
         on_filtered=None,
+        tracker=None,
     ) -> None:
         self._tree = tree
         self._status_blacklist = status_blacklist
         self._status_whitelist = status_whitelist
         self._on_filtered_cb = on_filtered
+        self._tracker = tracker
 
     def _on_filtered(self, route: Route, path: str, sig: ResponseSignature, reason: str) -> None:
         if self._on_filtered_cb:
@@ -331,6 +333,8 @@ class InferenceEngine:
             )
 
         # Verification: method change probe
+        if self._tracker:
+            self._tracker.plan(1)
         method_probe_status: int | None = None
         alt_method = [m for m in _ALTERNATE_METHODS if m != route.method][0]
         try:
@@ -376,6 +380,8 @@ class InferenceEngine:
         """
         path_len = len(path.lstrip("/"))
         alt_methods = [m for m in _ALTERNATE_METHODS if m != route.method]
+        if self._tracker:
+            self._tracker.plan(len(alt_methods))
 
         # Fire all probes in parallel
         async def _probe(method: str) -> tuple[str, ResponseSignature | None]:
@@ -386,6 +392,12 @@ class InferenceEngine:
                 return method, None
 
         results = await asyncio.gather(*[_probe(m) for m in alt_methods])
+
+        # Find the baseline prefix that the original route matched against.
+        # Only consider alternate methods that have a baseline at the same
+        # prefix or deeper — not a distant root fallback.
+        original_node = self._tree.lookup_baseline(path, route.method)
+        match_prefix = original_node[0] if original_node else "/"
 
         # Filter and check each against its method's baseline
         deviations: list[tuple[str, ResponseSignature, Baseline]] = []
@@ -400,7 +412,13 @@ class InferenceEngine:
             node = self._tree.lookup_baseline(path, method)
             if node is None:
                 continue
-            _, method_baseline = node
+            bl_prefix, method_baseline = node
+            # Skip methods whose baseline is at a more distant ancestor than
+            # the original route's match.  A root fallback when the boundary
+            # was probed for all methods means this method matched the ancestor
+            # during probing — nothing new to discover.
+            if len(bl_prefix) < len(match_prefix):
+                continue
             if matches_baseline(sig, method_baseline, path_len) is not None:
                 continue
 

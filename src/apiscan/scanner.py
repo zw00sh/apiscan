@@ -44,7 +44,36 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# Result building (shared by all finding paths)
+# Request tracker — single object shared across tree, inference, and scanner
+# ---------------------------------------------------------------------------
+
+class RequestTracker:
+    """Tracks planned and completed HTTP requests.
+
+    Passed to the scan tree and inference engine so they can call
+    :meth:`plan` before sending batches.  The scanner calls :meth:`tick`
+    after each completed request.  The progress tracker reads
+    :attr:`sent` and :attr:`planned` directly.
+    """
+
+    def __init__(self, initial_planned: int = 0, on_tick: Callable[[], None] | None = None) -> None:
+        self.sent = 0
+        self.planned = initial_planned
+        self._on_tick = on_tick
+
+    def plan(self, n: int) -> None:
+        """Register *n* additional requests that will be sent."""
+        self.planned += n
+
+    def tick(self) -> None:
+        """Record one completed HTTP request."""
+        self.sent += 1
+        if self._on_tick:
+            self._on_tick()
+
+
+# ---------------------------------------------------------------------------
+# Result building
 # ---------------------------------------------------------------------------
 
 def _finding_to_result(
@@ -94,13 +123,19 @@ async def scan(
     on_result: Callable[[ScanResult], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
     on_filtered: Callable[[str, str, int, str], None] | None = None,
+    tracker: RequestTracker | None = None,
 ) -> tuple[list[ScanResult], ScanTree]:
     """Scan *target_url* with the given routes. Returns (findings, tree)."""
     base_url = target_url.rstrip("/")
     limiter = RateLimiter(rate_limit) if rate_limit else None
     results: list[ScanResult] = []
+    if tracker is None:
+        tracker = RequestTracker()
 
     tree = ScanTree(routes)
+
+    # Initial planned: root init (10) + 1 per route
+    tracker.plan(10 + len(tree))
 
     def _inference_filtered(route, path, sig, reason):
         if on_filtered:
@@ -111,6 +146,7 @@ async def scan(
         status_blacklist=status_blacklist,
         status_whitelist=status_whitelist,
         on_filtered=_inference_filtered,
+        tracker=tracker,
     )
 
     async with httpx.AsyncClient(
@@ -135,6 +171,7 @@ async def scan(
                 content=body.encode() if body else None,
                 timeout=timeout,
             )
+            tracker.tick()
             return compute_signature(
                 resp.status_code, dict(resp.headers), resp.content, path,
             )
@@ -145,24 +182,16 @@ async def scan(
         # Connection failure tracking
         conn_failures = 0
 
-        # -- Emit a finding through the shared pipeline --------------------
-
         def _emit(finding: Finding, **kw) -> None:
             result = _finding_to_result(finding, base_url, **kw)
             results.append(result)
             if on_result:
                 on_result(result)
-            if on_progress:
-                on_progress(1)
-
-        # -- Handle a boundary probe --------------------------------------
 
         def _handle_boundary(probe: BoundaryProbe) -> None:
             finding = engine.classify_boundary(probe)
             if finding is not None:
                 _emit(finding)
-
-        # -- Handle a route ------------------------------------------------
 
         async def _handle_route(route: Route) -> None:
             nonlocal conn_failures
@@ -200,6 +229,7 @@ async def scan(
                 return
 
             conn_failures = 0
+            tracker.tick()
 
             sig = compute_signature(
                 resp.status_code, dict(resp.headers), resp.content, path,
@@ -213,16 +243,17 @@ async def scan(
                 return
 
             redirect_location = str(resp.url) if resp.history else None
-
-            # process() can return a single Finding or a list of Findings
-            findings = result if isinstance(result, list) else [result]
-            for finding in findings:
+            all_findings = result if isinstance(result, list) else [result]
+            for finding in all_findings:
                 _emit(
                     finding,
                     redirect_location=redirect_location,
                     request_headers=headers,
                     request_body=body_str,
                 )
+
+            if on_progress:
+                on_progress(len(all_findings))
 
         # -- Tree-driven orchestration ------------------------------------
 
@@ -244,7 +275,7 @@ async def scan(
         workers = [asyncio.create_task(_worker(queue)) for _ in range(concurrency)]
 
         try:
-            async for item in tree.walk(send_fn):
+            async for item in tree.walk(send_fn, tracker):
                 await queue.put(item)
             await queue.join()
         except (asyncio.CancelledError, KeyboardInterrupt):

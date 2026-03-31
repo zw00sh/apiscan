@@ -249,34 +249,37 @@ def braille_bar(pct: float) -> str:
 # ---------------------------------------------------------------------------
 
 class ProgressTracker:
-    def __init__(self, total: int, use_color: bool = True) -> None:
-        self.total = total
-        self.completed = 0
+    def __init__(self, route_total: int, use_color: bool = True, tracker=None) -> None:
+        self.route_total = route_total
+        self.routes_completed = 0
         self.findings = 0
-        self.hidden = 0  # deduped results sent to CSV/proxy but not printed
-        self.phase = "A"
-        self.phase_total = 0
-        self.phase_completed = 0
+        self.hidden = 0
+        self._tracker = tracker  # RequestTracker from scanner
         self._use_color = use_color
         self._last_print = 0.0
         self._start = time.monotonic()
         self._window: deque[float] = deque()
 
     def set_phase(self, phase: str, phase_total: int) -> None:
-        self.phase = phase
-        self.phase_total = phase_total
-        self.phase_completed = 0
+        pass  # kept for API compat
 
-    def update(self, findings_delta: int = 0) -> None:
-        self.completed += 1
-        self.phase_completed += 1
-        self.findings += findings_delta
+    def tick_request(self) -> None:
+        """Record a completed HTTP request for req/s calculation."""
         now = time.monotonic()
         self._window.append(now)
         cutoff = now - 3.0
         while self._window and self._window[0] <= cutoff:
             self._window.popleft()
-        if now - self._last_print >= 0.25 or self.completed == self.total:
+        if now - self._last_print >= 0.25:
+            self._print(now)
+            self._last_print = now
+
+    def update(self, findings_delta: int = 0) -> None:
+        """Record a completed route."""
+        self.routes_completed += 1
+        self.findings += findings_delta
+        now = time.monotonic()
+        if now - self._last_print >= 0.25 or self.routes_completed == self.route_total:
             self._print(now)
             self._last_print = now
 
@@ -285,26 +288,33 @@ class ProgressTracker:
         c = CYAN if self._use_color else ""
         g = GREEN if self._use_color else ""
         r = RESET if self._use_color else ""
-        elapsed = now - self._start
-        if elapsed > 0 and len(self._window) > 1:
+
+        # Route progress with braille bar
+        route_pct = self.routes_completed * 100 / self.route_total if self.route_total else 0
+        route_bar = braille_bar(route_pct)
+
+        # Request counts from tracker
+        reqs_sent = self._tracker.sent if self._tracker else 0
+        reqs_total = self._tracker.planned if self._tracker else 0
+
+        # Request rate from sliding window
+        if len(self._window) > 1:
             span = self._window[-1] - self._window[0]
             rps = (len(self._window) - 1) / span if span > 0 else 0
         else:
             rps = 0
-        total_pct = self.completed * 100 / self.total if self.total else 0
-        phase_pct = self.phase_completed * 100 / self.phase_total if self.phase_total else 0
-        phase_bar = braille_bar(phase_pct)
-        hidden_str = f" {d}| {DIM}{self.hidden} hidden{r}" if self.hidden else ""
-        # Clear the full line first to prevent leftover text from longer previous lines
+
+        hidden_str = f" {d}| {self.hidden} hidden{r}" if self.hidden else ""
+
         print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
-        line = (f"{d}[{self.completed}/{self.total}]{r} "
-                f"{d}[{total_pct:>3.0f}%]{r} "
-                f"{d}| {self.phase}{r} [{g}{phase_bar}{r}] "
-                f"{d}|{r} {c}{self.findings} routes{r} "
-                f"{d}| {rps:.0f} req/s{r}"
+        line = (f"[{g}{route_bar}{r}{d}{route_pct:02.0f}%{r}] | "
+                f"{d}{self.routes_completed}/{self.route_total} routes{r} "
+                f"| {d}{reqs_sent}/{reqs_total} reqs{r} "
+                f"{d}({rps:.0f} req/s){r} "
+                f"| {c}{self.findings} found{r} "
                 f"{hidden_str}")
         print(f"\r{line}", end="", flush=True, file=sys.stderr)
-        if self.completed == self.total:
+        if self.routes_completed == self.route_total:
             print(file=sys.stderr)
 
 

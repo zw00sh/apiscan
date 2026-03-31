@@ -381,3 +381,39 @@ class TestInferenceProcess:
         assert len(result) == 1  # POST and PUT grouped
         assert "POST" in result[0].reason
         assert "PUT" in result[0].reason
+
+    @pytest.mark.asyncio
+    async def test_skip_alternate_methods_when_boundary_covers_path(self):
+        """If a boundary probe already established per-method baselines at the
+        route's prefix, alternate method probing on a baseline-matched route
+        should not re-report what the boundary already discovered.
+
+        Example: boundary probe finds GET /users -> 403, POST /users -> 404.
+        Route GET /users/add matches GET baseline (403). Alternate method probe
+        sends POST /users/add -> 404, which matches POST baseline at /users.
+        Should NOT report POST /users/add as a finding since it just matches
+        the POST baseline.
+        """
+        tree, engine = _make_engine()
+        tree.insert(Route(template_path="/users/add", method="GET"))
+        # Root baselines
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+        tree.set_baseline("/", "POST", _baseline(_sig(status_code=404, content_type="text/html")))
+        # Boundary baselines at /users (as if tree probing discovered them)
+        tree.set_baseline("/users", "GET", _baseline(
+            _sig(status_code=403, content_type="application/json", content_length=131)))
+        tree.set_baseline("/users", "POST", _baseline(
+            _sig(status_code=404, content_type="application/json", content_length=111)))
+
+        route = Route(template_path="/users/add", method="GET")
+        candidate = _sig(status_code=403, content_type="application/json", content_length=131)
+
+        async def mock_send(method, path, headers=None, body=None):
+            if method == "POST":
+                # Matches POST baseline at /users — should NOT be a finding
+                return _sig(status_code=404, content_type="application/json", content_length=111)
+            return _sig(status_code=403, content_type="application/json", content_length=131)
+
+        result = await engine.process(route, candidate, "/users/add", mock_send)
+        # Should be fully filtered — no findings from alternate methods either
+        assert result is None

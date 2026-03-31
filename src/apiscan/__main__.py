@@ -391,8 +391,15 @@ async def _scan(args: argparse.Namespace) -> None:
         print(f"\r{' ' * 80}\r", end="")  # clear the status line
         print_banner(args.url, len(filtered_routes), unsafe_keywords, stats, use_color)
 
+    from apiscan.scanner import RequestTracker
+    req_tracker = RequestTracker(
+        on_tick=lambda: progress.tick_request() if progress else None,
+    )
+
     csv_writer = CSVWriter(args.output, replay_proxy=args.replay_proxy) if args.output else None
-    progress = ProgressTracker(len(filtered_routes), use_color) if not args.quiet else None
+    progress = ProgressTracker(len(filtered_routes), use_color, tracker=req_tracker) if not args.quiet else None
+    # Re-bind the tick callback now that progress exists
+    req_tracker._on_tick = progress.tick_request if progress else None
 
     # Replay proxy: re-send findings through a proxy (e.g. Burp) so they appear
     # in the proxy history for manual inspection and modification.
@@ -471,6 +478,7 @@ async def _scan(args: argparse.Namespace) -> None:
         on_result=on_result,
         on_progress=on_progress,
         on_filtered=on_filtered,
+        tracker=req_tracker,
     )
 
     elapsed = time.monotonic() - start
