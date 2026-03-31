@@ -19,6 +19,9 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 CYAN = "\033[36m"
+MAGENTA = "\033[35m"
+BLUE = "\033[34m"
+WHITE = "\033[37m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
@@ -65,15 +68,26 @@ def _status_color(status: int, use_color: bool) -> tuple[str, str]:
 
 
 def format_result(result: ScanResult, use_color: bool = True) -> str:
-    c_on, c_off = _status_color(result.status_code, use_color)
-    parts = [
-        f"{c_on}{result.status_code:>3}{c_off}",
-        f"{result.method:<7}",
-        f"{result.path}",
-        f"{result.content_length}B",
-        f"{result.word_count}W",
-        f"{result.line_count}L",
-    ]
+    sc_on, sc_off = _status_color(result.status_code, use_color)
+    if use_color:
+        d, r = DIM, RESET
+        parts = [
+            f"{sc_on}{result.status_code:>3}{sc_off}",
+            f"{CYAN}{result.method:<7}{RESET}",
+            f"{WHITE}{result.path}{RESET}",
+            f"{d}{result.content_length}B{r}",
+            f"{d}{result.word_count}W{r}",
+            f"{d}{result.line_count}L{r}",
+        ]
+    else:
+        parts = [
+            f"{result.status_code:>3}",
+            f"{result.method:<7}",
+            f"{result.path}",
+            f"{result.content_length}B",
+            f"{result.word_count}W",
+            f"{result.line_count}L",
+        ]
     line = " | ".join(parts)
     if result.original_method and result.original_method != result.method:
         hint = f" {DIM}(original: {result.original_method}){RESET}" if use_color else f" (original: {result.original_method})"
@@ -148,22 +162,34 @@ class ProgressTracker:
         self.findings = 0
         self._use_color = use_color
         self._last_print = 0.0
+        self._start = time.monotonic()
+        self._window: list[float] = []  # timestamps for RPS calculation
 
     def update(self, findings_delta: int = 0) -> None:
         self.completed += 1
         self.findings += findings_delta
         now = time.monotonic()
-        if now - self._last_print >= 0.5 or self.completed == self.total:
-            self._print()
+        self._window.append(now)
+        # Keep only last 3 seconds for rolling RPS
+        cutoff = now - 3.0
+        self._window = [t for t in self._window if t > cutoff]
+        if now - self._last_print >= 0.25 or self.completed == self.total:
+            self._print(now)
             self._last_print = now
 
-    def _print(self) -> None:
+    def _print(self, now: float) -> None:
         d = DIM if self._use_color else ""
+        c = CYAN if self._use_color else ""
         r = RESET if self._use_color else ""
-        print(
-            f"\r{d}[{self.completed}/{self.total}] {self.findings} findings{r}",
-            end="", flush=True, file=sys.stderr,
-        )
+        elapsed = now - self._start
+        if elapsed > 0 and len(self._window) > 1:
+            window_span = self._window[-1] - self._window[0]
+            rps = (len(self._window) - 1) / window_span if window_span > 0 else 0
+        else:
+            rps = 0
+        pct = self.completed * 100 // self.total if self.total else 0
+        line = f"\r{d}[{pct:>3}%] {self.completed}/{self.total} | {c}{self.findings} findings{r} {d}| {rps:.0f} req/s{r}"
+        print(f"{line:<60}", end="", flush=True, file=sys.stderr)
         if self.completed == self.total:
             print(file=sys.stderr)
 

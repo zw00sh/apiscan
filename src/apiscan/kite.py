@@ -277,7 +277,13 @@ def generate_value(crumb: Crumb) -> str:
 
     if k == "regex_string":
         try:
-            return exrex.getone(f.get("regex", "."))
+            import io, sys
+            old_stderr = sys.stderr
+            sys.stderr = io.StringIO()  # suppress exrex "[!] cannot handle" noise
+            try:
+                return exrex.getone(f.get("regex", "."))
+            finally:
+                sys.stderr = old_stderr
         except Exception:
             return "1"
 

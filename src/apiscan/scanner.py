@@ -240,20 +240,114 @@ async def scan(
         verify=False,
         headers=extra_headers or {},
     ) as client:
-        # Group routes by depth-1 prefix
-        groups = group_by_depth(routes, depth=1)
-
-        # Root preflight
+        # Root preflight for baseline
         root_baselines = await run_preflight(
             client, base_url, "/", timeout, semaphore, limiter,
         )
+
+        # Consecutive connection failure counter (not filtered responses)
+        conn_failures = 0
+
+        async def _scan_route(route: Route, baselines: list[WildcardResponse]) -> None:
+            nonlocal conn_failures
+            if conn_failures >= quarantine_threshold:
+                if on_progress:
+                    on_progress(0)
+                return
+
+            send_method = route.method
+            original_method = route.method
+            if not unsafe and route.method != "GET":
+                send_method = "GET"
+
+            path = render_path(route)
+            query = render_query(route)
+            url = f"{base_url}{path}"
+            if query:
+                url += f"?{query}"
+
+            headers = render_headers(route)
+            body_str = render_body(route) if send_method != "GET" else None
+            if body_str and not any(k.lower() == "content-type" for k in headers):
+                headers["Content-Type"] = "application/json"
+
+            async with semaphore:
+                if limiter:
+                    await limiter.acquire()
+                try:
+                    resp = await client.request(
+                        send_method, url,
+                        headers=headers,
+                        content=body_str.encode() if body_str else None,
+                        timeout=timeout,
+                    )
+                except (httpx.RequestError, httpx.HTTPStatusError):
+                    conn_failures += 1
+                    if on_progress:
+                        on_progress(0)
+                    return
+
+            # Connection succeeded — reset failure counter
+            conn_failures = 0
+
+            body = resp.content
+            status = resp.status_code
+            content_length = len(body)
+            words = body.count(b" ") + (1 if body else 0)
+            lines = body.count(b"\n") + (1 if body else 0)
+            resp_headers = dict(resp.headers)
+            path_len = len(path.lstrip("/"))
+
+            # Validator chain — filtered responses are normal, not quarantine-worthy
+            if should_filter_status(status, status_blacklist, status_whitelist):
+                if on_progress:
+                    on_progress(0)
+                return
+
+            if is_known_bad_site(status, content_length, words, lines, resp_headers):
+                if on_progress:
+                    on_progress(0)
+                return
+
+            if matches_wildcard(status, content_length, words, lines, path_len, baselines):
+                if on_progress:
+                    on_progress(0)
+                return
+
+            # Passed all validators — it's a finding
+            redirect_location = None
+            if resp.history:
+                redirect_location = str(resp.url)
+
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            result = ScanResult(
+                url=url,
+                method=send_method,
+                path=path,
+                status_code=status,
+                content_length=content_length,
+                word_count=words,
+                line_count=lines,
+                redirect_location=redirect_location,
+                original_method=original_method,
+                timestamp=ts,
+            )
+            results.append(result)
+            if on_result:
+                on_result(result)
+            if on_progress:
+                on_progress(1)
+
+        # Group routes by depth-1 prefix and launch all groups concurrently
+        groups = group_by_depth(routes, depth=1)
+        all_tasks: list[asyncio.Task] = []
 
         for prefix, group_routes in groups.items():
             # Per-prefix preflight
             prefix_baselines = await run_preflight(
                 client, base_url, prefix, timeout, semaphore, limiter,
             )
-            # Merge baselines (unique)
+            # Merge with root baselines
             seen = set(root_baselines)
             baselines = list(root_baselines)
             for bl in prefix_baselines:
@@ -261,109 +355,12 @@ async def scan(
                     seen.add(bl)
                     baselines.append(bl)
 
-            quarantine_count = 0
+            # Schedule all routes in this group (baselines captured by value)
+            for route in group_routes:
+                all_tasks.append(asyncio.create_task(_scan_route(route, baselines)))
 
-            async def _scan_route(route: Route) -> None:
-                nonlocal quarantine_count
-                if quarantine_count >= quarantine_threshold:
-                    if on_progress:
-                        on_progress(0)
-                    return
-
-                send_method = route.method
-                original_method = route.method
-                if not unsafe and route.method != "GET":
-                    send_method = "GET"
-
-                path = render_path(route)
-                query = render_query(route)
-                url = f"{base_url}{path}"
-                if query:
-                    url += f"?{query}"
-
-                headers = render_headers(route)
-                body_str = render_body(route) if send_method != "GET" else None
-                if body_str and not any(k.lower() == "content-type" for k in headers):
-                    headers["Content-Type"] = "application/json"
-
-                async with semaphore:
-                    if limiter:
-                        await limiter.acquire()
-                    try:
-                        resp = await client.request(
-                            send_method, url,
-                            headers=headers,
-                            content=body_str.encode() if body_str else None,
-                            timeout=timeout,
-                        )
-                    except (httpx.RequestError, httpx.HTTPStatusError):
-                        quarantine_count += 1
-                        if on_progress:
-                            on_progress(0)
-                        return
-
-                body = resp.content
-                status = resp.status_code
-                content_length = len(body)
-                words = body.count(b" ") + (1 if body else 0)
-                lines = body.count(b"\n") + (1 if body else 0)
-                resp_headers = dict(resp.headers)
-
-                # Strip leading slash for path_len calculation
-                path_len = len(path.lstrip("/"))
-
-                # Validator chain
-                if should_filter_status(status, status_blacklist, status_whitelist):
-                    quarantine_count += 1
-                    if on_progress:
-                        on_progress(0)
-                    return
-
-                if is_known_bad_site(status, content_length, words, lines, resp_headers):
-                    quarantine_count += 1
-                    if on_progress:
-                        on_progress(0)
-                    return
-
-                if matches_wildcard(status, content_length, words, lines, path_len, baselines):
-                    quarantine_count += 1
-                    if on_progress:
-                        on_progress(0)
-                    return
-
-                # Passed all validators — it's a finding
-                quarantine_count = 0  # reset on valid finding
-
-                redirect_location = None
-                if resp.history:
-                    redirect_location = str(resp.url)
-
-                ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-                result = ScanResult(
-                    url=url,
-                    method=send_method,
-                    path=path,
-                    status_code=status,
-                    content_length=content_length,
-                    word_count=words,
-                    line_count=lines,
-                    redirect_location=redirect_location,
-                    original_method=original_method,
-                    timestamp=ts,
-                )
-                results.append(result)
-                if on_result:
-                    on_result(result)
-                if on_progress:
-                    on_progress(1)
-                return
-
-            # Run all routes in this group concurrently
-            tasks = [asyncio.create_task(_scan_route(r)) for r in group_routes]
-            # Track progress for routes that don't call on_progress themselves
-            done_count = 0
-            for coro in asyncio.as_completed(tasks):
-                await coro
-                done_count += 1
+        # Await all tasks
+        for task in asyncio.as_completed(all_tasks):
+            await task
 
     return results

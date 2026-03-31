@@ -221,17 +221,28 @@ def _resolve_kite(args: argparse.Namespace) -> str:
 async def _scan(args: argparse.Namespace) -> None:
     use_color = supports_color() and not args.no_color
 
+    d = DIM if use_color else ""
+    r = RESET if use_color else ""
+
     kite_path = _resolve_kite(args)
-    routes = load_kite(kite_path)
-    filtered_routes, stats = apply_safety_filter(routes, args.unsafe)
 
     if not args.quiet:
+        print(f"  {d}loading {kite_path}...{r}", end="", flush=True)
+    routes = load_kite(kite_path)
+    if not args.quiet:
+        print(f"\r  {d}loaded {len(routes):,} routes, applying filters...{r}", end="", flush=True)
+    filtered_routes, stats = apply_safety_filter(routes, args.unsafe)
+    if not args.quiet:
+        print(f"\r{' ' * 60}\r", end="")  # clear the status line
         print_banner(args.url, len(filtered_routes), args.unsafe, stats, use_color)
 
     csv_writer = CSVWriter(args.output) if args.output else None
     progress = ProgressTracker(len(filtered_routes), use_color) if not args.quiet else None
 
     def on_result(result: ScanResult) -> None:
+        if progress:
+            # Clear the progress line before printing a finding
+            print(f"\r{' ' * 60}\r", end="", file=sys.stderr, flush=True)
         print(format_result(result, use_color))
         if csv_writer:
             csv_writer.write_result(result)
