@@ -1,4 +1,12 @@
-"""Test fixtures including a real ASGI HTTP server for integration tests."""
+"""Test fixtures including a real ASGI HTTP server for integration tests.
+
+The test server simulates a multi-service gateway:
+- Gateway default: 404 text/html
+- /api/v1/*: JSON service with method-aware routing
+- /api/v2/*: Different JSON service with soft-404 wildcard
+- /admin/*: Auth-required service with custom headers
+- /internal/metrics: Standalone plaintext service
+"""
 
 from __future__ import annotations
 
@@ -14,24 +22,25 @@ import uvicorn
 
 
 # ---------------------------------------------------------------------------
-# Minimal ASGI test application
+# Minimal ASGI test application — multi-service gateway simulation
 # ---------------------------------------------------------------------------
 
-# Known routes the test server handles
-_ROUTES: list[tuple[str, str, int, dict[str, Any]]] = [
-    # (method, path_pattern, status, response_body_fields)
+# /api/v1 routes — method-aware REST service
+_API_V1_ROUTES: list[tuple[str, str, int, dict[str, Any] | None]] = [
     ("GET", r"^/api/v1/users$", 200, {"users": ["alice", "bob"]}),
     ("GET", r"^/api/v1/users/(?P<id>[^/]+)$", 200, None),  # echoes id
     ("POST", r"^/api/v1/users$", 201, {"created": True}),
     ("PUT", r"^/api/v1/users/(?P<id>[^/]+)$", 200, {"updated": True}),
     ("DELETE", r"^/api/v1/users/(?P<id>[^/]+)$", 204, None),
     ("GET", r"^/api/v1/health$", 200, {"status": "ok"}),
-    ("GET", r"^/admin/shutdown$", 200, {"shutdown": "initiated"}),
-    ("GET", r"^/redirect$", 302, None),
 ]
 
-# Routes under /api/v2 are soft 404s (200 with fixed body)
+# /api/v2 — different service, soft 404 (always 200 json)
 _SOFT_404_BODY = json.dumps({"error": "not found", "code": 404}).encode()
+
+# /admin — auth-required service with custom headers
+_ADMIN_FORBIDDEN_BODY = json.dumps({"error": "forbidden"}).encode()
+_ADMIN_UNAUTHORIZED_BODY = json.dumps({"error": "unauthorized", "login": "/auth/login"}).encode()
 
 
 async def _app(scope: dict, receive: Any, send: Any) -> None:
@@ -41,7 +50,7 @@ async def _app(scope: dict, receive: Any, send: Any) -> None:
     method = scope["method"]
     path = scope["path"]
 
-    # /echo -- returns everything about the request
+    # /echo — mirrors request back
     if path == "/echo":
         body_parts = []
         while True:
@@ -63,7 +72,7 @@ async def _app(scope: dict, receive: Any, send: Any) -> None:
         await send({"type": "http.response.body", "body": echo})
         return
 
-    # /slow -- 5s delay
+    # /slow — 5s delay
     if path == "/slow":
         await asyncio.sleep(5)
         await send({"type": "http.response.start", "status": 200,
@@ -78,43 +87,83 @@ async def _app(scope: dict, receive: Any, send: Any) -> None:
         await send({"type": "http.response.body", "body": b""})
         return
 
-    # Soft 404s under /api/v2 (returns 200 with fixed body)
+    # /internal/metrics — standalone plaintext service (content-type boundary)
+    if path == "/internal/metrics" and method == "GET":
+        body = b"requests_total 12345\nerrors_total 42\n"
+        await send({"type": "http.response.start", "status": 200,
+                     "headers": [[b"content-type", b"text/plain"]]})
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    # /admin/* — auth-required service with custom headers
+    if path.startswith("/admin/"):
+        headers = [
+            [b"content-type", b"application/json"],
+            [b"x-request-id", b"req-abc-123"],
+        ]
+        if path == "/admin/dashboard":
+            await send({"type": "http.response.start", "status": 401,
+                         "headers": headers})
+            await send({"type": "http.response.body", "body": _ADMIN_UNAUTHORIZED_BODY})
+            return
+        # Everything else under /admin is 403 (admin wildcard)
+        await send({"type": "http.response.start", "status": 403,
+                     "headers": headers})
+        await send({"type": "http.response.body", "body": _ADMIN_FORBIDDEN_BODY})
+        return
+
+    # /api/v2/* — soft 404 (different service, always returns 200 json)
     if path.startswith("/api/v2/"):
         await send({"type": "http.response.start", "status": 200,
                      "headers": [[b"content-type", b"application/json"]]})
         await send({"type": "http.response.body", "body": _SOFT_404_BODY})
         return
 
-    # Check defined routes
-    for r_method, r_pattern, r_status, r_body_template in _ROUTES:
-        if r_method != method:
-            # Return 405 if path matches but method doesn't
+    # /api/v1/* — method-aware REST service
+    if path.startswith("/api/v1/"):
+        # Check for method match first
+        path_matched = False
+        for r_method, r_pattern, r_status, r_body_template in _API_V1_ROUTES:
             m = re.match(r_pattern, path)
             if m:
-                await send({"type": "http.response.start", "status": 405,
-                             "headers": [[b"content-type", b"text/plain"]]})
-                await send({"type": "http.response.body", "body": b"Method Not Allowed"})
-                return
-            continue
-        m = re.match(r_pattern, path)
-        if not m:
-            continue
-        groups = m.groupdict()
-        if r_status == 204:
-            await send({"type": "http.response.start", "status": 204, "headers": []})
-            await send({"type": "http.response.body", "body": b""})
+                path_matched = True
+                if r_method == method:
+                    groups = m.groupdict()
+                    if r_status == 204:
+                        await send({"type": "http.response.start", "status": 204, "headers": []})
+                        await send({"type": "http.response.body", "body": b""})
+                        return
+                    body = r_body_template or groups
+                    resp_body = json.dumps(body).encode()
+                    await send({"type": "http.response.start", "status": r_status,
+                                 "headers": [[b"content-type", b"application/json"]]})
+                    await send({"type": "http.response.body", "body": resp_body})
+                    return
+
+        if path_matched:
+            # Path exists but method doesn't match — 405 with Allow header
+            allowed = [r[0] for r in _API_V1_ROUTES if re.match(r[1], path)]
+            allow_header = ", ".join(sorted(set(allowed)))
+            await send({"type": "http.response.start", "status": 405,
+                         "headers": [
+                             [b"content-type", b"application/json"],
+                             [b"allow", allow_header.encode()],
+                         ]})
+            await send({"type": "http.response.body",
+                         "body": json.dumps({"error": "method not allowed"}).encode()})
             return
-        body = r_body_template or groups
-        resp_body = json.dumps(body).encode()
-        await send({"type": "http.response.start", "status": r_status,
+
+        # Unknown path under /api/v1 — JSON 404 (different from gateway default)
+        await send({"type": "http.response.start", "status": 404,
                      "headers": [[b"content-type", b"application/json"]]})
-        await send({"type": "http.response.body", "body": resp_body})
+        await send({"type": "http.response.body",
+                     "body": json.dumps({"error": "not found"}).encode()})
         return
 
-    # Default wildcard: 404 with path echoed in body (for baseline testing)
-    not_found_body = f"404 Not Found: {path}".encode()
+    # Gateway default: 404 text/html with path echoed
+    not_found_body = f"<html><body>404 Not Found: {path}</body></html>".encode()
     await send({"type": "http.response.start", "status": 404,
-                 "headers": [[b"content-type", b"text/plain"]]})
+                 "headers": [[b"content-type", b"text/html"]]})
     await send({"type": "http.response.body", "body": not_found_body})
 
 

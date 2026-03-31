@@ -1,196 +1,30 @@
-"""Async HTTP scanning engine with baseline detection and response validation."""
+"""Async HTTP scanning engine.
+
+Thin transport layer — sends requests, manages concurrency and rate limiting.
+All response classification is delegated to :mod:`apiscan.inference`.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import random
 import time
-from dataclasses import dataclass, field
 from typing import Callable
-from uuid import uuid4
 
 import httpx
 
+from apiscan.inference import (
+    Finding,
+    InferenceEngine,
+    ResponseSignature,
+    compute_signature,
+)
 from apiscan.kite import Route, render_body, render_headers, render_path, render_query
+from apiscan.output import ScanResult
 
 
 # ---------------------------------------------------------------------------
-# Baseline / wildcard detection
+# Complexity phasing (unchanged from previous implementation)
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class WildcardResponse:
-    status_code: int
-    content_length: int
-    adjusted_content_length: int
-    adjustment_scale: int
-    word_count: int
-    line_count: int
-
-
-def compute_baseline(body: bytes, path: str) -> WildcardResponse:
-    """Compute wildcard response characteristics from a preflight probe."""
-    # Strip leading slash for replacement calculation
-    basepath = path.lstrip("/")
-    status_code = -1  # filled by caller
-    content_length = len(body)
-    word_count = body.count(b" ")
-    line_count = body.count(b"\n")
-    if content_length > 0:
-        word_count += 1
-        line_count += 1
-
-    adjusted_body = body.replace(basepath.encode(), b"")
-    adjusted_content_length = len(adjusted_body)
-    diff = content_length - adjusted_content_length
-    scale = 0
-    if diff > 0 and len(basepath) > 0:
-        scale = diff // len(basepath)
-
-    return WildcardResponse(
-        status_code=status_code,
-        content_length=content_length,
-        adjusted_content_length=adjusted_content_length,
-        adjustment_scale=scale,
-        word_count=word_count,
-        line_count=line_count,
-    )
-
-
-def _make_baseline(status: int, body: bytes, path: str) -> WildcardResponse:
-    bl = compute_baseline(body, path)
-    # Replace the placeholder status_code
-    return WildcardResponse(
-        status_code=status,
-        content_length=bl.content_length,
-        adjusted_content_length=bl.adjusted_content_length,
-        adjustment_scale=bl.adjustment_scale,
-        word_count=bl.word_count,
-        line_count=bl.line_count,
-    )
-
-
-def _preflight_probes(prefix: str) -> list[tuple[str, str]]:
-    """Generate preflight probe (method, path) pairs for a given prefix."""
-    rand = lambda: uuid4().hex[:16]
-    base = prefix.rstrip("/")
-    return [
-        ("GET", f"{base}/{rand()}/{rand()}"),
-        ("GET", f"{base}/"),
-        ("GET", f"{base}/{rand()}"),
-        ("POST", f"{base}/"),
-        ("PUT", f"{base}/{rand()}"),
-        ("DELETE", f"{base}/{rand()}"),
-    ]
-
-
-async def run_preflight(
-    client: httpx.AsyncClient, base_url: str, prefix: str,
-    timeout: float, semaphore: asyncio.Semaphore,
-    rate_limiter: RateLimiter | None = None,
-) -> list[WildcardResponse]:
-    """Send preflight probes and collect unique baselines."""
-    baselines: list[WildcardResponse] = []
-    seen: set[WildcardResponse] = set()
-    probes = _preflight_probes(prefix)
-
-    async def _probe(method: str, path: str) -> None:
-        async with semaphore:
-            if rate_limiter:
-                await rate_limiter.acquire()
-            try:
-                resp = await client.request(method, f"{base_url}{path}", timeout=timeout)
-                bl = _make_baseline(resp.status_code, resp.content, path)
-                if bl not in seen:
-                    seen.add(bl)
-                    baselines.append(bl)
-            except Exception:
-                pass
-
-    await asyncio.gather(*[_probe(m, p) for m, p in probes])
-    return baselines
-
-
-# ---------------------------------------------------------------------------
-# Validators
-# ---------------------------------------------------------------------------
-
-def matches_wildcard(
-    status: int, content_length: int, words: int, lines: int,
-    path_len: int, baselines: list[WildcardResponse],
-) -> bool:
-    """Return True if response matches a baseline (should be filtered)."""
-    for bl in baselines:
-        if status != bl.status_code and abs(status - bl.status_code) >= 50:
-            continue
-        # Status is in range -- check body metrics
-        if content_length == bl.content_length:
-            return True
-        expected = bl.adjusted_content_length + (bl.adjustment_scale * path_len)
-        if content_length == expected:
-            return True
-        if words == bl.word_count and lines == bl.line_count:
-            return True
-    return False
-
-
-def is_known_bad_site(
-    status: int, content_length: int, words: int, lines: int,
-    headers: dict[str, str],
-) -> bool:
-    """Filter known false-positive patterns from Google Cloud and AWS API Gateway."""
-    # Google bad request (method/body mismatch)
-    if status == 400 and content_length == 1555 and words == 82 and lines == 12:
-        return True
-    # AWS API Gateway patterns
-    if status == 403:
-        is_aws = "x-amzn-requestid" in {k.lower() for k in headers}
-        if is_aws or (lines == 1 and words == 6 and content_length == 54):
-            if lines == 1 and words in (6, 13, 28):
-                return True
-    return False
-
-
-def should_filter_status(
-    status: int,
-    blacklist: set[int] | None,
-    whitelist: set[int] | None,
-) -> bool:
-    if whitelist and status not in whitelist:
-        return True
-    if blacklist and status in blacklist:
-        return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Route grouping
-# ---------------------------------------------------------------------------
-
-def group_by_depth(routes: list[Route], depth: int = 1) -> dict[str, list[Route]]:
-    """Group routes by path prefix at the given depth."""
-    groups: dict[str, list[Route]] = {}
-    for route in routes:
-        path = route.template_path
-        if not path.startswith("/"):
-            path = "/" + path
-        parts = path.split("/")
-        if len(parts) > depth + 1:
-            prefix = "/".join(parts[:depth + 1])
-        else:
-            prefix = path
-        groups.setdefault(prefix, []).append(route)
-    return groups
-
-
-# ---------------------------------------------------------------------------
-# Complexity phasing
-# ---------------------------------------------------------------------------
-
-# Routes are scanned in phases ordered by complexity (total crumb count).
-# Each distinct crumb count is its own phase: 0 first, then 1, 2, etc.
-# Simpler routes run first for faster early results.
-
 
 def route_complexity(route: Route) -> int:
     """Total crumb count across all parameter locations."""
@@ -199,7 +33,7 @@ def route_complexity(route: Route) -> int:
 
 
 def group_by_complexity(routes: list[Route]) -> list[tuple[str, list[Route]]]:
-    """Split routes into per-complexity phases. Seeded shuffle within each."""
+    """Split routes into per-complexity phases, sorted alphabetically within each."""
     buckets: dict[int, list[Route]] = {}
     for r in routes:
         c = route_complexity(r)
@@ -213,7 +47,7 @@ def group_by_complexity(routes: list[Route]) -> list[tuple[str, list[Route]]]:
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter
+# Rate limiter (unchanged)
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
@@ -235,9 +69,6 @@ class RateLimiter:
 # Main scan engine
 # ---------------------------------------------------------------------------
 
-from apiscan.output import ScanResult
-
-
 async def scan(
     target_url: str,
     routes: list[Route],
@@ -250,16 +81,25 @@ async def scan(
     status_blacklist: set[int] | None = None,
     status_whitelist: set[int] | None = None,
     quarantine_threshold: int = 50,
-    unsafe: bool = False,
     extra_headers: dict[str, str] | None = None,
     on_result: Callable[[ScanResult], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
+    on_filtered: Callable[[str, str, int, str], None] | None = None,
 ) -> list[ScanResult]:
-    """Scan target_url with the given routes. Returns list of findings."""
+    """Scan *target_url* with the given routes. Returns list of findings."""
     base_url = target_url.rstrip("/")
-    semaphore = asyncio.Semaphore(concurrency)
     limiter = RateLimiter(rate_limit) if rate_limit else None
     results: list[ScanResult] = []
+
+    def _inference_filtered(route, path, sig, reason):
+        if on_filtered:
+            on_filtered(route.method, path, sig.status_code, reason)
+
+    engine = InferenceEngine(
+        status_blacklist=status_blacklist,
+        status_whitelist=status_whitelist,
+        on_filtered=_inference_filtered,
+    )
 
     async with httpx.AsyncClient(
         follow_redirects=True,
@@ -267,86 +107,98 @@ async def scan(
         verify=False,
         headers=extra_headers or {},
     ) as client:
-        # Root preflight for baseline
-        root_baselines = await run_preflight(
-            client, base_url, "/", timeout, semaphore, limiter,
-        )
 
-        # Consecutive connection failure counter (not filtered responses)
+        # -- send_fn: the bridge between inference and HTTP ------------------
+
+        async def send_fn(
+            method: str,
+            path: str,
+            headers: dict[str, str] | None = None,
+            body: str | None = None,
+        ) -> ResponseSignature:
+            """Send a request and return a ``ResponseSignature``."""
+            url = f"{base_url}{path}"
+            if limiter:
+                await limiter.acquire()
+            resp = await client.request(
+                method, url,
+                headers=headers or {},
+                content=body.encode() if body else None,
+                timeout=timeout,
+            )
+            return compute_signature(
+                resp.status_code,
+                dict(resp.headers),
+                resp.content,
+                path,
+            )
+
+        # -- Initialize inference engine with root baseline ------------------
+
+        await engine.initialize(send_fn)
+
+        # -- Connection failure tracking -------------------------------------
+
         conn_failures = 0
 
-        async def _scan_route(route: Route, baselines: list[WildcardResponse]) -> None:
+        # -- Per-route scan --------------------------------------------------
+
+        async def _scan_route(route: Route) -> None:
             nonlocal conn_failures
             if conn_failures >= quarantine_threshold:
                 if on_progress:
                     on_progress(0)
                 return
 
-            send_method = route.method
-            original_method = route.method
-            if not unsafe and route.method != "GET":
-                send_method = "GET"
-
+            # Render request from route crumbs
             path = render_path(route)
             query = render_query(route)
             url = f"{base_url}{path}"
             if query:
                 url += f"?{query}"
-
-            # Cap URL length to avoid 414 errors. Most servers reject URLs over
-            # ~8KB; we use 2000 as a practical limit that covers all common servers.
+            # Cap URL length to avoid 414 errors
             if len(url) > 2000:
                 url = url[:2000]
 
             headers = render_headers(route)
-            body_str = render_body(route) if send_method != "GET" else None
+            body_str = render_body(route) if route.method != "GET" else None
             if body_str and not any(k.lower() == "content-type" for k in headers):
                 headers["Content-Type"] = "application/json"
 
-            async with semaphore:
-                if limiter:
-                    await limiter.acquire()
-                try:
-                    resp = await client.request(
-                        send_method, url,
-                        headers=headers,
-                        content=body_str.encode() if body_str else None,
-                        timeout=timeout,
-                    )
-                except Exception:
-                    conn_failures += 1
-                    if on_progress:
-                        on_progress(0)
-                    return
+            # Send initial probe
+            if limiter:
+                await limiter.acquire()
+            try:
+                resp = await client.request(
+                    route.method, url,
+                    headers=headers,
+                    content=body_str.encode() if body_str else None,
+                    timeout=timeout,
+                )
+            except Exception:
+                conn_failures += 1
+                if on_progress:
+                    on_progress(0)
+                return
 
-            # Connection succeeded — reset failure counter
             conn_failures = 0
 
-            body = resp.content
-            status = resp.status_code
-            content_length = len(body)
-            words = body.count(b" ") + (1 if body else 0)
-            lines = body.count(b"\n") + (1 if body else 0)
-            resp_headers = dict(resp.headers)
-            path_len = len(path.lstrip("/"))
+            sig = compute_signature(
+                resp.status_code,
+                dict(resp.headers),
+                resp.content,
+                path,
+            )
 
-            # Validator chain — filtered responses are normal, not quarantine-worthy
-            if should_filter_status(status, status_blacklist, status_whitelist):
+            # Delegate classification to inference engine
+            finding = await engine.process(route, sig, path, send_fn)
+
+            if finding is None:
                 if on_progress:
                     on_progress(0)
                 return
 
-            if is_known_bad_site(status, content_length, words, lines, resp_headers):
-                if on_progress:
-                    on_progress(0)
-                return
-
-            if matches_wildcard(status, content_length, words, lines, path_len, baselines):
-                if on_progress:
-                    on_progress(0)
-                return
-
-            # Passed all validators — it's a finding
+            # Build ScanResult from Finding
             redirect_location = None
             if resp.history:
                 redirect_location = str(resp.url)
@@ -354,14 +206,15 @@ async def scan(
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
             result = ScanResult(
                 url=url,
-                method=send_method,
+                method=route.method,
                 path=path,
-                status_code=status,
-                content_length=content_length,
-                word_count=words,
-                line_count=lines,
+                status_code=sig.status_code,
+                content_length=sig.content_length,
+                word_count=sig.word_count,
+                line_count=sig.line_count,
                 redirect_location=redirect_location,
-                original_method=original_method,
+                reason=finding.reason,
+                confidence=finding.confidence,
                 timestamp=ts,
                 request_headers=headers,
                 request_body=body_str,
@@ -372,51 +225,37 @@ async def scan(
             if on_progress:
                 on_progress(1)
 
-        # Cache preflight baselines per prefix so we don't re-probe across phases
-        prefix_cache: dict[str, list[WildcardResponse]] = {}
+        # -- Phase-based orchestration ---------------------------------------
+        # Routes are fed through a bounded worker pool so each route completes
+        # fully (including verification probes) before a new one starts.
+        # This prevents semaphore starvation where thousands of initial probes
+        # block verification probes from completing.
 
-        async def _get_baselines(prefix: str) -> list[WildcardResponse]:
-            if prefix in prefix_cache:
-                return prefix_cache[prefix]
-            prefix_baselines = await run_preflight(
-                client, base_url, prefix, timeout, semaphore, limiter,
-            )
-            seen = set(root_baselines)
-            merged = list(root_baselines)
-            for bl in prefix_baselines:
-                if bl not in seen:
-                    seen.add(bl)
-                    merged.append(bl)
-            prefix_cache[prefix] = merged
-            return merged
+        async def _worker(queue: asyncio.Queue) -> None:
+            while True:
+                route = await queue.get()
+                try:
+                    await _scan_route(route)
+                finally:
+                    queue.task_done()
 
-        # Scan in complexity phases: bare paths first, then progressively heavier
         phases = group_by_complexity(routes)
         for phase_label, phase_routes in phases:
             if on_phase:
                 on_phase(phase_label, len(phase_routes))
 
-            groups = group_by_depth(phase_routes, depth=1)
-
-            # Preflight all uncached prefixes concurrently
-            uncached = [p for p in groups if p not in prefix_cache]
-            if uncached:
-                await asyncio.gather(*[_get_baselines(p) for p in uncached])
-
-            # All baselines now cached — create scan tasks
-            all_tasks: list[asyncio.Task] = []
-            for prefix, group_routes in groups.items():
-                baselines = prefix_cache[prefix]
-                for route in group_routes:
-                    all_tasks.append(asyncio.create_task(_scan_route(route, baselines)))
+            queue: asyncio.Queue[Route] = asyncio.Queue(maxsize=concurrency * 2)
+            workers = [asyncio.create_task(_worker(queue)) for _ in range(concurrency)]
 
             try:
-                for task in asyncio.as_completed(all_tasks):
-                    await task
+                for route in phase_routes:
+                    await queue.put(route)
+                await queue.join()
             except (asyncio.CancelledError, KeyboardInterrupt):
-                for task in all_tasks:
-                    task.cancel()
-                await asyncio.gather(*all_tasks, return_exceptions=True)
-                break
+                pass
+            finally:
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
 
     return results

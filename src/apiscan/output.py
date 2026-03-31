@@ -87,7 +87,8 @@ class ScanResult:
     word_count: int
     line_count: int
     redirect_location: str | None = None
-    original_method: str = ""
+    reason: str = ""
+    confidence: str = ""
     timestamp: str = ""
     request_headers: dict[str, str] | None = None
     request_body: str | None = None
@@ -140,7 +141,7 @@ def _fmt_magnitude(value: int, suffix: str, colors: list[str], use_color: bool) 
     return f"{color}{text:>6}{r}"
 
 
-def format_result(result: ScanResult, use_color: bool = True) -> str:
+def format_result(result: ScanResult, use_color: bool = True, verbose: bool = False) -> str:
     r = RESET if use_color else ""
 
     # Status code — per-code color
@@ -160,8 +161,8 @@ def format_result(result: ScanResult, use_color: bool = True) -> str:
 
     line = f"{sc} | {method} | {size} {lines} {words} | {path}"
 
-    if result.original_method and result.original_method != result.method:
-        hint = f" {DIM}(original: {result.original_method}){r}" if use_color else f" (original: {result.original_method})"
+    if verbose and result.reason:
+        hint = f" {DIM}({result.reason}){r}" if use_color else f" ({result.reason})"
         line += hint
     if result.redirect_location:
         redir = f" -> {result.redirect_location}"
@@ -173,7 +174,7 @@ BANNER = " ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █\n █�
 
 
 def print_banner(target: str, route_count: int,
-                 unsafe_methods: bool, unsafe_keywords: bool,
+                 unsafe_keywords: bool,
                  stats: FilterStats, use_color: bool = True) -> None:
     b = BOLD if use_color else ""
     r = RESET if use_color else ""
@@ -181,26 +182,15 @@ def print_banner(target: str, route_count: int,
     c = CYAN if use_color else ""
     y = YELLOW if use_color else ""
     g = GREEN if use_color else ""
-    rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
     print(f" {d}api content discovery · v0.12.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
-    if unsafe_methods and unsafe_keywords:
-        sc = sum(v for m, v in stats.method_breakdown.items() if m != "GET")
-        print(f"  mode:    {rd}{b}unsafe-all{r} {d}-- all methods, no keyword filter. {sc} state-changing routes{r}")
-    elif unsafe_methods:
-        sc = sum(v for m, v in stats.method_breakdown.items() if m != "GET")
-        print(f"  mode:    {y}{b}unsafe-methods{r} {d}-- all methods, keyword filter active. "
-              f"{stats.keyword_filtered} keyword-filtered, {sc} state-changing routes{r}")
-    elif unsafe_keywords:
-        print(f"  mode:    {y}{b}unsafe-keywords{r} {d}-- GET-only, no keyword filter. "
-              f"{stats.method_filtered} method-filtered{r}")
-    else:
-        print(f"  mode:    {g}{b}safe{r} {d}-- GET-only, keyword filter. "
-              f"{stats.method_filtered} filtered by method, "
-              f"{stats.keyword_filtered} by keyword{r}")
+    if unsafe_keywords:
+        print(f"  filter:  {y}{b}keywords disabled{r} {d}-- no keyword filter{r}")
+    elif stats.keyword_filtered:
+        print(f"  filter:  {g}{b}keywords active{r} {d}-- {stats.keyword_filtered} routes filtered by keyword{r}")
     print()
 
 
@@ -211,7 +201,7 @@ def print_banner(target: str, route_count: int,
 _CSV_COLUMNS = [
     "timestamp", "url", "method", "path", "status_code",
     "content_length", "word_count", "line_count",
-    "redirect_location", "original_method", "curl",
+    "redirect_location", "reason", "confidence", "curl",
 ]
 
 
@@ -227,7 +217,7 @@ class CSVWriter:
             result.timestamp, result.url, result.method, result.path,
             result.status_code, result.content_length, result.word_count,
             result.line_count, result.redirect_location or "",
-            result.original_method, build_curl(result, self._proxy),
+            result.reason, result.confidence, build_curl(result, self._proxy),
         ])
 
     def close(self) -> None:

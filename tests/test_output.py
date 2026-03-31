@@ -25,7 +25,8 @@ def _make_result(**overrides) -> ScanResult:
         word_count=5,
         line_count=1,
         redirect_location=None,
-        original_method="GET",
+        reason="",
+        confidence="",
         timestamp="2026-03-31T12:00:00",
     )
     defaults.update(overrides)
@@ -80,15 +81,20 @@ class TestFormatResult:
         assert "\033[" not in line
         assert "200" in line
 
-    def test_original_method_shown(self):
-        r = _make_result(method="GET", original_method="POST")
-        line = format_result(r, use_color=False)
-        assert "(original: POST)" in line
+    def test_reason_shown_when_verbose(self):
+        r = _make_result(reason="status: 404 -> 200")
+        line = format_result(r, use_color=False, verbose=True)
+        assert "(status: 404 -> 200)" in line
 
-    def test_original_method_hidden_when_same(self):
-        r = _make_result(method="GET", original_method="GET")
-        line = format_result(r, use_color=False)
-        assert "original" not in line
+    def test_reason_hidden_without_verbose(self):
+        r = _make_result(reason="status: 404 -> 200")
+        line = format_result(r, use_color=False, verbose=False)
+        assert "status: 404 -> 200" not in line
+
+    def test_reason_hidden_when_empty(self):
+        r = _make_result(reason="")
+        line = format_result(r, use_color=False, verbose=True)
+        assert "(" not in line or "redirect" in line.lower() or "->" in line
 
     def test_magnitude_bytes(self):
         r = _make_result(content_length=500)
@@ -135,7 +141,8 @@ class TestCSVWriter:
                 assert rows[1]["status_code"] == "301"
                 assert rows[1]["path"] == "/other"
                 assert "timestamp" in rows[0]
-                assert "original_method" in rows[0]
+                assert "reason" in rows[0]
+                assert "confidence" in rows[0]
         finally:
             os.unlink(path)
 
@@ -153,7 +160,7 @@ class TestCSVWriter:
                 expected = [
                     "timestamp", "url", "method", "path", "status_code",
                     "content_length", "word_count", "line_count",
-                    "redirect_location", "original_method", "curl",
+                    "redirect_location", "reason", "confidence", "curl",
                 ]
                 assert header == expected
         finally:
@@ -161,41 +168,31 @@ class TestCSVWriter:
 
 
 class TestFilterStatsMessage:
-    def test_safe_mode_banner(self, capsys):
-        stats = FilterStats(
-            total=100, kept=60, method_filtered=30, keyword_filtered=10,
-            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
-        )
-        print_banner("http://example.com", 60, False, False, stats=stats, use_color=False)
-        output = capsys.readouterr().out
-        assert "safe" in output.lower()
-        assert "30 filtered by method" in output
-        assert "10 by keyword" in output
-
-    def test_unsafe_all_banner(self, capsys):
-        stats = FilterStats(
-            total=100, kept=100, method_filtered=0, keyword_filtered=0,
-            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
-        )
-        print_banner("http://example.com", 100, True, True, stats=stats, use_color=False)
-        output = capsys.readouterr().out
-        assert "unsafe-all" in output.lower()
-        assert "40 state-changing" in output
-
-    def test_unsafe_methods_banner(self, capsys):
+    def test_keywords_active_banner(self, capsys):
         stats = FilterStats(
             total=100, kept=90, method_filtered=0, keyword_filtered=10,
             method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
         )
-        print_banner("http://example.com", 90, True, False, stats=stats, use_color=False)
+        print_banner("http://example.com", 90, False, stats=stats, use_color=False)
         output = capsys.readouterr().out
-        assert "unsafe-methods" in output.lower()
+        assert "keywords active" in output.lower()
+        assert "10 routes filtered by keyword" in output
 
-    def test_unsafe_keywords_banner(self, capsys):
+    def test_keywords_disabled_banner(self, capsys):
         stats = FilterStats(
-            total=100, kept=60, method_filtered=30, keyword_filtered=0,
+            total=100, kept=100, method_filtered=0, keyword_filtered=0,
             method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
         )
-        print_banner("http://example.com", 60, False, True, stats=stats, use_color=False)
+        print_banner("http://example.com", 100, True, stats=stats, use_color=False)
         output = capsys.readouterr().out
-        assert "unsafe-keywords" in output.lower()
+        assert "keywords disabled" in output.lower()
+
+    def test_no_filter_line_when_nothing_filtered(self, capsys):
+        stats = FilterStats(
+            total=100, kept=100, method_filtered=0, keyword_filtered=0,
+            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
+        )
+        print_banner("http://example.com", 100, False, stats=stats, use_color=False)
+        output = capsys.readouterr().out
+        assert "target:" in output
+        assert "routes:" in output

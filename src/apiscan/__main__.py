@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from apiscan.kite import Route, apply_safety_filter, load_kite, route_from_dict, route_to_dict
+from apiscan.wordlist import load_wordlist
 from apiscan.output import (
     BOLD,
     CYAN,
@@ -223,6 +224,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sc = sub.add_parser("scan", help="Scan a target using a .kite wordlist")
     sc.add_argument("--kite", default=None,
                     help="Path to .kite wordlist file (default: cached routes-large.kite)")
+    sc.add_argument("--wordlist", default=None, metavar="PATH",
+                    help="Path to a flat wordlist file (one path per line, sent as GET)")
     sc.add_argument("--url", required=True, help="Target base URL")
     scan_mode = sc.add_mutually_exclusive_group()
     scan_mode.add_argument("--fast", action="store_true",
@@ -231,12 +234,8 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="Deduplicated scan (~30k routes appearing in 2+ APIs)")
 
     safety = sc.add_argument_group("safety")
-    safety.add_argument("--unsafe-all", action="store_true",
-                        help="Enable all HTTP methods and disable keyword filtering")
-    safety.add_argument("--unsafe-methods", action="store_true",
-                        help="Enable all HTTP methods (keep keyword filtering)")
     safety.add_argument("--unsafe-keywords", action="store_true",
-                        help="Disable keyword filtering (keep GET-only)")
+                        help="Disable keyword filtering for dangerous paths")
 
     http = sc.add_argument_group("http")
     http.add_argument("--concurrency", type=int, default=10,
@@ -263,6 +262,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Replay findings through a proxy (e.g. http://127.0.0.1:8080 for Burp)")
     output.add_argument("--verbose", action="store_true",
                         help="Show additional details")
+    output.add_argument("--debug", action="store_true",
+                        help="Show why routes are filtered (noisy)")
     output.add_argument("--no-color", action="store_true",
                         help="Disable ANSI colors")
     output.add_argument("--quiet", action="store_true",
@@ -328,44 +329,59 @@ async def _scan(args: argparse.Namespace) -> None:
 
     g = GREEN if use_color else ""
     c2 = CYAN if use_color else ""
-    kite_path = _ensure_kite(args, use_color)
-    kite_name = os.path.basename(kite_path)
 
-    def _load_progress(parsed: int, total: int) -> None:
-        pct = parsed * 100 / total if total else 0
-        bar = braille_bar(pct)
-        print(f"\r  {c2}parsing {kite_name}{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
+    routes: list[Route] = []
 
-    # Try loading cached routes for --fast/--short (skip full protobuf parse)
-    scan_mode = "fast" if args.fast else ("short" if args.short else None)
-    routes = None
+    # Load .kite routes (unless --wordlist is the sole source)
+    wordlist_only = args.wordlist and not args.kite and not args.fast and not args.short
+    if not wordlist_only:
+        kite_path = _ensure_kite(args, use_color)
+        kite_name = os.path.basename(kite_path)
 
-    if scan_mode and not args.kite:
-        index_name, _ = SCAN_MODES[scan_mode]
-        cache_dir = _default_cache_dir()
-        index_path = cache_dir / index_name
-        if index_path.exists():
-            if not args.quiet:
-                print(f"\r  {c2}loading {scan_mode} cache{r}{' ' * 40}", end="", flush=True)
-            routes = _load_cached_routes(index_path, kite_path)
+        def _load_progress(parsed: int, total: int) -> None:
+            pct = parsed * 100 / total if total else 0
+            bar = braille_bar(pct)
+            print(f"\r  {c2}parsing {kite_name}{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
 
-    if routes is None:
-        # Full parse needed (no mode, custom kite, or stale/missing cache)
-        if not args.quiet:
-            print(f"\r  {c2}parsing {kite_name}{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
-        routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
+        # Try loading cached routes for --fast/--short (skip full protobuf parse)
+        scan_mode = "fast" if args.fast else ("short" if args.short else None)
+        kite_routes = None
+
         if scan_mode and not args.kite:
+            index_name, _ = SCAN_MODES[scan_mode]
+            cache_dir = _default_cache_dir()
+            index_path = cache_dir / index_name
+            if index_path.exists():
+                if not args.quiet:
+                    print(f"\r  {c2}loading {scan_mode} cache{r}{' ' * 40}", end="", flush=True)
+                kite_routes = _load_cached_routes(index_path, kite_path)
+
+        if kite_routes is None:
             if not args.quiet:
-                print(f"\r  {d}building {scan_mode} cache...{' ' * 30}{r}", end="", flush=True)
-            index_path = _ensure_index(kite_path, scan_mode, use_color)
-            routes = _load_cached_routes(index_path, kite_path) or routes
+                print(f"\r  {c2}parsing {kite_name}{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
+            kite_routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
+            if scan_mode and not args.kite:
+                if not args.quiet:
+                    print(f"\r  {d}building {scan_mode} cache...{' ' * 30}{r}", end="", flush=True)
+                index_path = _ensure_index(kite_path, scan_mode, use_color)
+                kite_routes = _load_cached_routes(index_path, kite_path) or kite_routes
+
+        routes.extend(kite_routes)
+
+    # Load flat wordlist routes
+    if args.wordlist:
+        if not args.quiet:
+            print(f"\r  {c2}loading wordlist{r} {os.path.basename(args.wordlist)}{' ' * 30}", end="", flush=True)
+        wl_routes = load_wordlist(args.wordlist)
+        if not args.quiet:
+            print(f"\r  {c2}wordlist:{r} {len(wl_routes):,} paths{' ' * 40}")
+        routes.extend(wl_routes)
 
     if not args.quiet:
         print(f"\r  {d}filtering {len(routes):,} routes...{' ' * 40}{r}", end="", flush=True)
-    unsafe_methods = args.unsafe_all or args.unsafe_methods
-    unsafe_keywords = args.unsafe_all or args.unsafe_keywords
+    unsafe_keywords = args.unsafe_keywords
     filtered_routes, stats = apply_safety_filter(
-        routes, unsafe_methods=unsafe_methods, unsafe_keywords=unsafe_keywords,
+        routes, unsafe_methods=True, unsafe_keywords=unsafe_keywords,
     )
 
     # Route ordering is handled by complexity phasing in the scanner —
@@ -373,7 +389,7 @@ async def _scan(args: argparse.Namespace) -> None:
 
     if not args.quiet:
         print(f"\r{' ' * 80}\r", end="")  # clear the status line
-        print_banner(args.url, len(filtered_routes), unsafe_methods, unsafe_keywords, stats, use_color)
+        print_banner(args.url, len(filtered_routes), unsafe_keywords, stats, use_color)
 
     csv_writer = CSVWriter(args.output, replay_proxy=args.replay_proxy) if args.output else None
     progress = ProgressTracker(len(filtered_routes), use_color) if not args.quiet else None
@@ -419,7 +435,7 @@ async def _scan(args: argparse.Namespace) -> None:
         seen_results.add(display_key)
         if progress:
             print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
-        print(format_result(result, use_color))
+        print(format_result(result, use_color, verbose=args.verbose))
 
     def on_progress(findings_delta: int) -> None:
         if progress:
@@ -428,6 +444,15 @@ async def _scan(args: argparse.Namespace) -> None:
     def on_phase(label: str, phase_total: int) -> None:
         if progress:
             progress.set_phase(label, phase_total)
+
+    def on_filtered(method: str, path: str, status: int, reason: str) -> None:
+        if not args.debug:
+            return
+        d2 = DIM if use_color else ""
+        r2 = RESET if use_color else ""
+        if progress:
+            print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
+        print(f"{d2}  filtered {method:<7} {status:>3} {path} -- {reason}{r2}", file=sys.stderr)
 
     start = time.monotonic()
     warnings.filterwarnings("ignore", message="Unverified HTTPS request")
@@ -441,11 +466,11 @@ async def _scan(args: argparse.Namespace) -> None:
         max_redirects=args.max_redirects,
         status_blacklist=_parse_codes(args.blacklist_codes),
         status_whitelist=_parse_codes(args.status_codes),
-        unsafe=unsafe_methods,
         extra_headers=_parse_headers(args.header),
         on_phase=on_phase,
         on_result=on_result,
         on_progress=on_progress,
+        on_filtered=on_filtered,
     )
 
     elapsed = time.monotonic() - start
