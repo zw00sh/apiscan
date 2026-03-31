@@ -117,17 +117,24 @@ def _build_fast_index(kite_path: str, cache_dir: Path, use_color: bool = True) -
 
     index_path = cache_dir / FAST_INDEX_NAME
 
-    print(f"  {c}building fast index{r} {d}(one-time, ~10s)...{r}", end="", flush=True)
+    def _index_progress(parsed: int, total: int) -> None:
+        pct = parsed * 100 // total if total else 0
+        print(f"\r  {c}building fast index{r} {d}[{pct:>3}%]{r}", end="", flush=True)
 
-    routes = load_kite(kite_path)
+    print(f"  {c}building fast index{r} {d}[  0%]{r}", end="", flush=True)
+    routes = load_kite(kite_path, on_progress=_index_progress)
 
     # Count how many distinct source APIs each (path, method) appears in
     route_apis: dict[tuple[str, str], set[str]] = {}
-    for route in routes:
+    total = len(routes)
+    for i, route in enumerate(routes):
         key = (route.template_path, route.method)
         if key not in route_apis:
             route_apis[key] = set()
         route_apis[key].add(route.source_api_url)
+        if i % 50_000 == 0:
+            pct = 100 + (i * 100 // total) if total else 100  # 100-199% for dedup phase
+            print(f"\r  {c}building fast index{r} {d}[dedup {i * 100 // total:>3}%]{r}", end="", flush=True)
 
     # Keep routes appearing in >= FAST_MIN_APIS distinct APIs
     fast_keys = [list(k) for k, apis in route_apis.items() if len(apis) >= FAST_MIN_APIS]
@@ -135,7 +142,7 @@ def _build_fast_index(kite_path: str, cache_dir: Path, use_color: bool = True) -
     with open(index_path, "w") as f:
         json.dump(fast_keys, f)
 
-    print(f"\r  {c}fast index:{r} {len(fast_keys):,} routes (from {len(route_apis):,} unique, threshold >={FAST_MIN_APIS} APIs)")
+    print(f"\r  {c}fast index:{r} {len(fast_keys):,} routes (from {len(route_apis):,} unique, threshold >={FAST_MIN_APIS} APIs){' ' * 10}")
     return index_path
 
 
