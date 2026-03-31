@@ -9,6 +9,7 @@ import re
 import string
 import struct
 from dataclasses import dataclass, field
+from typing import Callable
 from urllib.parse import urlencode
 from uuid import uuid4
 
@@ -199,8 +200,12 @@ def _parse_route(data: bytes, api_url: str = "",
     method = _str(f, 2).strip().upper()
     if method not in VALID_METHODS:
         return None
+    template_path = _str(f, 1)
+    # Skip malformed paths (hostnames, port prefixes, commas)
+    if template_path.startswith(":") or template_path.startswith(",") or "." in template_path.split("/")[0]:
+        return None
     return Route(
-        template_path=_str(f, 1),
+        template_path=template_path,
         method=method,
         path_crumbs=_parse_crumbs(f, 3),
         header_crumbs=(api_headers or []) + _parse_crumbs(f, 4),
@@ -215,15 +220,25 @@ def _parse_route(data: bytes, api_url: str = "",
 VALID_METHODS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})
 
 
-def load_kite(path: str) -> list[Route]:
-    """Load a .kite file and return a flat list of Route objects."""
+def load_kite(path: str, on_progress: Callable[[int, int], None] | None = None) -> list[Route]:
+    """Load a .kite file and return a flat list of Route objects.
+
+    on_progress(bytes_parsed, total_bytes) is called periodically during loading.
+    """
     with open(path, "rb") as fh:
         data = fh.read()
 
-    top = _decode_message(data)
+    total = len(data)
     routes: list[Route] = []
-    for api_data in top.get(1, []):
-        af = _decode_message(api_data)
+    pos = 0
+    last_report = 0
+
+    # Stream top-level ProtoAPIS fields instead of decoding all at once
+    while pos < total:
+        fn, wt, val, pos = _read_field(data, pos)
+        if fn != 1 or wt != 2:
+            continue
+        af = _decode_message(val)
         api_url = _str(af, 1)
         api_headers = _parse_crumbs(af, 4)
         api_query = _parse_crumbs(af, 5)
@@ -232,6 +247,14 @@ def load_kite(path: str) -> list[Route]:
             r = _parse_route(route_data, api_url, api_headers, api_query, api_body)
             if r is not None:
                 routes.append(r)
+
+        if on_progress and pos - last_report > total // 50:
+            on_progress(pos, total)
+            last_report = pos
+
+    if on_progress:
+        on_progress(total, total)
+
     return routes
 
 
@@ -346,7 +369,10 @@ def render_path(route: Route) -> str:
             return generate_value(crumb_map[name])
         return "42"
 
-    return re.sub(r"\{([^}]+)\}", _replacer, route.template_path)
+    path = re.sub(r"\{([^}]+)\}", _replacer, route.template_path)
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
 
 
 def render_query(route: Route) -> str:
@@ -389,12 +415,17 @@ _DANGEROUS_RE = re.compile(
 )
 
 
-def apply_safety_filter(routes: list[Route], unsafe: bool) -> tuple[list[Route], FilterStats]:
+def apply_safety_filter(
+    routes: list[Route],
+    *,
+    unsafe_methods: bool = False,
+    unsafe_keywords: bool = False,
+) -> tuple[list[Route], FilterStats]:
     method_breakdown: dict[str, int] = {}
     for r in routes:
         method_breakdown[r.method] = method_breakdown.get(r.method, 0) + 1
 
-    if unsafe:
+    if unsafe_methods and unsafe_keywords:
         return routes, FilterStats(
             total=len(routes), kept=len(routes),
             method_filtered=0, keyword_filtered=0,
@@ -406,10 +437,10 @@ def apply_safety_filter(routes: list[Route], unsafe: bool) -> tuple[list[Route],
     kept: list[Route] = []
 
     for r in routes:
-        if r.method != "GET":
+        if not unsafe_methods and r.method != "GET":
             method_filtered += 1
             continue
-        if _DANGEROUS_RE.search(r.template_path):
+        if not unsafe_keywords and _DANGEROUS_RE.search(r.template_path):
             keyword_filtered += 1
             continue
         kept.append(r)

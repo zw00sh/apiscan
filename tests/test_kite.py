@@ -38,7 +38,7 @@ LARGE_KITE = os.path.join(KITES_DIR, "routes-large.kite")
 class TestLoadSmallKite:
     def test_route_count(self):
         routes = load_kite(SMALL_KITE)
-        assert 35_000 <= len(routes) <= 37_000
+        assert 30_000 <= len(routes) <= 37_000
 
     def test_valid_methods_only(self):
         routes = load_kite(SMALL_KITE)
@@ -50,18 +50,33 @@ class TestLoadSmallKite:
         for r in routes[:1000]:
             assert r.template_path
 
+    def test_all_paths_renderable(self):
+        """Every rendered path must start with / and produce a valid URL suffix."""
+        routes = load_kite(SMALL_KITE)
+        for r in routes:
+            path = render_path(r)
+            assert path.startswith("/"), f"bad path: {path!r} from {r.template_path!r}"
+            assert ":" not in path.split("/")[0], f"port-like path: {path!r}"
+
 
 @pytest.mark.skipif(not os.path.exists(LARGE_KITE), reason="routes-large.kite not found")
 class TestLoadLargeKite:
     def test_route_count(self):
         routes = load_kite(LARGE_KITE)
-        assert 950_000 <= len(routes) <= 965_000
+        assert 900_000 <= len(routes) <= 965_000
 
     def test_junk_methods_filtered(self):
         routes = load_kite(LARGE_KITE)
         methods = {r.method for r in routes}
         for junk in ("GETT", "POSY", "VENDOREXTENSIONS", "/HEALTH", "CREATE"):
             assert junk not in methods
+
+    def test_all_paths_renderable(self):
+        """Every rendered path must start with / and produce a valid URL suffix."""
+        routes = load_kite(LARGE_KITE)
+        for r in routes:
+            path = render_path(r)
+            assert path.startswith("/"), f"bad path: {path!r} from {r.template_path!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +288,13 @@ class TestSafetyFilter:
 
     def test_safe_mode_methods(self):
         routes = self._make_routes()
-        filtered, stats = apply_safety_filter(routes, unsafe=False)
+        filtered, stats = apply_safety_filter(routes)
         methods = {r.method for r in filtered}
         assert methods == {"GET"}
 
     def test_safe_mode_keywords(self):
         routes = self._make_routes()
-        filtered, stats = apply_safety_filter(routes, unsafe=False)
+        filtered, stats = apply_safety_filter(routes)
         paths = {r.template_path for r in filtered}
         assert "/admin/shutdown" not in paths
         assert "/api/cache/clear" not in paths
@@ -289,7 +304,7 @@ class TestSafetyFilter:
 
     def test_safe_mode_stats(self):
         routes = self._make_routes()
-        _, stats = apply_safety_filter(routes, unsafe=False)
+        _, stats = apply_safety_filter(routes)
         assert stats.total == 8
         assert stats.method_filtered == 3  # POST, DELETE, PUT
         assert stats.keyword_filtered == 3  # shutdown, clear, remove
@@ -297,7 +312,7 @@ class TestSafetyFilter:
 
     def test_unsafe_mode_all_preserved(self):
         routes = self._make_routes()
-        filtered, stats = apply_safety_filter(routes, unsafe=True)
+        filtered, stats = apply_safety_filter(routes, unsafe_methods=True, unsafe_keywords=True)
         assert len(filtered) == len(routes)
         assert stats.method_filtered == 0
         assert stats.keyword_filtered == 0

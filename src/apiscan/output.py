@@ -74,19 +74,19 @@ def format_result(result: ScanResult, use_color: bool = True) -> str:
         parts = [
             f"{sc_on}{result.status_code:>3}{sc_off}",
             f"{CYAN}{result.method:<7}{RESET}",
+            f"{YELLOW}{result.content_length:>7}B{RESET}",
+            f"{MAGENTA}{result.word_count:>5}W{RESET}",
+            f"{d}{result.line_count:>5}L{r}",
             f"{WHITE}{result.path}{RESET}",
-            f"{d}{result.content_length}B{r}",
-            f"{d}{result.word_count}W{r}",
-            f"{d}{result.line_count}L{r}",
         ]
     else:
         parts = [
             f"{result.status_code:>3}",
             f"{result.method:<7}",
+            f"{result.content_length:>7}B",
+            f"{result.word_count:>5}W",
+            f"{result.line_count:>5}L",
             f"{result.path}",
-            f"{result.content_length}B",
-            f"{result.word_count}W",
-            f"{result.line_count}L",
         ]
     line = " | ".join(parts)
     if result.original_method and result.original_method != result.method:
@@ -101,24 +101,35 @@ def format_result(result: ScanResult, use_color: bool = True) -> str:
 BANNER = " ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █\n █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█"
 
 
-def print_banner(target: str, route_count: int, unsafe: bool,
+def print_banner(target: str, route_count: int,
+                 unsafe_methods: bool, unsafe_keywords: bool,
                  stats: FilterStats, use_color: bool = True) -> None:
     b = BOLD if use_color else ""
     r = RESET if use_color else ""
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
+    y = YELLOW if use_color else ""
+    g = GREEN if use_color else ""
+    rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
     print(f" {d}api content discovery · v0.2.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
-    if unsafe:
+    if unsafe_methods and unsafe_keywords:
         sc = sum(v for m, v in stats.method_breakdown.items() if m != "GET")
-        print(f"  {YELLOW if use_color else ''}mode:    unsafe -- sending {sc} state-changing routes (POST/PUT/DELETE/PATCH){r}")
+        print(f"  mode:    {rd}{b}unsafe-all{r} {d}-- all methods, no keyword filter. {sc} state-changing routes{r}")
+    elif unsafe_methods:
+        sc = sum(v for m, v in stats.method_breakdown.items() if m != "GET")
+        print(f"  mode:    {y}{b}unsafe-methods{r} {d}-- all methods, keyword filter active. "
+              f"{stats.keyword_filtered} keyword-filtered, {sc} state-changing routes{r}")
+    elif unsafe_keywords:
+        print(f"  mode:    {y}{b}unsafe-keywords{r} {d}-- GET-only, no keyword filter. "
+              f"{stats.method_filtered} method-filtered{r}")
     else:
-        print(f"  {d}mode:    safe (GET-only, keyword filter). "
-              f"{stats.method_filtered} routes filtered by method, "
-              f"{stats.keyword_filtered} by keyword. Use --unsafe for full scan.{r}")
+        print(f"  mode:    {g}{b}safe{r} {d}-- GET-only, keyword filter. "
+              f"{stats.method_filtered} filtered by method, "
+              f"{stats.keyword_filtered} by keyword{r}")
     print()
 
 

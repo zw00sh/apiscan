@@ -139,8 +139,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Use routes-small.kite instead of routes-large.kite")
 
     safety = sc.add_argument_group("safety")
-    safety.add_argument("--unsafe", action="store_true",
+    safety.add_argument("--unsafe-all", action="store_true",
                         help="Enable all HTTP methods and disable keyword filtering")
+    safety.add_argument("--unsafe-methods", action="store_true",
+                        help="Enable all HTTP methods (keep keyword filtering)")
+    safety.add_argument("--unsafe-keywords", action="store_true",
+                        help="Disable keyword filtering (keep GET-only)")
 
     http = sc.add_argument_group("http")
     http.add_argument("--concurrency", type=int, default=10,
@@ -226,15 +230,23 @@ async def _scan(args: argparse.Namespace) -> None:
 
     kite_path = _resolve_kite(args)
 
+    def _load_progress(parsed: int, total: int) -> None:
+        pct = parsed * 100 // total if total else 0
+        print(f"\r  {d}loading {kite_path} [{pct:>3}%]{r}", end="", flush=True)
+
     if not args.quiet:
-        print(f"  {d}loading {kite_path}...{r}", end="", flush=True)
-    routes = load_kite(kite_path)
+        print(f"  {d}loading {kite_path} [  0%]{r}", end="", flush=True)
+    routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
     if not args.quiet:
-        print(f"\r  {d}loaded {len(routes):,} routes, applying filters...{r}", end="", flush=True)
-    filtered_routes, stats = apply_safety_filter(routes, args.unsafe)
+        print(f"\r  {d}loaded {len(routes):,} routes, applying filters...{' ' * 20}{r}", end="", flush=True)
+    unsafe_methods = args.unsafe_all or args.unsafe_methods
+    unsafe_keywords = args.unsafe_all or args.unsafe_keywords
+    filtered_routes, stats = apply_safety_filter(
+        routes, unsafe_methods=unsafe_methods, unsafe_keywords=unsafe_keywords,
+    )
     if not args.quiet:
         print(f"\r{' ' * 60}\r", end="")  # clear the status line
-        print_banner(args.url, len(filtered_routes), args.unsafe, stats, use_color)
+        print_banner(args.url, len(filtered_routes), unsafe_methods, unsafe_keywords, stats, use_color)
 
     csv_writer = CSVWriter(args.output) if args.output else None
     progress = ProgressTracker(len(filtered_routes), use_color) if not args.quiet else None
@@ -263,7 +275,7 @@ async def _scan(args: argparse.Namespace) -> None:
         max_redirects=args.max_redirects,
         status_blacklist=_parse_codes(args.blacklist_codes),
         status_whitelist=_parse_codes(args.status_codes),
-        unsafe=args.unsafe,
+        unsafe=unsafe_methods,
         extra_headers=_parse_headers(args.header),
         on_result=on_result,
         on_progress=on_progress,
@@ -286,13 +298,17 @@ def cli() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    if args.command == "download":
-        _download(args)
-    elif args.command == "scan":
-        asyncio.run(_scan(args))
-    else:
-        parser.print_help()
-        sys.exit(1)
+    try:
+        if args.command == "download":
+            _download(args)
+        elif args.command == "scan":
+            asyncio.run(_scan(args))
+        else:
+            parser.print_help()
+            sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n\n  interrupted", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":

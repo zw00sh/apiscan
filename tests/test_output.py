@@ -124,19 +124,36 @@ class TestFilterStatsMessage:
             total=100, kept=60, method_filtered=30, keyword_filtered=10,
             method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
         )
-        print_banner("http://example.com", 60, unsafe=False, stats=stats, use_color=False)
+        print_banner("http://example.com", 60, False, False, stats=stats, use_color=False)
         output = capsys.readouterr().out
         assert "safe" in output.lower()
-        assert "30 routes filtered by method" in output
+        assert "30 filtered by method" in output
         assert "10 by keyword" in output
-        assert "--unsafe" in output
 
-    def test_unsafe_mode_banner(self, capsys):
+    def test_unsafe_all_banner(self, capsys):
         stats = FilterStats(
             total=100, kept=100, method_filtered=0, keyword_filtered=0,
             method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
         )
-        print_banner("http://example.com", 100, unsafe=True, stats=stats, use_color=False)
+        print_banner("http://example.com", 100, True, True, stats=stats, use_color=False)
         output = capsys.readouterr().out
-        assert "unsafe" in output.lower()
+        assert "unsafe-all" in output.lower()
         assert "40 state-changing" in output
+
+    def test_unsafe_methods_banner(self, capsys):
+        stats = FilterStats(
+            total=100, kept=90, method_filtered=0, keyword_filtered=10,
+            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
+        )
+        print_banner("http://example.com", 90, True, False, stats=stats, use_color=False)
+        output = capsys.readouterr().out
+        assert "unsafe-methods" in output.lower()
+
+    def test_unsafe_keywords_banner(self, capsys):
+        stats = FilterStats(
+            total=100, kept=60, method_filtered=30, keyword_filtered=0,
+            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
+        )
+        print_banner("http://example.com", 60, False, True, stats=stats, use_color=False)
+        output = capsys.readouterr().out
+        assert "unsafe-keywords" in output.lower()
