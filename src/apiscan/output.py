@@ -26,6 +26,47 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+# 256-color helpers
+def _c256(n: int) -> str:
+    return f"\033[38;5;{n}m"
+
+def _bg256(n: int) -> str:
+    return f"\033[48;5;{n}m"
+
+# Per-status-code colors (256-color)
+_STATUS_COLORS: dict[int, str] = {
+    200: _c256(82),    # bright green
+    201: _c256(36),    # teal
+    204: _c256(65),    # dim green
+    301: _c256(220),   # yellow
+    302: _c256(214),   # amber
+    304: _c256(178),   # dark yellow
+    400: _c256(208),   # dark orange
+    401: _c256(214),   # bright orange — needs auth, actionable
+    403: _c256(170),   # magenta/pink — forbidden
+    404: _c256(245),   # dim grey — noise
+    405: f"{BOLD}{_c256(196)}",  # bright red bold — discovery signal
+    429: f"{_bg256(52)}{_c256(255)}",   # white on dark red bg — scan in trouble
+    500: _c256(196),   # red
+    502: f"{_bg256(52)}{_c256(255)}",   # white on dark red bg — scan in trouble
+    503: f"{_bg256(52)}{_c256(255)}",   # white on dark red bg — scan in trouble
+}
+
+# Fallback colors by range
+_STATUS_RANGE_COLORS: list[tuple[int, int, str]] = [
+    (200, 300, _c256(82)),   # green
+    (300, 400, _c256(220)),  # yellow
+    (400, 500, _c256(245)),  # dim grey
+    (500, 600, _c256(196)),  # red
+]
+
+# Magnitude colors for size (B, K, M)
+_SIZE_COLORS = [_c256(245), _c256(214), _c256(208)]  # dim, yellow, orange
+# Magnitude colors for word count (purple shades)
+_WORD_COLORS = [_c256(96), _c256(134), _c256(171)]   # dim, medium, bright purple
+# Magnitude colors for line count (blue shades)
+_LINE_COLORS = [_c256(60), _c256(69), _c256(111)]    # dim, medium, bright blue
+
 
 def supports_color() -> bool:
     return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
@@ -53,48 +94,59 @@ class ScanResult:
 # Terminal formatting
 # ---------------------------------------------------------------------------
 
-def _status_color(status: int, use_color: bool) -> tuple[str, str]:
-    if not use_color:
-        return "", ""
-    if status == 405:
-        return RED, RESET
-    if 200 <= status < 300:
-        return GREEN, RESET
-    if 300 <= status < 400:
-        return YELLOW, RESET
-    if 400 <= status < 500:
-        return DIM, RESET
-    return "", ""
+def _status_color(status: int) -> str:
+    if status in _STATUS_COLORS:
+        return _STATUS_COLORS[status]
+    for lo, hi, color in _STATUS_RANGE_COLORS:
+        if lo <= status < hi:
+            return color
+    return ""
+
+
+def _fmt_magnitude(value: int, colors: list[str], use_color: bool) -> str:
+    """Format a value with unit suffix and magnitude-appropriate color.
+
+    Returns a string right-aligned to 6 chars (e.g. '  1.5K', ' 42  ').
+    """
+    if value >= 1_000_000:
+        text = f"{value / 1_000_000:.1f}M"
+        color = colors[2] if use_color else ""
+    elif value >= 1_000:
+        text = f"{value / 1_000:.1f}K"
+        color = colors[1] if use_color else ""
+    else:
+        text = f"{value}  "  # pad with 2 spaces to align with suffix chars
+        color = colors[0] if use_color else ""
+    r = RESET if use_color else ""
+    return f"{color}{text:>6}{r}"
 
 
 def format_result(result: ScanResult, use_color: bool = True) -> str:
-    sc_on, sc_off = _status_color(result.status_code, use_color)
-    if use_color:
-        d, r = DIM, RESET
-        parts = [
-            f"{sc_on}{result.status_code:>3}{sc_off}",
-            f"{CYAN}{result.method:<7}{RESET}",
-            f"{YELLOW}{result.content_length:>7}B{RESET}",
-            f"{MAGENTA}{result.word_count:>5}W{RESET}",
-            f"{d}{result.line_count:>5}L{r}",
-            f"{WHITE}{result.path}{RESET}",
-        ]
-    else:
-        parts = [
-            f"{result.status_code:>3}",
-            f"{result.method:<7}",
-            f"{result.content_length:>7}B",
-            f"{result.word_count:>5}W",
-            f"{result.line_count:>5}L",
-            f"{result.path}",
-        ]
-    line = " | ".join(parts)
+    r = RESET if use_color else ""
+
+    # Status code — per-code color
+    sc_color = _status_color(result.status_code) if use_color else ""
+    sc = f"{sc_color}{result.status_code:>3}{r}" if use_color else f"{result.status_code:>3}"
+
+    # Method
+    method = f"{CYAN}{result.method:<7}{r}" if use_color else f"{result.method:<7}"
+
+    # Magnitude-colored columns
+    size = _fmt_magnitude(result.content_length, _SIZE_COLORS, use_color)
+    words = _fmt_magnitude(result.word_count, _WORD_COLORS, use_color)
+    lines = _fmt_magnitude(result.line_count, _LINE_COLORS, use_color)
+
+    # Path
+    path = f"{WHITE}{result.path}{r}" if use_color else result.path
+
+    line = f"{sc} | {method} | {size} | {words} | {lines} | {path}"
+
     if result.original_method and result.original_method != result.method:
-        hint = f" {DIM}(original: {result.original_method}){RESET}" if use_color else f" (original: {result.original_method})"
+        hint = f" {DIM}(original: {result.original_method}){r}" if use_color else f" (original: {result.original_method})"
         line += hint
     if result.redirect_location:
         redir = f" -> {result.redirect_location}"
-        line += f" {DIM}{redir}{RESET}" if use_color else redir
+        line += f" {DIM}{redir}{r}" if use_color else redir
     return line
 
 
@@ -112,7 +164,7 @@ def print_banner(target: str, route_count: int,
     g = GREEN if use_color else ""
     rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.3.0{r}\n")
+    print(f" {d}api content discovery · v0.4.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 

@@ -33,28 +33,46 @@ def _make_result(**overrides) -> ScanResult:
 
 
 class TestFormatResult:
-    def test_200_green(self):
+    def test_200_has_color(self):
         r = _make_result(status_code=200)
         line = format_result(r, use_color=True)
-        assert "\033[32m" in line  # GREEN
+        assert "\033[38;5;82m" in line  # 256-color bright green
         assert "200" in line
 
-    def test_301_yellow(self):
+    def test_301_has_color(self):
         r = _make_result(status_code=301, redirect_location="http://example.com/new")
         line = format_result(r, use_color=True)
-        assert "\033[33m" in line  # YELLOW
+        assert "\033[38;5;220m" in line  # 256-color yellow
         assert "301" in line
         assert "/new" in line
 
-    def test_405_red(self):
+    def test_405_bold_red(self):
         r = _make_result(status_code=405)
         line = format_result(r, use_color=True)
-        assert "\033[31m" in line  # RED
+        assert "\033[1m" in line  # BOLD
+        assert "\033[38;5;196m" in line  # bright red
 
-    def test_404_dim(self):
+    def test_404_dim_grey(self):
         r = _make_result(status_code=404)
         line = format_result(r, use_color=True)
-        assert "\033[2m" in line  # DIM
+        assert "\033[38;5;245m" in line  # dim grey
+
+    def test_401_distinct_from_404(self):
+        r401 = format_result(_make_result(status_code=401), use_color=True)
+        r404 = format_result(_make_result(status_code=404), use_color=True)
+        # 401 should use bright orange (214), 404 dim grey (245) — visually distinct
+        assert "\033[38;5;214m" in r401
+        assert "\033[38;5;245m" in r404
+
+    def test_429_background_shaded(self):
+        r = _make_result(status_code=429)
+        line = format_result(r, use_color=True)
+        assert "\033[48;5;" in line  # has background color
+
+    def test_502_background_shaded(self):
+        r = _make_result(status_code=502)
+        line = format_result(r, use_color=True)
+        assert "\033[48;5;" in line  # has background color
 
     def test_no_color(self):
         r = _make_result(status_code=200)
@@ -71,6 +89,30 @@ class TestFormatResult:
         r = _make_result(method="GET", original_method="GET")
         line = format_result(r, use_color=False)
         assert "original" not in line
+
+    def test_magnitude_bytes(self):
+        r = _make_result(content_length=500)
+        line = format_result(r, use_color=False)
+        assert "500" in line
+
+    def test_magnitude_kilobytes(self):
+        r = _make_result(content_length=1500)
+        line = format_result(r, use_color=False)
+        assert "1.5K" in line
+
+    def test_magnitude_megabytes(self):
+        r = _make_result(content_length=2_500_000)
+        line = format_result(r, use_color=False)
+        assert "2.5M" in line
+
+    def test_columns_aligned(self):
+        """Fixed-width columns should produce consistent line lengths up to the path."""
+        r1 = format_result(_make_result(content_length=42, word_count=5, line_count=1), use_color=False)
+        r2 = format_result(_make_result(content_length=150_000, word_count=25_000, line_count=3_000), use_color=False)
+        # Everything before the path should be the same width
+        pre1 = r1.split("/api")[0]
+        pre2 = r2.split("/api")[0]
+        assert len(pre1) == len(pre2)
 
 
 class TestCSVWriter:
