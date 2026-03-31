@@ -153,7 +153,7 @@ class TestCSVWriter:
                 expected = [
                     "timestamp", "url", "method", "path", "status_code",
                     "content_length", "word_count", "line_count",
-                    "redirect_location", "original_method",
+                    "redirect_location", "original_method", "curl",
                 ]
                 assert header == expected
         finally:

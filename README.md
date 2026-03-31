@@ -1,7 +1,7 @@
 ```
  ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
  █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
- api content discovery · v0.5.0
+ api content discovery · v0.6.0
 ```
 
 Lightweight API content discovery tool that uses [Kiterunner](https://github.com/assetnote/kiterunner)'s `.kite` wordlist files to find hidden API endpoints.
@@ -61,7 +61,8 @@ By default, apiscan runs in **safe mode**: GET requests only, with dangerous pat
 | `--header K:V` | - | Extra header (repeatable) |
 | `--status-codes` | - | Whitelist status codes (e.g. `200,301`) |
 | `--blacklist-codes` | - | Blacklist status codes (e.g. `404,500`) |
-| `--output` | - | Write results to CSV |
+| `--output` | - | Write results to CSV (includes curl replay column) |
+| `--replay-proxy` | - | Replay findings through a proxy (e.g. `http://127.0.0.1:8080` for Burp) |
 | `--no-color` | off | Disable ANSI colors |
 
 ## License

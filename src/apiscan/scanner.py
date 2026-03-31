@@ -331,6 +331,8 @@ async def scan(
                 redirect_location=redirect_location,
                 original_method=original_method,
                 timestamp=ts,
+                request_headers=headers,
+                request_body=body_str,
             )
             results.append(result)
             if on_result:

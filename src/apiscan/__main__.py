@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import sys
 import tarfile
 import time
@@ -225,7 +226,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     output = sc.add_argument_group("output")
     output.add_argument("--output", default=None, metavar="PATH",
-                        help="Write CSV results to file")
+                        help="Write CSV results to file (includes curl replay column)")
+    output.add_argument("--replay-proxy", default=None, metavar="URL",
+                        help="Replay findings through a proxy (e.g. http://127.0.0.1:8080 for Burp)")
     output.add_argument("--verbose", action="store_true",
                         help="Show additional details")
     output.add_argument("--no-color", action="store_true",
@@ -314,19 +317,50 @@ async def _scan(args: argparse.Namespace) -> None:
     filtered_routes, stats = apply_safety_filter(
         routes, unsafe_methods=unsafe_methods, unsafe_keywords=unsafe_keywords,
     )
+
+    # Shuffle routes so we spread across path prefixes rather than hammering one API
+    # at a time. Seeded for deterministic re-runs.
+    random.Random(42).shuffle(filtered_routes)
+
     if not args.quiet:
         print(f"\r{' ' * 80}\r", end="")  # clear the status line
         print_banner(args.url, len(filtered_routes), unsafe_methods, unsafe_keywords, stats, use_color)
 
-    csv_writer = CSVWriter(args.output) if args.output else None
+    csv_writer = CSVWriter(args.output, replay_proxy=args.replay_proxy) if args.output else None
     progress = ProgressTracker(len(filtered_routes), use_color) if not args.quiet else None
+
+    # Replay proxy: re-send findings through a proxy (e.g. Burp) so they appear
+    # in the proxy history for manual inspection and modification.
+    import httpx as _httpx
+    replay_client: _httpx.AsyncClient | None = None
+    if args.replay_proxy:
+        replay_client = _httpx.AsyncClient(
+            proxy=args.replay_proxy, verify=False, follow_redirects=False,
+        )
+
     # Deduplicate output — same (status, method, path, size) shown once.
     # All results still go to CSV; only terminal display is deduped.
     seen_results: set[tuple[int, str, str, int]] = set()
 
+    async def _replay(result: ScanResult) -> None:
+        """Re-send the finding through the replay proxy."""
+        if not replay_client:
+            return
+        try:
+            await replay_client.request(
+                result.method, result.url,
+                headers=result.request_headers or {},
+                content=result.request_body.encode() if result.request_body else None,
+                timeout=args.timeout,
+            )
+        except Exception:
+            pass  # best-effort replay, don't break the scan
+
     def on_result(result: ScanResult) -> None:
         if csv_writer:
             csv_writer.write_result(result)
+        if replay_client:
+            asyncio.create_task(_replay(result))
         display_key = (result.status_code, result.method, result.path, result.content_length)
         if display_key in seen_results:
             return
@@ -358,6 +392,9 @@ async def _scan(args: argparse.Namespace) -> None:
     )
 
     elapsed = time.monotonic() - start
+
+    if replay_client:
+        await replay_client.aclose()
 
     if csv_writer:
         csv_writer.close()

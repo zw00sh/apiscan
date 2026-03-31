@@ -88,6 +88,23 @@ class ScanResult:
     redirect_location: str | None = None
     original_method: str = ""
     timestamp: str = ""
+    request_headers: dict[str, str] | None = None
+    request_body: str | None = None
+
+
+def build_curl(result: ScanResult, proxy: str | None = None) -> str:
+    """Build a curl command that replays the request."""
+    parts = ["curl", "-s", "-k"]
+    if result.method != "GET":
+        parts += ["-X", result.method]
+    if proxy:
+        parts += ["-x", proxy]
+    for k, v in (result.request_headers or {}).items():
+        parts += ["-H", f"'{k}: {v}'"]
+    if result.request_body:
+        parts += ["-d", f"'{result.request_body}'"]
+    parts.append(f"'{result.url}'")
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +182,7 @@ def print_banner(target: str, route_count: int,
     g = GREEN if use_color else ""
     rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.5.0{r}\n")
+    print(f" {d}api content discovery · v0.6.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
@@ -193,22 +210,23 @@ def print_banner(target: str, route_count: int,
 _CSV_COLUMNS = [
     "timestamp", "url", "method", "path", "status_code",
     "content_length", "word_count", "line_count",
-    "redirect_location", "original_method",
+    "redirect_location", "original_method", "curl",
 ]
 
 
 class CSVWriter:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, replay_proxy: str | None = None) -> None:
         self._file = open(path, "w", newline="")
         self._writer = csv.writer(self._file)
         self._writer.writerow(_CSV_COLUMNS)
+        self._proxy = replay_proxy
 
     def write_result(self, result: ScanResult) -> None:
         self._writer.writerow([
             result.timestamp, result.url, result.method, result.path,
             result.status_code, result.content_length, result.word_count,
             result.line_count, result.redirect_location or "",
-            result.original_method,
+            result.original_method, build_curl(result, self._proxy),
         ])
 
     def close(self) -> None:
