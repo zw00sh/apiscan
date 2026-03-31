@@ -1,6 +1,6 @@
 ```
- █▄▀ █ ▀█▀ █▀▀ █ █ █ ▄▀█ █   █▄▀ █▀▀ █▀█
- █ █ █  █  ██▄ ▀▄▀▄▀ █▀█ █▄▄ █ █ ██▄ █▀▄
+ ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
+ █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
  api content discovery · v0.1.0
 ```
 
@@ -9,39 +9,48 @@ Lightweight API content discovery tool that uses [Kiterunner](https://github.com
 ## Install
 
 ```
-pipx install git+https://github.com/zw00sh/kitewalker.git
+pipx install git+https://github.com/zw00sh/apiscan.git
 ```
 
 Or with poetry for development:
 
 ```
-git clone https://github.com/zw00sh/kitewalker.git
-cd kitewalker
+git clone https://github.com/zw00sh/apiscan.git
+cd apiscan
 poetry install
 ```
 
-## Wordlists
-
-Download `.kite` files from Assetnote's CDN:
-
-https://wordlists-cdn.assetnote.io/data/kiterunner/
-
-`routes-large.kite` (~183MB) and `routes-small.kite` (~1.7MB) are the Swagger-derived wordlists with typed route parameters.
-
-## Usage
+## Quick Start
 
 ```
-kitewalker --kite routes-small.kite --url https://target.com
+apiscan scan --url https://target.com
 ```
 
-By default, kitewalker runs in **safe mode**: GET requests only, with dangerous path keywords filtered. Use `--unsafe` to send all HTTP methods from the wordlist.
+On first run, apiscan automatically downloads `routes-large.kite` (~35MB download, ~183MB extracted) from [Assetnote's CDN](https://wordlists-cdn.assetnote.io/data/kiterunner/) and caches it in `~/.cache/apiscan/`.
 
-### Flags
+Use `--fast` to use the smaller wordlist (~1.7MB, 36k routes vs 958k):
+
+```
+apiscan scan --url https://target.com --fast
+```
+
+Or bring your own `.kite` file:
+
+```
+apiscan scan --url https://target.com --kite /path/to/custom.kite
+```
+
+You can also pre-download wordlists with `apiscan download`.
+
+By default, apiscan runs in **safe mode**: GET requests only, with dangerous path keywords filtered. Use `--unsafe` to send all HTTP methods from the wordlist.
+
+### Scan Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--kite` | required | Path to `.kite` wordlist |
 | `--url` | required | Target base URL |
+| `--kite` | routes-large | Path to `.kite` wordlist (auto-downloads if not cached) |
+| `--fast` | off | Use routes-small.kite instead of routes-large.kite |
 | `--unsafe` | off | Send all HTTP methods, disable keyword filter |
 | `--concurrency` | 10 | Max concurrent requests |
 | `--rate` | unlimited | Requests per second cap |

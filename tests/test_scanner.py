@@ -8,9 +8,9 @@ import time
 import httpx
 import pytest
 
-from kitewalker.kite import Crumb, Route
-from kitewalker.output import ScanResult
-from kitewalker.scanner import (
+from apiscan.kite import Crumb, Route
+from apiscan.output import ScanResult
+from apiscan.scanner import (
     RateLimiter,
     WildcardResponse,
     compute_baseline,

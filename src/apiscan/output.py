@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from kitewalker.kite import FilterStats
+    from apiscan.kite import FilterStats
 
 # ---------------------------------------------------------------------------
 # ANSI colors
@@ -84,7 +84,7 @@ def format_result(result: ScanResult, use_color: bool = True) -> str:
     return line
 
 
-BANNER = " █▄▀ █ ▀█▀ █▀▀ █ █ █ ▄▀█ █   █▄▀ █▀▀ █▀█\n █ █ █  █  ██▄ ▀▄▀▄▀ █▀█ █▄▄ █ █ ██▄ █▀▄"
+BANNER = " ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █\n █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█"
 
 
 def print_banner(target: str, route_count: int, unsafe: bool,

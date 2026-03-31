@@ -1,10 +1,10 @@
 [tool.poetry]
-name = "kitewalker"
+name = "apiscan"
 version = "0.1.0"
 description = "Lightweight API content discovery using Kiterunner .kite wordlists"
 license = "AGPL-3.0-only"
 authors = []
-packages = [{include = "kitewalker", from = "src"}]
+packages = [{include = "apiscan", from = "src"}]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
@@ -17,7 +17,7 @@ pytest-asyncio = ">=0.25"
 uvicorn = ">=0.30"
 
 [tool.poetry.scripts]
-kitewalker = "kitewalker.__main__:cli"
+apiscan = "apiscan.__main__:cli"
 
 [build-system]
 requires = ["poetry-core"]

@@ -6,8 +6,8 @@ import csv
 import os
 import tempfile
 
-from kitewalker.kite import FilterStats
-from kitewalker.output import (
+from apiscan.kite import FilterStats
+from apiscan.output import (
     CSVWriter,
     ScanResult,
     format_result,

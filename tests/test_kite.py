@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-from kitewalker.kite import (
+from apiscan.kite import (
     DANGEROUS_KEYWORDS,
     VALID_METHODS,
     Crumb,

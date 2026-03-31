@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import httpx
 
-from kitewalker.kite import Route, render_body, render_headers, render_path, render_query
+from apiscan.kite import Route, render_body, render_headers, render_path, render_query
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +209,7 @@ class RateLimiter:
 # Main scan engine
 # ---------------------------------------------------------------------------
 
-from kitewalker.output import ScanResult
+from apiscan.output import ScanResult
 
 
 async def scan(
