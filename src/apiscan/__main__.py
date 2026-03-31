@@ -320,13 +320,20 @@ async def _scan(args: argparse.Namespace) -> None:
 
     csv_writer = CSVWriter(args.output) if args.output else None
     progress = ProgressTracker(len(filtered_routes), use_color) if not args.quiet else None
+    # Deduplicate output — same (status, method, path, size) shown once.
+    # All results still go to CSV; only terminal display is deduped.
+    seen_results: set[tuple[int, str, str, int]] = set()
 
     def on_result(result: ScanResult) -> None:
+        if csv_writer:
+            csv_writer.write_result(result)
+        display_key = (result.status_code, result.method, result.path, result.content_length)
+        if display_key in seen_results:
+            return
+        seen_results.add(display_key)
         if progress:
             print(f"\r{' ' * 60}\r", end="", file=sys.stderr, flush=True)
         print(format_result(result, use_color))
-        if csv_writer:
-            csv_writer.write_result(result)
 
     def on_progress(findings_delta: int) -> None:
         if progress:
