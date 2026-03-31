@@ -191,13 +191,8 @@ def group_by_depth(routes: list[Route], depth: int = 1) -> dict[str, list[Route]
 # ---------------------------------------------------------------------------
 
 # Routes are scanned in phases ordered by complexity (total crumb count).
+# Each distinct crumb count is its own phase: 0 first, then 1, 2, etc.
 # Simpler routes run first for faster early results.
-COMPLEXITY_PHASES = [
-    ("A", 0, 0),       # bare paths, no crumbs
-    ("B", 1, 5),       # light params
-    ("C", 6, 20),      # moderate
-    ("D", 21, 10_000), # heavy
-]
 
 
 def route_complexity(route: Route) -> int:
@@ -207,13 +202,16 @@ def route_complexity(route: Route) -> int:
 
 
 def group_by_complexity(routes: list[Route]) -> list[tuple[str, list[Route]]]:
-    """Split routes into complexity phases. Seeded shuffle within each phase."""
+    """Split routes into per-complexity phases. Seeded shuffle within each."""
+    buckets: dict[int, list[Route]] = {}
+    for r in routes:
+        c = route_complexity(r)
+        buckets.setdefault(c, []).append(r)
     phases: list[tuple[str, list[Route]]] = []
-    for label, lo, hi in COMPLEXITY_PHASES:
-        phase_routes = [r for r in routes if lo <= route_complexity(r) <= hi]
-        if phase_routes:
-            random.Random(42).shuffle(phase_routes)
-            phases.append((label, phase_routes))
+    for complexity in sorted(buckets):
+        phase_routes = sorted(buckets[complexity], key=lambda r: r.template_path)
+        label = f"{complexity} mutations"
+        phases.append((label, phase_routes))
     return phases
 
 

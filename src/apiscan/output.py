@@ -302,14 +302,16 @@ class ProgressTracker:
         total_pct = self.completed * 100 / self.total if self.total else 0
         phase_pct = self.phase_completed * 100 / self.phase_total if self.phase_total else 0
         phase_bar = braille_bar(phase_pct)
-        hidden_str = f" {d}| {self.hidden} mutations hidden{r}" if self.hidden else ""
-        line = (f"\r{d}[{self.completed}/{self.total}]{r} "
+        hidden_str = f" {d}| {DIM}{self.hidden} hidden{r}" if self.hidden else ""
+        # Clear the full line first to prevent leftover text from longer previous lines
+        print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
+        line = (f"{d}[{self.completed}/{self.total}]{r} "
                 f"{d}[{total_pct:>3.0f}%]{r} "
-                f"{d}| Phase {self.phase}{r} [{g}{phase_bar}{r}] "
-                f"{d}|{r} {c}{self.findings} findings{r} "
+                f"{d}| {self.phase}{r} [{g}{phase_bar}{r}] "
+                f"{d}|{r} {c}{self.findings} routes{r} "
                 f"{d}| {rps:.0f} req/s{r}"
                 f"{hidden_str}")
-        print(f"{line:<80}", end="", flush=True, file=sys.stderr)
+        print(f"\r{line}", end="", flush=True, file=sys.stderr)
         if self.completed == self.total:
             print(file=sys.stderr)
 
@@ -319,4 +321,5 @@ def print_summary(findings: int, total_requests: int, elapsed: float,
     d = DIM if use_color else ""
     r = RESET if use_color else ""
     b = BOLD if use_color else ""
-    print(f"\n{b}{findings} routes{r} from {total_requests} requests in {elapsed:.1f}s")
+    avg_rps = total_requests / elapsed if elapsed > 0 else 0
+    print(f"\n{b}{findings} routes{r} from {total_requests} requests in {elapsed:.1f}s {d}({avg_rps:.0f} avg req/s){r}")

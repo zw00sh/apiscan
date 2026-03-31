@@ -383,7 +383,7 @@ async def _scan(args: argparse.Namespace) -> None:
             return
         seen_results.add(display_key)
         if progress:
-            print(f"\r{' ' * 80}\r", end="", file=sys.stderr, flush=True)
+            print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
         print(format_result(result, use_color))
 
     def on_progress(findings_delta: int) -> None:
