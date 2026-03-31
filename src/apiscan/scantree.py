@@ -5,14 +5,17 @@ Organises routes into a tree by URL path segments.  Each node can hold:
 - **Baselines** per HTTP method (discovered by probing)
 
 Async iteration is depth-first.  At each node the tree:
-1. Probes for a handler boundary (if the node has children and no baseline yet)
-2. Yields the node's routes
+1. Probes for handler boundaries (if the node has children and no baseline yet)
+2. Yields ``BoundaryProbe`` events for any newly-discovered boundaries
+3. Yields the node's routes
 
-This ensures baselines are established before children are scanned.
+This ensures baselines are established before children are scanned, and
+boundary discoveries flow through the same classification pipeline as routes.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
@@ -27,14 +30,34 @@ from apiscan.inference import (
 from apiscan.kite import Route
 
 
+# ---------------------------------------------------------------------------
+# Events yielded during tree walk
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class BoundaryProbe:
+    """A handler boundary discovered during prefix probing.
+
+    Yielded by the tree walk so the scanner can classify it through the
+    same pipeline as normal routes.
+    """
+    prefix: str
+    method: str
+    signature: ResponseSignature
+    ancestor_signature: ResponseSignature
+
+
+# ---------------------------------------------------------------------------
+# Tree node
+# ---------------------------------------------------------------------------
+
 @dataclass
 class _Node:
-    """A node in the scan tree, representing one path segment."""
     segment: str
     routes: list[Route] = field(default_factory=list)
     children: dict[str, _Node] = field(default_factory=dict)
     _insertion_order: list[str] = field(default_factory=list)
-    baselines: dict[str, Baseline] = field(default_factory=dict)  # method -> Baseline
+    baselines: dict[str, Baseline] = field(default_factory=dict)
 
     def get_or_create(self, segment: str) -> _Node:
         if segment not in self.children:
@@ -43,28 +66,24 @@ class _Node:
         return self.children[segment]
 
 
+# ---------------------------------------------------------------------------
+# Scan tree
+# ---------------------------------------------------------------------------
+
 class ScanTree:
     """Unified tree holding routes and baselines, iterable depth-first.
 
-    Usage::
-
-        tree = ScanTree(routes)
-        await tree.initialize(send_fn)   # root baselines
-        async for route in tree.walk(send_fn):
-            # route's ancestors are already baselined
-            ...
+    Yields :class:`Route` and :class:`BoundaryProbe` objects during walk.
     """
 
     def __init__(self, routes: list[Route] | None = None) -> None:
         self._root = _Node(segment="")
         self.route_count = 0
-        self._fresh_boundaries: set[tuple[str, str]] = set()
         if routes:
             for route in routes:
                 self.insert(route)
 
     def insert(self, route: Route) -> None:
-        """Insert a route into the tree based on its template path."""
         path = route.template_path
         if not path.startswith("/"):
             path = "/" + path
@@ -79,25 +98,10 @@ class ScanTree:
         return self.route_count
 
     # ------------------------------------------------------------------
-    # Baseline access (used by InferenceEngine)
+    # Baseline access
     # ------------------------------------------------------------------
 
-    def consume_fresh_boundary(self, prefix: str, method: str) -> bool:
-        """Return ``True`` (once) if this prefix/method is a freshly discovered boundary.
-
-        The first call for a given ``(prefix, method)`` returns ``True`` and
-        clears the flag.  Subsequent calls return ``False``.  Used by the
-        inference engine to report the boundary itself as a finding before
-        filtering its children.
-        """
-        key = (prefix, method)
-        if key in self._fresh_boundaries:
-            self._fresh_boundaries.discard(key)
-            return True
-        return False
-
     def set_baseline(self, prefix: str, method: str, baseline: Baseline) -> None:
-        """Store a baseline at the given prefix for the given method."""
         node = self._resolve(prefix)
         if node is not None:
             node.baselines[method] = baseline
@@ -105,8 +109,8 @@ class ScanTree:
     def lookup_baseline(self, path: str, method: str) -> tuple[str, Baseline] | None:
         """Return ``(prefix, baseline)`` for the nearest ancestor, or ``None``.
 
-        Falls back to a GET baseline at the same prefix if no method-specific
-        baseline exists.
+        Only returns method-specific baselines.  Falls back to GET only at
+        root, where all methods are explicitly probed during initialization.
         """
         parts = path.rstrip("/").split("/")
         for i in range(len(parts), 0, -1):
@@ -116,9 +120,6 @@ class ScanTree:
                 continue
             if method in node.baselines:
                 return candidate, node.baselines[method]
-            if "GET" in node.baselines:
-                return candidate, node.baselines["GET"]
-        # Check root explicitly
         if method in self._root.baselines:
             return "/", self._root.baselines[method]
         if "GET" in self._root.baselines:
@@ -126,37 +127,62 @@ class ScanTree:
         return None
 
     # ------------------------------------------------------------------
-    # Initialization
+    # Initialization (parallel)
     # ------------------------------------------------------------------
 
     async def initialize(self, send_fn) -> None:
-        """Establish root baselines (2 probes per method)."""
+        """Establish root baselines with random + error-shape probes.
+
+        Sends probes in parallel for all methods.  Each method gets:
+        - 2 random-path probes (default handler)
+        - 1 encoded-traversal probe (WAF/proxy rejection)
+        - 1 extension probe (extension-specific handlers)
+        - 1 trailing-slash probe (slash-specific behaviour)
+        """
+        async def _probe(method: str, path: str) -> tuple[str, ResponseSignature | None]:
+            try:
+                sig = await send_fn(method, path, None, None)
+                return method, sig
+            except Exception:
+                return method, None
+
+        # Build all probe tasks
+        tasks = []
         for method in _ALTERNATE_METHODS:
-            sigs: list[ResponseSignature] = []
-            for _ in range(2):
-                path = f"/{_random_segment()}"
-                try:
-                    sig = await send_fn(method, path, None, None)
-                    sigs.append(sig)
-                except Exception:
-                    pass
+            tasks.append(_probe(method, f"/{_random_segment()}"))
+            tasks.append(_probe(method, f"/{_random_segment()}"))
+            tasks.append(_probe(method, "/%2e%2e"))
+            tasks.append(_probe(method, f"/{_random_segment()}.php"))
+            tasks.append(_probe(method, f"/{_random_segment()}/"))
+
+        results = await asyncio.gather(*tasks)
+
+        # Group by method, build baselines
+        by_method: dict[str, list[ResponseSignature]] = {}
+        for method, sig in results:
+            if sig is not None:
+                by_method.setdefault(method, []).append(sig)
+        for method, sigs in by_method.items():
             if sigs:
                 self._root.baselines[method] = build_baseline(sigs)
 
     # ------------------------------------------------------------------
-    # Depth-first walk with automatic prefix probing
+    # Depth-first walk with parallel prefix probing
     # ------------------------------------------------------------------
 
-    async def walk(self, send_fn) -> AsyncIterator[Route]:
-        """Depth-first iteration.  Probes empty intermediate nodes before
-        yielding their children's routes."""
-        async for route in self._walk(self._root, "", send_fn):
-            yield route
+    async def walk(self, send_fn) -> AsyncIterator[Route | BoundaryProbe]:
+        """Depth-first iteration.  Probes intermediate nodes and yields
+        boundary discoveries before yielding routes."""
+        async for item in self._walk(self._root, "", send_fn):
+            yield item
 
-    async def _walk(self, node: _Node, prefix: str, send_fn) -> AsyncIterator[Route]:
-        # If this node has children but no baseline, probe it to establish one
+    async def _walk(
+        self, node: _Node, prefix: str, send_fn,
+    ) -> AsyncIterator[Route | BoundaryProbe]:
+        # Probe this node for handler boundaries (if it has children)
         if node.children and prefix:
-            await self._probe_node(node, prefix, send_fn)
+            async for bp in self._probe_node(node, prefix, send_fn):
+                yield bp
 
         # Yield this node's routes
         for route in node.routes:
@@ -165,73 +191,65 @@ class ScanTree:
         # Recurse into children in insertion order
         for seg in node._insertion_order:
             child_prefix = f"{prefix}/{seg}" if prefix else f"/{seg}"
-            async for route in self._walk(node.children[seg], child_prefix, send_fn):
-                yield route
+            async for item in self._walk(node.children[seg], child_prefix, send_fn):
+                yield item
 
-    async def _probe_node(self, node: _Node, prefix: str, send_fn) -> None:
-        """Probe a node to establish per-method baselines if needed."""
-        for method in _ALTERNATE_METHODS:
+    async def _probe_node(
+        self, node: _Node, prefix: str, send_fn,
+    ) -> AsyncIterator[BoundaryProbe]:
+        """Probe a node in parallel for all methods, yield boundary discoveries."""
+
+        async def _probe_method(method: str) -> tuple[str, ResponseSignature | None, Baseline | None]:
             if method in node.baselines:
-                continue
-
-            # Find nearest ancestor baseline via lookup (all ancestors probed already)
+                return method, None, None
             ancestor_result = self.lookup_baseline(prefix, method)
             if ancestor_result is None:
-                continue
+                return method, None, None
             ancestor_prefix, ancestor_baseline = ancestor_result
-            # Don't re-probe if lookup already found a baseline at this exact prefix
             if ancestor_prefix == prefix:
-                continue
+                return method, None, None
 
             probe_path = f"{prefix.rstrip('/')}/{_random_segment()}"
             try:
                 probe_sig = await send_fn(method, probe_path, None, None)
             except Exception:
-                continue
+                return method, None, None
 
-            # Does the probe differ from the ancestor baseline?
             probe_len = len(probe_path.lstrip("/"))
             if matches_baseline(probe_sig, ancestor_baseline, probe_len) is not None:
+                return method, None, None
+
+            return method, probe_sig, ancestor_baseline
+
+        # Fire all method probes in parallel
+        results = await asyncio.gather(*[_probe_method(m) for m in _ALTERNATE_METHODS])
+
+        # Process results: register baselines, yield boundary probes
+        for method, probe_sig, ancestor_baseline in results:
+            if probe_sig is None:
                 continue
 
-            # New handler boundary — second probe for variance detection
-            sigs = [probe_sig]
+            # Second probe for variance detection
+            extra_path = f"{prefix.rstrip('/')}/{_random_segment()}"
             try:
-                extra_path = f"{prefix.rstrip('/')}/{_random_segment()}"
                 extra_sig = await send_fn(method, extra_path, None, None)
-                sigs.append(extra_sig)
+                sigs = [probe_sig, extra_sig]
             except Exception:
-                pass
+                sigs = [probe_sig]
 
             node.baselines[method] = build_baseline(sigs)
-            # Mark this as a fresh boundary — the first route here should be
-            # reported even if it matches the baseline, since the boundary
-            # itself is a discovery (e.g. a 403 "forbidden" handler).
-            self._fresh_boundaries.add((prefix, method))
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _resolve(self, prefix: str) -> _Node | None:
-        """Resolve a prefix path to its tree node."""
-        if prefix == "/" or prefix == "":
-            return self._root
-        segments = _split(prefix)
-        node = self._root
-        for seg in segments:
-            if seg not in node.children:
-                return None
-            node = node.children[seg]
-        return node
-
+            yield BoundaryProbe(
+                prefix=prefix,
+                method=method,
+                signature=probe_sig,
+                ancestor_signature=ancestor_baseline.signatures[0],
+            )
 
     # ------------------------------------------------------------------
     # Debug: ASCII tree representation
     # ------------------------------------------------------------------
 
     def format_tree(self) -> str:
-        """Return an ASCII representation of the tree showing baselines."""
         lines: list[str] = []
         self._format_node(self._root, "/", "", True, lines)
         return "\n".join(lines)
@@ -241,7 +259,6 @@ class ScanTree:
     ) -> None:
         connector = "└── " if last else "├── "
         if not indent:
-            # Root node
             bl_info = self._baseline_summary(node)
             lines.append(f"/ {bl_info}" if bl_info else "/")
         else:
@@ -266,7 +283,21 @@ class ScanTree:
                 parts.append(f"{method}:{ref.status_code}/{ref.content_type}")
         return f"[{', '.join(parts)}]" if parts else ""
 
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _resolve(self, prefix: str) -> _Node | None:
+        if prefix == "/" or prefix == "":
+            return self._root
+        segments = _split(prefix)
+        node = self._root
+        for seg in segments:
+            if seg not in node.children:
+                return None
+            node = node.children[seg]
+        return node
+
 
 def _split(path: str) -> list[str]:
-    """Split a path into segments: ``/api/v1/users`` -> ``["api", "v1", "users"]``."""
     return [s for s in path.split("/") if s]

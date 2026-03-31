@@ -5,13 +5,13 @@ perturbation.  This module has **no HTTP knowledge** — it receives response
 data and emits probe requests via a caller-supplied ``send_fn`` callback.
 
 The ``InferenceEngine`` reads baselines from a :class:`~apiscan.scantree.ScanTree`
-(which owns both route ordering and baseline storage) and writes nothing
-to the tree itself.
+and classifies both route responses and boundary probe discoveries through
+the same pipeline.
 """
 
 from __future__ import annotations
 
-import random
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -19,7 +19,7 @@ from uuid import uuid4
 from apiscan.kite import Route
 
 if TYPE_CHECKING:
-    from apiscan.scantree import ScanTree
+    from apiscan.scantree import BoundaryProbe, ScanTree
 
 
 # ---------------------------------------------------------------------------
@@ -31,13 +31,13 @@ class ResponseSignature:
     """Captured signals from a single HTTP response."""
 
     status_code: int
-    content_type: str                # e.g. "application/json"
+    content_type: str
     content_length: int
-    adjusted_content_length: int     # body with path string removed
-    adjustment_scale: int            # times path appears in body
+    adjusted_content_length: int
+    adjustment_scale: int
     word_count: int
     line_count: int
-    header_names: frozenset[str]     # lowercase header names present
+    header_names: frozenset[str]
 
 
 @dataclass
@@ -54,8 +54,8 @@ class Finding:
 
     route: Route
     signature: ResponseSignature
-    reason: str          # human-readable explanation
-    confidence: str      # "high", "medium", "low"
+    reason: str
+    confidence: str
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,6 @@ def compute_signature(
     body: bytes,
     path: str,
 ) -> ResponseSignature:
-    """Build a ``ResponseSignature`` from raw HTTP response data."""
     raw_ct = headers.get("content-type", "")
     content_type = raw_ct.split(";", 1)[0].strip().lower()
 
@@ -86,8 +85,6 @@ def compute_signature(
         adjusted_content_length = content_length
         adjustment_scale = 0
 
-    header_names = frozenset(k.lower() for k in headers)
-
     return ResponseSignature(
         status_code=status_code,
         content_type=content_type,
@@ -96,12 +93,12 @@ def compute_signature(
         adjustment_scale=adjustment_scale,
         word_count=word_count,
         line_count=line_count,
-        header_names=header_names,
+        header_names=frozenset(k.lower() for k in headers),
     )
 
 
 # ---------------------------------------------------------------------------
-# Baseline construction
+# Baseline construction & matching
 # ---------------------------------------------------------------------------
 
 _BASELINE_COMPARABLE = (
@@ -111,63 +108,46 @@ _BASELINE_COMPARABLE = (
 
 
 def build_baseline(signatures: list[ResponseSignature]) -> Baseline:
-    """Determine which response fields are stable across multiple probes."""
     if not signatures:
         return Baseline()
     if len(signatures) == 1:
-        return Baseline(
-            signatures=list(signatures),
-            stable_fields=set(_BASELINE_COMPARABLE),
-        )
+        return Baseline(signatures=list(signatures), stable_fields=set(_BASELINE_COMPARABLE))
 
     stable: set[str] = set()
     for f in _BASELINE_COMPARABLE:
         vals = {getattr(s, f) for s in signatures}
         if len(vals) == 1:
             stable.add(f)
-
     return Baseline(signatures=list(signatures), stable_fields=stable)
 
-
-# ---------------------------------------------------------------------------
-# Baseline matching
-# ---------------------------------------------------------------------------
 
 def matches_baseline(
     sig: ResponseSignature,
     baseline: Baseline,
     path_len: int,
 ) -> str | None:
-    """Check if *sig* matches a baseline (i.e. should be filtered).
-
-    Returns a short reason string describing *why* it matched, or ``None``
-    if the response does not match the baseline.
-    """
+    """Return a match reason string, or ``None`` if no match."""
     if not baseline.signatures:
         return None
 
     ref = baseline.signatures[0]
     stable = baseline.stable_fields
 
-    if "status_code" in stable:
-        if sig.status_code != ref.status_code:
-            return None
+    if "status_code" in stable and sig.status_code != ref.status_code:
+        return None
+    if "content_type" in stable and sig.content_type != ref.content_type:
+        return None
 
-    if "content_type" in stable:
-        if sig.content_type != ref.content_type:
-            return None
-
-    if "content_length" in stable:
-        if sig.content_length == ref.content_length:
-            return f"status={ref.status_code}, exact length={sig.content_length}"
+    if "content_length" in stable and sig.content_length == ref.content_length:
+        return f"status={ref.status_code}, exact length={sig.content_length}"
     if "adjusted_content_length" in stable:
         expected = ref.adjusted_content_length + (ref.adjustment_scale * path_len)
         if sig.content_length == expected:
-            return f"status={ref.status_code}, scaled length={sig.content_length} (adj={ref.adjusted_content_length} + {ref.adjustment_scale}*{path_len})"
+            return f"status={ref.status_code}, scaled length={sig.content_length}"
 
-    if "word_count" in stable and "line_count" in stable:
-        if sig.word_count == ref.word_count and sig.line_count == ref.line_count:
-            return f"status={ref.status_code}, words={sig.word_count}, lines={sig.line_count}"
+    if ("word_count" in stable and "line_count" in stable
+            and sig.word_count == ref.word_count and sig.line_count == ref.line_count):
+        return f"status={ref.status_code}, words={sig.word_count}, lines={sig.line_count}"
 
     return None
 
@@ -177,21 +157,19 @@ def matches_baseline(
 # ---------------------------------------------------------------------------
 
 def is_known_bad_site(sig: ResponseSignature) -> bool:
-    """Filter known false-positive patterns from Google Cloud and AWS API Gateway."""
     if (sig.status_code == 400 and sig.content_length == 1555
             and sig.word_count == 82 and sig.line_count == 12):
         return True
     if sig.status_code == 403:
         is_aws = "x-amzn-requestid" in sig.header_names
-        if is_aws or (sig.line_count == 1 and sig.word_count == 6
-                      and sig.content_length == 54):
+        if is_aws or (sig.line_count == 1 and sig.word_count == 6 and sig.content_length == 54):
             if sig.line_count == 1 and sig.word_count in (6, 13, 28):
                 return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# Reason building
+# Reason building & confidence
 # ---------------------------------------------------------------------------
 
 def _build_reason(
@@ -201,49 +179,34 @@ def _build_reason(
     method_probe_status: int | None = None,
     new_headers: frozenset[str] | None = None,
 ) -> list[str]:
-    """Collect human-readable reason fragments for why this is a finding."""
     parts: list[str] = []
-
     if sig.content_type != baseline_ref.content_type:
         parts.append(f"content-type: {baseline_ref.content_type} -> {sig.content_type}")
-
     if method_probe_status == 405:
         parts.append("method-sensitive: 405 Method Not Allowed")
     elif method_probe_status is not None and method_probe_status != sig.status_code:
         parts.append(f"method-sensitive: {method_probe_status} on alternate verb")
-
     if sig.status_code != baseline_ref.status_code:
-        label = _status_label(sig.status_code)
-        parts.append(f"status: {baseline_ref.status_code} -> {sig.status_code}{label}")
-
+        parts.append(f"status: {baseline_ref.status_code} -> {sig.status_code}{_status_label(sig.status_code)}")
     if new_headers:
-        names = ", ".join(sorted(new_headers)[:5])
-        parts.append(f"new headers: {names}")
-
+        parts.append(f"new headers: {', '.join(sorted(new_headers)[:5])}")
     return parts
 
 
 def _status_label(code: int) -> str:
-    labels = {
+    return {
         200: "", 201: " (created)", 204: " (no content)",
         301: " (moved)", 302: " (redirect)",
         400: " (bad request)", 401: " (auth required)", 403: " (forbidden)",
         405: " (method not allowed)", 422: " (validation error)",
         429: " (rate limited)", 500: " (server error)",
-    }
-    return labels.get(code, "")
+    }.get(code, "")
 
-
-# ---------------------------------------------------------------------------
-# Confidence scoring
-# ---------------------------------------------------------------------------
 
 def _score_confidence(reason_parts: list[str]) -> str:
-    high_signals = {"method-sensitive: 405 Method Not Allowed", "content-type:"}
     for part in reason_parts:
-        for hs in high_signals:
-            if part.startswith(hs):
-                return "high"
+        if part.startswith("method-sensitive: 405") or part.startswith("content-type:"):
+            return "high"
     if len(reason_parts) >= 2:
         return "high"
     for part in reason_parts:
@@ -265,27 +228,12 @@ def _random_segment() -> str:
     return uuid4().hex[:16]
 
 
-def _pick_alternate_method(original: str) -> str:
-    candidates = [m for m in _ALTERNATE_METHODS if m != original]
-    return random.choice(candidates)
-
-
 # ---------------------------------------------------------------------------
 # Inference engine
 # ---------------------------------------------------------------------------
 
 class InferenceEngine:
-    """Classifies candidate responses using baselines from a :class:`ScanTree`.
-
-    The engine does not own the baseline tree — it reads from the ``ScanTree``
-    passed at construction.  The tree handles route ordering, prefix probing,
-    and baseline storage.
-
-    ``send_fn`` signature::
-
-        async (method: str, url: str, headers: dict | None, body: str | None)
-            -> ResponseSignature
-    """
+    """Classifies route responses and boundary probes using baselines from a ScanTree."""
 
     def __init__(
         self,
@@ -310,88 +258,188 @@ class InferenceEngine:
             return True
         return False
 
+    # ------------------------------------------------------------------
+    # Classify a boundary probe (from tree walk)
+    # ------------------------------------------------------------------
+
+    def classify_boundary(self, probe: BoundaryProbe) -> Finding | None:
+        """Classify a handler boundary discovered during prefix probing."""
+        if self._filter_status(probe.signature.status_code):
+            return None
+        if is_known_bad_site(probe.signature):
+            return None
+
+        reason_parts = _build_reason(probe.signature, probe.ancestor_signature)
+        if not reason_parts:
+            reason_parts = [f"handler boundary at {probe.prefix}"]
+
+        return Finding(
+            route=Route(template_path=probe.prefix, method=probe.method),
+            signature=probe.signature,
+            reason=f"probe: {', '.join(reason_parts)}",
+            confidence=_score_confidence(reason_parts),
+        )
+
+    # ------------------------------------------------------------------
+    # Classify a route response
+    # ------------------------------------------------------------------
+
     async def process(
         self,
         route: Route,
         sig: ResponseSignature,
         path: str,
         send_fn,
-    ) -> Finding | None:
-        """Classify a candidate response. Returns a :class:`Finding` or ``None``."""
-        # --- Pre-filters ---
+    ) -> Finding | list[Finding] | None:
+        """Classify a candidate response.
+
+        Returns a single ``Finding``, a list of findings (from alternate
+        method probing), or ``None`` if filtered.
+        """
+        # Pre-filters
         if self._filter_status(sig.status_code):
             self._on_filtered(route, path, sig, f"status filter: {sig.status_code}")
             return None
         if is_known_bad_site(sig):
-            self._on_filtered(route, path, sig, f"known bad site pattern: {sig.status_code}, length={sig.content_length}")
+            self._on_filtered(route, path, sig, f"known bad site: {sig.status_code}, length={sig.content_length}")
             return None
 
-        # --- Baseline comparison ---
+        # Baseline comparison
         path_len = len(path.lstrip("/"))
         method = route.method
         node = self._tree.lookup_baseline(path, method)
+
         if node is not None:
             prefix, baseline = node
-            # Consume fresh boundary flag for this prefix — whether the route
-            # matches or deviates.  If it deviates, it'll be reported as a
-            # normal finding.  If it matches, report it as a boundary finding.
-            is_fresh = self._tree.consume_fresh_boundary(prefix, method)
             match_reason = matches_baseline(sig, baseline, path_len)
             if match_reason is not None:
-                if is_fresh:
-                    # First route at a new handler boundary — report the
-                    # boundary itself as a finding (e.g. "403 forbidden on
-                    # a protected resource") even though children will be filtered.
-                    baseline_ref = baseline.signatures[0]
-                    reason_parts = _build_reason(sig, baseline_ref)
-                    if not reason_parts:
-                        reason_parts = [f"handler boundary at {prefix}"]
-                    return Finding(
-                        route=route, signature=sig,
-                        reason=", ".join(reason_parts),
-                        confidence="medium",
-                    )
+                # Route matches baseline — try alternate methods before discarding
+                alt_findings = await self._try_alternate_methods(route, path, send_fn)
+                if alt_findings:
+                    return alt_findings
                 self._on_filtered(route, path, sig, f"baseline match at {prefix}: {match_reason}")
                 return None
             baseline_ref = baseline.signatures[0]
         else:
             baseline_ref = None
 
-        # --- Verification phase ---
+        # No baseline available
         if baseline_ref is None:
             return Finding(
                 route=route, signature=sig,
                 reason="no baseline available", confidence="low",
             )
 
-        # Method change probe
+        # Verification: method change probe
         method_probe_status: int | None = None
-        alt_method = _pick_alternate_method(route.method)
+        alt_method = [m for m in _ALTERNATE_METHODS if m != route.method][0]
         try:
             method_sig = await send_fn(alt_method, path, None, None)
             method_probe_status = method_sig.status_code
         except Exception:
             pass
 
-        # New headers check
+        # Check for new headers
         ref_headers = baseline_ref.header_names
         new_headers = sig.header_names - ref_headers
         new_headers -= {"date", "content-length", "transfer-encoding", "connection"}
 
-        # --- Classification ---
+        # Classification
         reason_parts = _build_reason(
             sig, baseline_ref,
             method_probe_status=method_probe_status,
             new_headers=new_headers if new_headers else None,
         )
-
         if not reason_parts:
             reason_parts = ["response differs from baseline"]
 
-        confidence = _score_confidence(reason_parts)
-        reason = ", ".join(reason_parts)
-
         return Finding(
             route=route, signature=sig,
-            reason=reason, confidence=confidence,
+            reason=", ".join(reason_parts),
+            confidence=_score_confidence(reason_parts),
         )
+
+    # ------------------------------------------------------------------
+    # Parallel alternate method probing
+    # ------------------------------------------------------------------
+
+    async def _try_alternate_methods(
+        self,
+        route: Route,
+        path: str,
+        send_fn,
+    ) -> list[Finding]:
+        """Probe all alternate HTTP methods in parallel.
+
+        Returns findings grouped by distinct response: if POST and PUT both
+        return 400, that's one finding with both methods in the reason.
+        """
+        path_len = len(path.lstrip("/"))
+        alt_methods = [m for m in _ALTERNATE_METHODS if m != route.method]
+
+        # Fire all probes in parallel
+        async def _probe(method: str) -> tuple[str, ResponseSignature | None]:
+            try:
+                sig = await send_fn(method, path, None, None)
+                return method, sig
+            except Exception:
+                return method, None
+
+        results = await asyncio.gather(*[_probe(m) for m in alt_methods])
+
+        # Filter and check each against its method's baseline
+        deviations: list[tuple[str, ResponseSignature, Baseline]] = []
+        for method, sig in results:
+            if sig is None:
+                continue
+            if self._filter_status(sig.status_code):
+                continue
+            if is_known_bad_site(sig):
+                continue
+
+            node = self._tree.lookup_baseline(path, method)
+            if node is None:
+                continue
+            _, method_baseline = node
+            if matches_baseline(sig, method_baseline, path_len) is not None:
+                continue
+
+            deviations.append((method, sig, method_baseline))
+
+        if not deviations:
+            return []
+
+        # Group deviations by response fingerprint
+        groups: dict[tuple[int, str, int], list[tuple[str, ResponseSignature, Baseline]]] = {}
+        for method, sig, bl in deviations:
+            key = (sig.status_code, sig.content_type, sig.content_length)
+            groups.setdefault(key, []).append((method, sig, bl))
+
+        # Build one finding per distinct response
+        findings: list[Finding] = []
+        for _, group in groups.items():
+            methods = [m for m, _, _ in group]
+            sig = group[0][1]
+            baseline_ref = group[0][2].signatures[0]
+            reason_parts = _build_reason(sig, baseline_ref)
+            if not reason_parts:
+                reason_parts = [f"responds differently"]
+            method_label = ", ".join(methods)
+            finding = Finding(
+                route=Route(
+                    template_path=route.template_path,
+                    method=methods[0],
+                    path_crumbs=route.path_crumbs,
+                    header_crumbs=route.header_crumbs,
+                    query_crumbs=route.query_crumbs,
+                    body_crumbs=route.body_crumbs,
+                    content_types=route.content_types,
+                    source_api_url=route.source_api_url,
+                ),
+                signature=sig,
+                reason=f"via {method_label}: {', '.join(reason_parts)}",
+                confidence=_score_confidence(reason_parts),
+            )
+            findings.append(finding)
+
+        return findings

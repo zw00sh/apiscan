@@ -1,8 +1,8 @@
 """Async HTTP scanning engine.
 
 Thin transport layer — sends requests, manages concurrency and rate limiting.
-All response classification is delegated to :mod:`apiscan.inference`.
 Route ordering and baseline management are handled by :mod:`apiscan.scantree`.
+Response classification is handled by :mod:`apiscan.inference`.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from apiscan.inference import (
 )
 from apiscan.kite import Route, render_body, render_headers, render_path, render_query
 from apiscan.output import ScanResult
-from apiscan.scantree import ScanTree
+from apiscan.scantree import BoundaryProbe, ScanTree
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +41,37 @@ class RateLimiter:
             if wait > 0:
                 await asyncio.sleep(wait)
             self._last = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Result building (shared by all finding paths)
+# ---------------------------------------------------------------------------
+
+def _finding_to_result(
+    finding: Finding,
+    base_url: str,
+    *,
+    redirect_location: str | None = None,
+    request_headers: dict[str, str] | None = None,
+    request_body: str | None = None,
+) -> ScanResult:
+    path = finding.route.template_path
+    url = f"{base_url}{path}"
+    return ScanResult(
+        url=url,
+        method=finding.route.method,
+        path=path,
+        status_code=finding.signature.status_code,
+        content_length=finding.signature.content_length,
+        word_count=finding.signature.word_count,
+        line_count=finding.signature.line_count,
+        redirect_location=redirect_location,
+        reason=finding.reason,
+        confidence=finding.confidence,
+        timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        request_headers=request_headers,
+        request_body=request_body,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +100,6 @@ async def scan(
     limiter = RateLimiter(rate_limit) if rate_limit else None
     results: list[ScanResult] = []
 
-    # Build the unified scan tree (routes + baselines)
     tree = ScanTree(routes)
 
     def _inference_filtered(route, path, sig, reason):
@@ -90,8 +120,6 @@ async def scan(
         headers=extra_headers or {},
     ) as client:
 
-        # -- send_fn: the bridge between tree/inference and HTTP -------------
-
         async def send_fn(
             method: str,
             path: str,
@@ -108,23 +136,35 @@ async def scan(
                 timeout=timeout,
             )
             return compute_signature(
-                resp.status_code,
-                dict(resp.headers),
-                resp.content,
-                path,
+                resp.status_code, dict(resp.headers), resp.content, path,
             )
 
-        # -- Initialize root baselines --------------------------------------
-
+        # Initialize root baselines
         await tree.initialize(send_fn)
 
-        # -- Connection failure tracking -------------------------------------
-
+        # Connection failure tracking
         conn_failures = 0
 
-        # -- Per-route scan --------------------------------------------------
+        # -- Emit a finding through the shared pipeline --------------------
 
-        async def _scan_route(route: Route) -> None:
+        def _emit(finding: Finding, **kw) -> None:
+            result = _finding_to_result(finding, base_url, **kw)
+            results.append(result)
+            if on_result:
+                on_result(result)
+            if on_progress:
+                on_progress(1)
+
+        # -- Handle a boundary probe --------------------------------------
+
+        def _handle_boundary(probe: BoundaryProbe) -> None:
+            finding = engine.classify_boundary(probe)
+            if finding is not None:
+                _emit(finding)
+
+        # -- Handle a route ------------------------------------------------
+
+        async def _handle_route(route: Route) -> None:
             nonlocal conn_failures
             if conn_failures >= quarantine_threshold:
                 if on_progress:
@@ -162,67 +202,50 @@ async def scan(
             conn_failures = 0
 
             sig = compute_signature(
-                resp.status_code,
-                dict(resp.headers),
-                resp.content,
-                path,
+                resp.status_code, dict(resp.headers), resp.content, path,
             )
 
-            finding = await engine.process(route, sig, path, send_fn)
+            result = await engine.process(route, sig, path, send_fn)
 
-            if finding is None:
+            if result is None:
                 if on_progress:
                     on_progress(0)
                 return
 
-            redirect_location = None
-            if resp.history:
-                redirect_location = str(resp.url)
+            redirect_location = str(resp.url) if resp.history else None
 
-            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-            result = ScanResult(
-                url=url,
-                method=route.method,
-                path=path,
-                status_code=sig.status_code,
-                content_length=sig.content_length,
-                word_count=sig.word_count,
-                line_count=sig.line_count,
-                redirect_location=redirect_location,
-                reason=finding.reason,
-                confidence=finding.confidence,
-                timestamp=ts,
-                request_headers=headers,
-                request_body=body_str,
-            )
-            results.append(result)
-            if on_result:
-                on_result(result)
-            if on_progress:
-                on_progress(1)
+            # process() can return a single Finding or a list of Findings
+            findings = result if isinstance(result, list) else [result]
+            for finding in findings:
+                _emit(
+                    finding,
+                    redirect_location=redirect_location,
+                    request_headers=headers,
+                    request_body=body_str,
+                )
 
-        # -- Tree-driven orchestration ---------------------------------------
-        # The scan tree yields routes depth-first, probing empty intermediate
-        # nodes for baselines before yielding their children.  A bounded
-        # worker pool ensures each route completes fully before the next starts.
+        # -- Tree-driven orchestration ------------------------------------
 
         if on_phase:
             on_phase("scanning", len(tree))
 
         async def _worker(queue: asyncio.Queue) -> None:
             while True:
-                route = await queue.get()
+                item = await queue.get()
                 try:
-                    await _scan_route(route)
+                    if isinstance(item, BoundaryProbe):
+                        _handle_boundary(item)
+                    else:
+                        await _handle_route(item)
                 finally:
                     queue.task_done()
 
-        queue: asyncio.Queue[Route] = asyncio.Queue(maxsize=concurrency * 2)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 2)
         workers = [asyncio.create_task(_worker(queue)) for _ in range(concurrency)]
 
         try:
-            async for route in tree.walk(send_fn):
-                await queue.put(route)
+            async for item in tree.walk(send_fn):
+                await queue.put(item)
             await queue.join()
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
