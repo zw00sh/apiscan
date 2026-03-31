@@ -174,14 +174,11 @@ def group_by_depth(routes: list[Route], depth: int = 1) -> dict[str, list[Route]
         path = route.template_path
         if not path.startswith("/"):
             path = "/" + path
-        hits = 0
-        prefix = path
-        for i, ch in enumerate(path):
-            if ch == "/":
-                hits += 1
-            if hits == depth + 1:
-                prefix = path[:i]
-                break
+        parts = path.split("/")
+        if len(parts) > depth + 1:
+            prefix = "/".join(parts[:depth + 1])
+        else:
+            prefix = path
         groups.setdefault(prefix, []).append(route)
     return groups
 
@@ -400,10 +397,16 @@ async def scan(
                 on_phase(phase_label, len(phase_routes))
 
             groups = group_by_depth(phase_routes, depth=1)
-            all_tasks: list[asyncio.Task] = []
 
+            # Preflight all uncached prefixes concurrently
+            uncached = [p for p in groups if p not in prefix_cache]
+            if uncached:
+                await asyncio.gather(*[_get_baselines(p) for p in uncached])
+
+            # All baselines now cached — create scan tasks
+            all_tasks: list[asyncio.Task] = []
             for prefix, group_routes in groups.items():
-                baselines = await _get_baselines(prefix)
+                baselines = prefix_cache[prefix]
                 for route in group_routes:
                     all_tasks.append(asyncio.create_task(_scan_route(route, baselines)))
 

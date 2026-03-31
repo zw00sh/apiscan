@@ -118,6 +118,17 @@ class TestGroupByDepth:
         assert len(groups["/api"]) == 2
         assert "/health" in groups
 
+    def test_depth_1_no_subpath(self):
+        routes = [Route(template_path="/health", method="GET")]
+        groups = group_by_depth(routes, depth=1)
+        assert "/health" in groups
+        assert len(groups["/health"]) == 1
+
+    def test_depth_1_missing_leading_slash(self):
+        routes = [Route(template_path="api/v1/users", method="GET")]
+        groups = group_by_depth(routes, depth=1)
+        assert "/api" in groups
+
 
 class TestRateLimiter:
     @pytest.mark.asyncio

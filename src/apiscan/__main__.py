@@ -14,7 +14,7 @@ import warnings
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from apiscan.kite import Route, apply_safety_filter, load_kite
+from apiscan.kite import Route, apply_safety_filter, load_kite, route_from_dict, route_to_dict
 from apiscan.output import (
     BOLD,
     CYAN,
@@ -115,7 +115,8 @@ def _download_kite(cache_dir: Path, force: bool = False, use_color: bool = True)
 def _build_index(kite_path: str, cache_dir: Path, mode: str, use_color: bool = True) -> Path:
     """Build a scan index: deduplicated routes appearing in >= threshold APIs.
 
-    Stores a JSON set of (template_path, method) pairs. Cached per mode.
+    Caches full Route objects (with crumbs) so subsequent scans skip the
+    protobuf parse entirely.
     """
     index_name, threshold = SCAN_MODES[mode]
     d = DIM if use_color else ""
@@ -143,20 +144,42 @@ def _build_index(kite_path: str, cache_dir: Path, mode: str, use_color: bool = T
         if i % 50_000 == 0:
             _progress(f"  {c}building {mode} index{r}", i, total)
 
-    fast_keys = [list(k) for k, apis in route_apis.items() if len(apis) >= threshold]
+    fast_key_set = {k for k, apis in route_apis.items() if len(apis) >= threshold}
 
+    # Deduplicate: keep first route per (template_path, method) key
+    seen_keys: set[tuple[str, str]] = set()
+    deduped: list[Route] = []
+    for route in routes:
+        key = (route.template_path, route.method)
+        if key in fast_key_set and key not in seen_keys:
+            seen_keys.add(key)
+            deduped.append(route)
+
+    payload = {
+        "v": 2,
+        "kite_mtime": os.path.getmtime(kite_path),
+        "kite_size": os.path.getsize(kite_path),
+        "routes": [route_to_dict(r) for r in deduped],
+    }
     with open(index_path, "w") as f:
-        json.dump(fast_keys, f)
+        json.dump(payload, f)
 
-    print(f"\r  {c}{mode} index:{r} {len(fast_keys):,} routes (>={threshold} APIs, from {len(route_apis):,} unique){' ' * 20}")
+    print(f"\r  {c}{mode} index:{r} {len(deduped):,} routes (>={threshold} APIs, from {len(route_apis):,} unique){' ' * 20}")
     return index_path
 
 
-def _apply_fast_filter(routes: list[Route], index_path: Path) -> list[Route]:
-    """Filter routes to only those in the fast index."""
+def _load_cached_routes(index_path: Path, kite_path: str) -> list[Route] | None:
+    """Load cached routes from a v2 index. Returns None if stale or old format."""
     with open(index_path) as f:
-        fast_keys = {(p, m) for p, m in json.load(f)}
-    return [r for r in routes if (r.template_path, r.method) in fast_keys]
+        data = json.load(f)
+    if isinstance(data, list):
+        return None  # v1 format, rebuild
+    if data.get("v") != 2:
+        return None
+    if (data.get("kite_mtime") != os.path.getmtime(kite_path)
+            or data.get("kite_size") != os.path.getsize(kite_path)):
+        return None  # stale
+    return [route_from_dict(d) for d in data["routes"]]
 
 
 # ---------------------------------------------------------------------------
@@ -313,17 +336,29 @@ async def _scan(args: argparse.Namespace) -> None:
         bar = braille_bar(pct)
         print(f"\r  {c2}parsing {kite_name}{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
 
-    if not args.quiet:
-        print(f"  {c2}parsing {kite_name}{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
-    routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
-
-    # Apply --fast/--short filter if requested (before safety filter)
+    # Try loading cached routes for --fast/--short (skip full protobuf parse)
     scan_mode = "fast" if args.fast else ("short" if args.short else None)
+    routes = None
+
     if scan_mode and not args.kite:
+        index_name, _ = SCAN_MODES[scan_mode]
+        cache_dir = _default_cache_dir()
+        index_path = cache_dir / index_name
+        if index_path.exists():
+            if not args.quiet:
+                print(f"\r  {c2}loading {scan_mode} cache{r}{' ' * 40}", end="", flush=True)
+            routes = _load_cached_routes(index_path, kite_path)
+
+    if routes is None:
+        # Full parse needed (no mode, custom kite, or stale/missing cache)
         if not args.quiet:
-            print(f"\r  {d}applying {scan_mode} filter...{' ' * 30}{r}", end="", flush=True)
-        index_path = _ensure_index(kite_path, scan_mode, use_color)
-        routes = _apply_fast_filter(routes, index_path)
+            print(f"\r  {c2}parsing {kite_name}{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
+        routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
+        if scan_mode and not args.kite:
+            if not args.quiet:
+                print(f"\r  {d}building {scan_mode} cache...{' ' * 30}{r}", end="", flush=True)
+            index_path = _ensure_index(kite_path, scan_mode, use_color)
+            routes = _load_cached_routes(index_path, kite_path) or routes
 
     if not args.quiet:
         print(f"\r  {d}filtering {len(routes):,} routes...{' ' * 40}{r}", end="", flush=True)

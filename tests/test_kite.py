@@ -18,6 +18,8 @@ from apiscan.kite import (
     Route,
     apply_safety_filter,
     generate_value,
+    route_from_dict,
+    route_to_dict,
     load_kite,
     render_body,
     render_headers,
@@ -316,3 +318,78 @@ class TestSafetyFilter:
         assert len(filtered) == len(routes)
         assert stats.method_filtered == 0
         assert stats.keyword_filtered == 0
+
+
+# ---------------------------------------------------------------------------
+# Route serialization roundtrip
+# ---------------------------------------------------------------------------
+
+class TestRouteSerialization:
+    def test_crumb_roundtrip(self):
+        crumbs = [
+            Crumb("uuid"),
+            Crumb("static", name="q", fields={"v": "test"}),
+            Crumb("int", name="id", fields={"min": 1, "max": 100}),
+            Crumb("bool", name="active"),
+            Crumb("regex_string", name="pat", fields={"r": "[a-z]+"}),
+        ]
+        route = Route(
+            template_path="/api/{id}",
+            method="GET",
+            path_crumbs=[crumbs[2]],
+            query_crumbs=[crumbs[1], crumbs[3]],
+            header_crumbs=[crumbs[4]],
+        )
+        d = route_to_dict(route)
+        restored = route_from_dict(d)
+        assert restored.template_path == route.template_path
+        assert restored.method == route.method
+        assert len(restored.path_crumbs) == 1
+        assert restored.path_crumbs[0].kind == "int"
+        assert restored.path_crumbs[0].name == "id"
+        assert restored.path_crumbs[0].fields == {"min": 1, "max": 100}
+        assert len(restored.query_crumbs) == 2
+        assert len(restored.header_crumbs) == 1
+
+    def test_nested_crumb_roundtrip(self):
+        child = Crumb("int", name="age", fields={"min": 0, "max": 150})
+        parent = Crumb("object", name="user", children=[child])
+        route = Route(
+            template_path="/api/users",
+            method="POST",
+            body_crumbs=[parent],
+        )
+        d = route_to_dict(route)
+        restored = route_from_dict(d)
+        assert len(restored.body_crumbs) == 1
+        obj = restored.body_crumbs[0]
+        assert obj.kind == "object"
+        assert len(obj.children) == 1
+        assert obj.children[0].kind == "int"
+        assert obj.children[0].name == "age"
+
+    def test_empty_crumbs_omitted(self):
+        route = Route(template_path="/health", method="GET")
+        d = route_to_dict(route)
+        assert "pc" not in d
+        assert "qc" not in d
+        assert "bc" not in d
+        assert "hc" not in d
+        assert d == {"p": "/health", "m": "GET"}
+        restored = route_from_dict(d)
+        assert restored.path_crumbs == []
+        assert restored.query_crumbs == []
+
+    def test_source_api_url_omitted(self):
+        route = Route(template_path="/api", method="GET", source_api_url="http://example.com/swagger.json")
+        d = route_to_dict(route)
+        assert "source_api_url" not in d
+        restored = route_from_dict(d)
+        assert restored.source_api_url == ""
+
+    def test_content_types_roundtrip(self):
+        route = Route(template_path="/api", method="POST", content_types=["application/json", "text/xml"])
+        d = route_to_dict(route)
+        assert d["ct"] == ["application/json", "text/xml"]
+        restored = route_from_dict(d)
+        assert restored.content_types == ["application/json", "text/xml"]

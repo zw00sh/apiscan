@@ -116,6 +116,55 @@ class Route:
     source_api_url: str = ""
 
 
+def _crumb_to_dict(crumb: Crumb) -> dict:
+    d: dict = {"kind": crumb.kind}
+    if crumb.name:
+        d["name"] = crumb.name
+    if crumb.fields:
+        d["fields"] = crumb.fields
+    if crumb.children:
+        d["children"] = [_crumb_to_dict(c) for c in crumb.children]
+    return d
+
+
+def _crumb_from_dict(d: dict) -> Crumb:
+    return Crumb(
+        kind=d["kind"],
+        name=d.get("name", ""),
+        fields=d.get("fields", {}),
+        children=[_crumb_from_dict(c) for c in d.get("children", [])],
+    )
+
+
+def route_to_dict(route: Route) -> dict:
+    """Serialize a Route to a JSON-compatible dict. Omits source_api_url."""
+    d: dict = {"p": route.template_path, "m": route.method}
+    if route.path_crumbs:
+        d["pc"] = [_crumb_to_dict(c) for c in route.path_crumbs]
+    if route.header_crumbs:
+        d["hc"] = [_crumb_to_dict(c) for c in route.header_crumbs]
+    if route.query_crumbs:
+        d["qc"] = [_crumb_to_dict(c) for c in route.query_crumbs]
+    if route.body_crumbs:
+        d["bc"] = [_crumb_to_dict(c) for c in route.body_crumbs]
+    if route.content_types:
+        d["ct"] = route.content_types
+    return d
+
+
+def route_from_dict(d: dict) -> Route:
+    """Deserialize a Route from a dict produced by route_to_dict."""
+    return Route(
+        template_path=d["p"],
+        method=d["m"],
+        path_crumbs=[_crumb_from_dict(c) for c in d.get("pc", [])],
+        header_crumbs=[_crumb_from_dict(c) for c in d.get("hc", [])],
+        query_crumbs=[_crumb_from_dict(c) for c in d.get("qc", [])],
+        body_crumbs=[_crumb_from_dict(c) for c in d.get("bc", [])],
+        content_types=d.get("ct", []),
+    )
+
+
 @dataclass
 class FilterStats:
     total: int

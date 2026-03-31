@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -182,7 +183,7 @@ def print_banner(target: str, route_count: int,
     g = GREEN if use_color else ""
     rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.11.0{r}\n")
+    print(f" {d}api content discovery · v0.12.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
@@ -269,7 +270,7 @@ class ProgressTracker:
         self._use_color = use_color
         self._last_print = 0.0
         self._start = time.monotonic()
-        self._window: list[float] = []
+        self._window: deque[float] = deque()
 
     def set_phase(self, phase: str, phase_total: int) -> None:
         self.phase = phase
@@ -283,7 +284,8 @@ class ProgressTracker:
         now = time.monotonic()
         self._window.append(now)
         cutoff = now - 3.0
-        self._window = [t for t in self._window if t > cutoff]
+        while self._window and self._window[0] <= cutoff:
+            self._window.popleft()
         if now - self._last_print >= 0.25 or self.completed == self.total:
             self._print(now)
             self._last_print = now
