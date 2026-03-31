@@ -1,0 +1,8 @@
+kiterunner/
+kites/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+.pytest_cache/
+.venv/
