@@ -1,7 +1,7 @@
 ```
  ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
  █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
- api content discovery · v0.4.0
+ api content discovery · v0.5.0
 ```
 
 Lightweight API content discovery tool that uses [Kiterunner](https://github.com/assetnote/kiterunner)'s `.kite` wordlist files to find hidden API endpoints.
@@ -28,7 +28,7 @@ apiscan scan --url https://target.com
 
 On first run, apiscan automatically downloads `routes-large.kite` (~35MB download, ~183MB extracted) from [Assetnote's CDN](https://wordlists-cdn.assetnote.io/data/kiterunner/) and caches it in `~/.cache/apiscan/`.
 
-Use `--fast` to use the smaller wordlist (~1.7MB, 36k routes vs 958k):
+Use `--fast` for a deduplicated subset (~30k routes that appear in 2+ independent API specs — higher signal, lower noise):
 
 ```
 apiscan scan --url https://target.com --fast
@@ -40,9 +40,9 @@ Or bring your own `.kite` file:
 apiscan scan --url https://target.com --kite /path/to/custom.kite
 ```
 
-You can also pre-download wordlists with `apiscan download`.
+You can also pre-download with `apiscan download`.
 
-By default, apiscan runs in **safe mode**: GET requests only, with dangerous path keywords filtered. Use `--unsafe` to send all HTTP methods from the wordlist.
+By default, apiscan runs in **safe mode**: GET requests only, with dangerous path keywords filtered. Use `--unsafe-all` to send all HTTP methods from the wordlist, or `--unsafe-methods` / `--unsafe-keywords` for granular control.
 
 ### Scan Flags
 
@@ -50,8 +50,10 @@ By default, apiscan runs in **safe mode**: GET requests only, with dangerous pat
 |------|---------|-------------|
 | `--url` | required | Target base URL |
 | `--kite` | routes-large | Path to `.kite` wordlist (auto-downloads if not cached) |
-| `--fast` | off | Use routes-small.kite instead of routes-large.kite |
-| `--unsafe` | off | Send all HTTP methods, disable keyword filter |
+| `--fast` | off | Deduplicated subset (~30k routes appearing in 2+ APIs) |
+| `--unsafe-all` | off | All HTTP methods, no keyword filter |
+| `--unsafe-methods` | off | All HTTP methods (keep keyword filter) |
+| `--unsafe-keywords` | off | No keyword filter (keep GET-only) |
 | `--concurrency` | 10 | Max concurrent requests |
 | `--rate` | unlimited | Requests per second cap |
 | `--timeout` | 10s | Per-request timeout |
