@@ -182,7 +182,7 @@ def print_banner(target: str, route_count: int,
     g = GREEN if use_color else ""
     rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.10.0{r}\n")
+    print(f" {d}api content discovery · v0.11.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
