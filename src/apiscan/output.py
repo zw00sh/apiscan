@@ -103,10 +103,11 @@ def _status_color(status: int) -> str:
     return ""
 
 
-def _fmt_magnitude(value: int, colors: list[str], use_color: bool) -> str:
+def _fmt_magnitude(value: int, suffix: str, colors: list[str], use_color: bool) -> str:
     """Format a value with unit suffix and magnitude-appropriate color.
 
-    Returns a string right-aligned to 6 chars (e.g. '  1.5K', ' 42  ').
+    Always shows the suffix (e.g. '  42B', ' 1.5K', ' 2.3M').
+    Returns a string right-aligned to 5 chars + 1 char suffix.
     """
     if value >= 1_000_000:
         text = f"{value / 1_000_000:.1f}M"
@@ -115,7 +116,7 @@ def _fmt_magnitude(value: int, colors: list[str], use_color: bool) -> str:
         text = f"{value / 1_000:.1f}K"
         color = colors[1] if use_color else ""
     else:
-        text = f"{value}  "  # pad with 2 spaces to align with suffix chars
+        text = f"{value}{suffix}"
         color = colors[0] if use_color else ""
     r = RESET if use_color else ""
     return f"{color}{text:>6}{r}"
@@ -131,15 +132,15 @@ def format_result(result: ScanResult, use_color: bool = True) -> str:
     # Method
     method = f"{CYAN}{result.method:<7}{r}" if use_color else f"{result.method:<7}"
 
-    # Magnitude-colored columns
-    size = _fmt_magnitude(result.content_length, _SIZE_COLORS, use_color)
-    words = _fmt_magnitude(result.word_count, _WORD_COLORS, use_color)
-    lines = _fmt_magnitude(result.line_count, _LINE_COLORS, use_color)
+    # Magnitude-colored columns (size lines words, no separators between them)
+    size = _fmt_magnitude(result.content_length, "B", _SIZE_COLORS, use_color)
+    lines = _fmt_magnitude(result.line_count, "L", _LINE_COLORS, use_color)
+    words = _fmt_magnitude(result.word_count, "W", _WORD_COLORS, use_color)
 
     # Path
     path = f"{WHITE}{result.path}{r}" if use_color else result.path
 
-    line = f"{sc} | {method} | {size} | {words} | {lines} | {path}"
+    line = f"{sc} | {method} | {size} {lines} {words} | {path}"
 
     if result.original_method and result.original_method != result.method:
         hint = f" {DIM}(original: {result.original_method}){r}" if use_color else f" (original: {result.original_method})"
