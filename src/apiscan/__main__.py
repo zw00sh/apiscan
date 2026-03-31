@@ -79,7 +79,7 @@ def _download(args: argparse.Namespace) -> None:
         tarball_path = cache_dir / tarball_name
 
         print(f"  {c}downloading{r} {tarball_name} ({desc})")
-        req = Request(url, headers={"User-Agent": "apiscan/0.1.0"})
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"})
         with urlopen(req) as resp, open(tarball_path, "wb") as f:
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0

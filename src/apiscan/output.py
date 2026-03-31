@@ -108,7 +108,7 @@ def print_banner(target: str, route_count: int, unsafe: bool,
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.1.0{r}\n")
+    print(f" {d}api content discovery · v0.2.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
