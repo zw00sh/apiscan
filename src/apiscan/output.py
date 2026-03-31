@@ -182,7 +182,7 @@ def print_banner(target: str, route_count: int,
     g = GREEN if use_color else ""
     rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.8.0{r}\n")
+    print(f" {d}api content discovery · v0.9.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
@@ -290,9 +290,14 @@ class ProgressTracker:
         else:
             rps = 0
         pct = self.completed * 100 / self.total if self.total else 0
+        g = GREEN if self._use_color else ""
         bar = braille_bar(pct)
-        line = f"\r{d}{bar} {pct:>3.0f}%{r} | {c}{self.findings} findings{r} {d}| {rps:.0f} req/s{r}"
-        print(f"{line:<60}", end="", flush=True, file=sys.stderr)
+        line = (f"\r{d}[{self.completed}/{self.total}]{r} "
+                f"[{g}{bar}{r}] "
+                f"{d}[{pct:>3.0f}%]{r} "
+                f"{c}{self.findings} routes{r} "
+                f"{d}| {rps:.0f} req/s{r}")
+        print(f"{line:<80}", end="", flush=True, file=sys.stderr)
         if self.completed == self.total:
             print(file=sys.stderr)
 
@@ -302,4 +307,4 @@ def print_summary(findings: int, total_requests: int, elapsed: float,
     d = DIM if use_color else ""
     r = RESET if use_color else ""
     b = BOLD if use_color else ""
-    print(f"\n{b}{findings} findings{r} from {total_requests} requests in {elapsed:.1f}s")
+    print(f"\n{b}{findings} routes{r} from {total_requests} requests in {elapsed:.1f}s")

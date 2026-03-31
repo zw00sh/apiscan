@@ -1,7 +1,7 @@
 ```
  ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
  █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
- api content discovery · v0.8.0
+ api content discovery · v0.9.0
 ```
 
 Lightweight API content discovery tool that uses [Kiterunner](https://github.com/assetnote/kiterunner)'s `.kite` wordlist files to find hidden API endpoints.
@@ -28,10 +28,11 @@ apiscan scan --url https://target.com
 
 On first run, apiscan automatically downloads `routes-large.kite` (~35MB download, ~183MB extracted) from [Assetnote's CDN](https://wordlists-cdn.assetnote.io/data/kiterunner/) and caches it in `~/.cache/apiscan/`.
 
-Use `--fast` for a deduplicated subset (~30k routes that appear in 2+ independent API specs — higher signal, lower noise):
+Use `--fast` for a quick scan (~8k routes appearing in 3+ API specs) or `--short` for a broader deduplicated set (~30k routes, 2+ specs):
 
 ```
 apiscan scan --url https://target.com --fast
+apiscan scan --url https://target.com --short
 ```
 
 Or bring your own `.kite` file:
@@ -50,7 +51,8 @@ By default, apiscan runs in **safe mode**: GET requests only, with dangerous pat
 |------|---------|-------------|
 | `--url` | required | Target base URL |
 | `--kite` | routes-large | Path to `.kite` wordlist (auto-downloads if not cached) |
-| `--fast` | off | Deduplicated subset (~30k routes appearing in 2+ APIs) |
+| `--short` | off | Deduplicated scan (~30k routes appearing in 2+ APIs) |
+| `--fast` | off | Quick scan (~8k routes appearing in 3+ APIs) |
 | `--unsafe-all` | off | All HTTP methods, no keyword filter |
 | `--unsafe-methods` | off | All HTTP methods (keep keyword filter) |
 | `--unsafe-keywords` | off | No keyword filter (keep GET-only) |

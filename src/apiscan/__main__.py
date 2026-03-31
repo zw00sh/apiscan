@@ -19,6 +19,7 @@ from apiscan.output import (
     BOLD,
     CYAN,
     DIM,
+    GREEN,
     RESET,
     CSVWriter,
     ProgressTracker,
@@ -43,12 +44,15 @@ CDN_TARBALL = "routes-large.kite.tar.gz"
 CDN_KITE = "routes-large.kite"
 CDN_DESC = "~35 MB download, ~183 MB extracted"
 
-# The fast index is a precomputed list of (path, method) pairs that appear in >= N
-# distinct API specs. At threshold=2 this yields ~30k routes — similar size to routes-small
-# but every route has been independently validated by appearing in 2+ Swagger specs.
-# The top routes are exactly what you'd expect: /login, /api/register, /users, /api/auth/login.
-FAST_INDEX_NAME = "routes-fast.json"
-FAST_MIN_APIS = 2
+# Precomputed indexes of (path, method) pairs appearing in >= N distinct API specs.
+# --short (>=2 APIs, ~30k routes): thorough but deduplicated, every route validated
+#   by appearing in 2+ independent Swagger specs.
+# --fast (>=3 APIs, ~8k routes): aggressive cut for quick scans, only routes that
+#   appear across 3+ specs. The top hits: /login, /api/register, /users, etc.
+SCAN_MODES = {
+    "short": ("routes-short.json", 2),
+    "fast": ("routes-fast.json", 3),
+}
 
 
 def _default_cache_dir() -> Path:
@@ -108,23 +112,25 @@ def _download_kite(cache_dir: Path, force: bool = False, use_color: bool = True)
     return kite_path
 
 
-def _build_fast_index(kite_path: str, cache_dir: Path, use_color: bool = True) -> Path:
-    """Build the fast-scan index: deduplicated routes appearing in >= FAST_MIN_APIS APIs.
+def _build_index(kite_path: str, cache_dir: Path, mode: str, use_color: bool = True) -> Path:
+    """Build a scan index: deduplicated routes appearing in >= threshold APIs.
 
-    Stores a JSON set of (template_path, method) pairs. Cached as routes-fast.json.
+    Stores a JSON set of (template_path, method) pairs. Cached per mode.
     """
+    index_name, threshold = SCAN_MODES[mode]
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
+    g = GREEN if use_color else ""
     r = RESET if use_color else ""
 
-    index_path = cache_dir / FAST_INDEX_NAME
+    index_path = cache_dir / index_name
 
     def _index_progress(parsed: int, total: int) -> None:
         pct = parsed * 100 / total if total else 0
         bar = braille_bar(pct)
-        print(f"\r  {c}loading{r} {d}{bar} {pct:>3.0f}%{r}", end="", flush=True)
+        print(f"\r  {c}loading{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
 
-    print(f"  {c}loading{r} {d}{braille_bar(0)}   0%{r}", end="", flush=True)
+    print(f"  {c}loading{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
     routes = load_kite(kite_path, on_progress=_index_progress)
 
     # Count how many distinct source APIs each (path, method) appears in
@@ -138,15 +144,14 @@ def _build_fast_index(kite_path: str, cache_dir: Path, use_color: bool = True) -
         if i % 50_000 == 0:
             pct = i * 100 / total if total else 0
             bar = braille_bar(pct)
-            print(f"\r  {c}dedup{r}   {d}{bar} {pct:>3.0f}%{r}", end="", flush=True)
+            print(f"\r  {c}dedup{r}   [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
 
-    # Keep routes appearing in >= FAST_MIN_APIS distinct APIs
-    fast_keys = [list(k) for k, apis in route_apis.items() if len(apis) >= FAST_MIN_APIS]
+    fast_keys = [list(k) for k, apis in route_apis.items() if len(apis) >= threshold]
 
     with open(index_path, "w") as f:
         json.dump(fast_keys, f)
 
-    print(f"\r  {c}fast index:{r} {len(fast_keys):,} routes (from {len(route_apis):,} unique, threshold >={FAST_MIN_APIS} APIs){' ' * 10}")
+    print(f"\r  {c}{mode} index:{r} {len(fast_keys):,} routes (from {len(route_apis):,} unique, threshold >={threshold} APIs){' ' * 10}")
     return index_path
 
 
@@ -166,10 +171,11 @@ def _download(args: argparse.Namespace) -> None:
     cache_dir = Path(args.dir) if args.dir else _default_cache_dir()
     kite_path = _download_kite(cache_dir, force=args.force, use_color=use_color)
 
-    # Also build fast index if it doesn't exist
-    index_path = cache_dir / FAST_INDEX_NAME
-    if not index_path.exists() or args.force:
-        _build_fast_index(str(kite_path), cache_dir, use_color=use_color)
+    # Build both scan mode indexes if they don't exist
+    for mode, (index_name, _) in SCAN_MODES.items():
+        index_path = cache_dir / index_name
+        if not index_path.exists() or args.force:
+            _build_index(str(kite_path), cache_dir, mode, use_color=use_color)
 
     print(f"\n  use with: apiscan scan --url <target>")
 
@@ -198,8 +204,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--kite", default=None,
                     help="Path to .kite wordlist file (default: cached routes-large.kite)")
     sc.add_argument("--url", required=True, help="Target base URL")
-    sc.add_argument("--fast", action="store_true",
-                    help="Use deduplicated subset (~30k routes appearing in 2+ APIs)")
+    scan_mode = sc.add_mutually_exclusive_group()
+    scan_mode.add_argument("--fast", action="store_true",
+                           help="Quick scan (~8k routes appearing in 3+ APIs)")
+    scan_mode.add_argument("--short", action="store_true",
+                           help="Deduplicated scan (~30k routes appearing in 2+ APIs)")
 
     safety = sc.add_argument_group("safety")
     safety.add_argument("--unsafe-all", action="store_true",
@@ -281,12 +290,13 @@ def _ensure_kite(args: argparse.Namespace, use_color: bool) -> str:
     return str(kite_path)
 
 
-def _ensure_fast_index(kite_path: str, use_color: bool) -> Path:
-    """Ensure fast index exists. Builds it if needed."""
+def _ensure_index(kite_path: str, mode: str, use_color: bool) -> Path:
+    """Ensure a scan mode index exists. Builds it if needed."""
     cache_dir = _default_cache_dir()
-    index_path = cache_dir / FAST_INDEX_NAME
+    index_name, _ = SCAN_MODES[mode]
+    index_path = cache_dir / index_name
     if not index_path.exists():
-        _build_fast_index(kite_path, cache_dir, use_color=use_color)
+        _build_index(kite_path, cache_dir, mode, use_color=use_color)
     return index_path
 
 
@@ -296,22 +306,24 @@ async def _scan(args: argparse.Namespace) -> None:
     d = DIM if use_color else ""
     r = RESET if use_color else ""
 
+    g = GREEN if use_color else ""
     kite_path = _ensure_kite(args, use_color)
 
     def _load_progress(parsed: int, total: int) -> None:
         pct = parsed * 100 / total if total else 0
         bar = braille_bar(pct)
-        print(f"\r  {d}loading {bar} {pct:>3.0f}%{r}", end="", flush=True)
+        print(f"\r  {d}loading{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
 
     if not args.quiet:
-        print(f"  {d}loading {braille_bar(0)}   0%{r}", end="", flush=True)
+        print(f"  {d}loading{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
     routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
 
-    # Apply --fast filter if requested (before safety filter)
-    if args.fast and not args.kite:
+    # Apply --fast/--short filter if requested (before safety filter)
+    scan_mode = "fast" if args.fast else ("short" if args.short else None)
+    if scan_mode and not args.kite:
         if not args.quiet:
-            print(f"\r  {d}applying fast filter...{' ' * 30}{r}", end="", flush=True)
-        index_path = _ensure_fast_index(kite_path, use_color)
+            print(f"\r  {d}applying {scan_mode} filter...{' ' * 30}{r}", end="", flush=True)
+        index_path = _ensure_index(kite_path, scan_mode, use_color)
         routes = _apply_fast_filter(routes, index_path)
 
     if not args.quiet:
