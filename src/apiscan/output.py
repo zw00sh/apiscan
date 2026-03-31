@@ -182,7 +182,7 @@ def print_banner(target: str, route_count: int,
     g = GREEN if use_color else ""
     rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.7.0{r}\n")
+    print(f" {d}api content discovery · v0.8.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
@@ -234,6 +234,26 @@ class CSVWriter:
 
 
 # ---------------------------------------------------------------------------
+# Braille progress bar
+# ---------------------------------------------------------------------------
+
+# 8 cells × 8 fill levels = 64 steps. Each cell fills bottom-left to full
+# before the next one starts.
+_BRAILLE = " ⡀⡄⡆⡇⣇⣧⣷⣿"
+
+
+def braille_bar(pct: float) -> str:
+    steps = int(pct * 64 / 100)
+    full_cells = steps // 8
+    partial = steps % 8
+    bar = "⣿" * full_cells
+    if full_cells < 8:
+        bar += _BRAILLE[partial]
+        bar += " " * (7 - full_cells)
+    return bar
+
+
+# ---------------------------------------------------------------------------
 # Progress tracker
 # ---------------------------------------------------------------------------
 
@@ -269,8 +289,9 @@ class ProgressTracker:
             rps = (len(self._window) - 1) / window_span if window_span > 0 else 0
         else:
             rps = 0
-        pct = self.completed * 100 // self.total if self.total else 0
-        line = f"\r{d}[{pct:>3}%] {self.completed}/{self.total} | {c}{self.findings} findings{r} {d}| {rps:.0f} req/s{r}"
+        pct = self.completed * 100 / self.total if self.total else 0
+        bar = braille_bar(pct)
+        line = f"\r{d}{bar} {pct:>3.0f}%{r} | {c}{self.findings} findings{r} {d}| {rps:.0f} req/s{r}"
         print(f"{line:<60}", end="", flush=True, file=sys.stderr)
         if self.completed == self.total:
             print(file=sys.stderr)

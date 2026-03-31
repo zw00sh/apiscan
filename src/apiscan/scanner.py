@@ -265,6 +265,11 @@ async def scan(
             if query:
                 url += f"?{query}"
 
+            # Cap URL length to avoid 414 errors. Most servers reject URLs over
+            # ~8KB; we use 2000 as a practical limit that covers all common servers.
+            if len(url) > 2000:
+                url = url[:2000]
+
             headers = render_headers(route)
             body_str = render_body(route) if send_method != "GET" else None
             if body_str and not any(k.lower() == "content-type" for k in headers):

@@ -23,6 +23,7 @@ from apiscan.output import (
     CSVWriter,
     ProgressTracker,
     ScanResult,
+    braille_bar,
     format_result,
     print_banner,
     print_summary,
@@ -119,10 +120,11 @@ def _build_fast_index(kite_path: str, cache_dir: Path, use_color: bool = True) -
     index_path = cache_dir / FAST_INDEX_NAME
 
     def _index_progress(parsed: int, total: int) -> None:
-        pct = parsed * 100 // total if total else 0
-        print(f"\r  {c}building fast index{r} {d}[{pct:>3}%]{r}", end="", flush=True)
+        pct = parsed * 100 / total if total else 0
+        bar = braille_bar(pct)
+        print(f"\r  {c}loading{r} {d}{bar} {pct:>3.0f}%{r}", end="", flush=True)
 
-    print(f"  {c}building fast index{r} {d}[  0%]{r}", end="", flush=True)
+    print(f"  {c}loading{r} {d}{braille_bar(0)}   0%{r}", end="", flush=True)
     routes = load_kite(kite_path, on_progress=_index_progress)
 
     # Count how many distinct source APIs each (path, method) appears in
@@ -134,8 +136,9 @@ def _build_fast_index(kite_path: str, cache_dir: Path, use_color: bool = True) -
             route_apis[key] = set()
         route_apis[key].add(route.source_api_url)
         if i % 50_000 == 0:
-            pct = 100 + (i * 100 // total) if total else 100  # 100-199% for dedup phase
-            print(f"\r  {c}building fast index{r} {d}[dedup {i * 100 // total:>3}%]{r}", end="", flush=True)
+            pct = i * 100 / total if total else 0
+            bar = braille_bar(pct)
+            print(f"\r  {c}dedup{r}   {d}{bar} {pct:>3.0f}%{r}", end="", flush=True)
 
     # Keep routes appearing in >= FAST_MIN_APIS distinct APIs
     fast_keys = [list(k) for k, apis in route_apis.items() if len(apis) >= FAST_MIN_APIS]
@@ -296,11 +299,12 @@ async def _scan(args: argparse.Namespace) -> None:
     kite_path = _ensure_kite(args, use_color)
 
     def _load_progress(parsed: int, total: int) -> None:
-        pct = parsed * 100 // total if total else 0
-        print(f"\r  {d}loading {kite_path} [{pct:>3}%]{r}", end="", flush=True)
+        pct = parsed * 100 / total if total else 0
+        bar = braille_bar(pct)
+        print(f"\r  {d}loading {bar} {pct:>3.0f}%{r}", end="", flush=True)
 
     if not args.quiet:
-        print(f"  {d}loading {kite_path} [  0%]{r}", end="", flush=True)
+        print(f"  {d}loading {braille_bar(0)}   0%{r}", end="", flush=True)
     routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
 
     # Apply --fast filter if requested (before safety filter)
