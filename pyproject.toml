@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "apiscan"
-version = "0.12.0"
+version = "0.13.0"
 description = "Lightweight API content discovery using Kiterunner .kite wordlists"
 license = "AGPL-3.0-only"
 authors = []

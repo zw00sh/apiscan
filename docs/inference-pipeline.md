@@ -11,13 +11,13 @@
 │                                                                     │
 │  ┌─────────────┐    ┌──────────────────┐    ┌────────────────────┐  │
 │  │ initialize()│───>│ Root baselines   │    │ Per-method probes  │  │
-│  │             │    │ 5 methods × 5    │    │ at each prefix     │  │
-│  │ 25 parallel │    │ probes each      │    │ (parallel)         │  │
+│  │             │    │ 5 methods × 2    │    │ at each prefix     │  │
+│  │ 10 parallel │    │ random probes    │    │ (parallel)         │  │
 │  │ probes      │    │                  │    │                    │  │
-│  └─────────────┘    │ Random paths     │    │ /{prefix}/{random} │  │
-│                     │ /%2e%2e (WAF)    │    │ for GET/POST/PUT/  │  │
-│                     │ /{rand}.php      │    │ DELETE/PATCH       │  │
-│                     │ /{rand}/ (slash) │    │                    │  │
+│  └─────────────┘    │ /{random} × 2   │    │ /{prefix}/{random} │  │
+│                     │ per method       │    │ for GET/POST/PUT/  │  │
+│                     │                  │    │ DELETE/PATCH        │  │
+│                     │                  │    │                    │  │
 │                     └──────────────────┘    └────────┬───────────┘  │
 │                                                       │             │
 │                                              differs from ancestor? │
