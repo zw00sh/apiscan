@@ -76,7 +76,6 @@ def _preflight_probes(prefix: str) -> list[tuple[str, str]]:
     return [
         ("GET", f"{base}/{rand()}/{rand()}"),
         ("GET", f"{base}/"),
-        ("GET", f"{base}/{'A' * 1500}"),
         ("GET", f"{base}/{rand()}"),
         ("POST", f"{base}/"),
         ("PUT", f"{base}/{rand()}"),
@@ -104,7 +103,7 @@ async def run_preflight(
                 if bl not in seen:
                     seen.add(bl)
                     baselines.append(bl)
-            except (httpx.RequestError, httpx.HTTPStatusError):
+            except Exception:
                 pass
 
     await asyncio.gather(*[_probe(m, p) for m, p in probes])
@@ -281,7 +280,7 @@ async def scan(
                         content=body_str.encode() if body_str else None,
                         timeout=timeout,
                     )
-                except (httpx.RequestError, httpx.HTTPStatusError):
+                except Exception:
                     conn_failures += 1
                     if on_progress:
                         on_progress(0)
@@ -361,8 +360,13 @@ async def scan(
             for route in group_routes:
                 all_tasks.append(asyncio.create_task(_scan_route(route, baselines)))
 
-        # Await all tasks
-        for task in asyncio.as_completed(all_tasks):
-            await task
+        # Await all tasks, handling cancellation gracefully
+        try:
+            for task in asyncio.as_completed(all_tasks):
+                await task
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            for task in all_tasks:
+                task.cancel()
+            await asyncio.gather(*all_tasks, return_exceptions=True)
 
     return results

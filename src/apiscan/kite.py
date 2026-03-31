@@ -13,7 +13,11 @@ from typing import Callable
 from urllib.parse import urlencode
 from uuid import uuid4
 
+import threading
+
 import exrex
+
+_exrex_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -300,13 +304,16 @@ def generate_value(crumb: Crumb) -> str:
 
     if k == "regex_string":
         try:
-            import io, sys
-            old_stderr = sys.stderr
-            sys.stderr = io.StringIO()  # suppress exrex "[!] cannot handle" noise
-            try:
-                return exrex.getone(f.get("regex", "."))
-            finally:
-                sys.stderr = old_stderr
+            import io, sys, threading
+            # exrex prints "[!] cannot handle expression" directly to stderr.
+            # Suppress with a lock to avoid races in async/threaded contexts.
+            with _exrex_lock:
+                old_stderr = sys.stderr
+                sys.stderr = io.StringIO()
+                try:
+                    return exrex.getone(f.get("regex", "."))
+                finally:
+                    sys.stderr = old_stderr
         except Exception:
             return "1"
 
