@@ -182,7 +182,7 @@ def print_banner(target: str, route_count: int,
     g = GREEN if use_color else ""
     rd = RED if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.9.0{r}\n")
+    print(f" {d}api content discovery · v0.10.0{r}\n")
     print(f"  target:  {target}")
     print(f"  routes:  {route_count}")
 
@@ -262,17 +262,26 @@ class ProgressTracker:
         self.total = total
         self.completed = 0
         self.findings = 0
+        self.hidden = 0  # deduped results sent to CSV/proxy but not printed
+        self.phase = "A"
+        self.phase_total = 0
+        self.phase_completed = 0
         self._use_color = use_color
         self._last_print = 0.0
         self._start = time.monotonic()
-        self._window: list[float] = []  # timestamps for RPS calculation
+        self._window: list[float] = []
+
+    def set_phase(self, phase: str, phase_total: int) -> None:
+        self.phase = phase
+        self.phase_total = phase_total
+        self.phase_completed = 0
 
     def update(self, findings_delta: int = 0) -> None:
         self.completed += 1
+        self.phase_completed += 1
         self.findings += findings_delta
         now = time.monotonic()
         self._window.append(now)
-        # Keep only last 3 seconds for rolling RPS
         cutoff = now - 3.0
         self._window = [t for t in self._window if t > cutoff]
         if now - self._last_print >= 0.25 or self.completed == self.total:
@@ -282,21 +291,24 @@ class ProgressTracker:
     def _print(self, now: float) -> None:
         d = DIM if self._use_color else ""
         c = CYAN if self._use_color else ""
+        g = GREEN if self._use_color else ""
         r = RESET if self._use_color else ""
         elapsed = now - self._start
         if elapsed > 0 and len(self._window) > 1:
-            window_span = self._window[-1] - self._window[0]
-            rps = (len(self._window) - 1) / window_span if window_span > 0 else 0
+            span = self._window[-1] - self._window[0]
+            rps = (len(self._window) - 1) / span if span > 0 else 0
         else:
             rps = 0
-        pct = self.completed * 100 / self.total if self.total else 0
-        g = GREEN if self._use_color else ""
-        bar = braille_bar(pct)
+        total_pct = self.completed * 100 / self.total if self.total else 0
+        phase_pct = self.phase_completed * 100 / self.phase_total if self.phase_total else 0
+        phase_bar = braille_bar(phase_pct)
+        hidden_str = f" {d}| {self.hidden} mutations hidden{r}" if self.hidden else ""
         line = (f"\r{d}[{self.completed}/{self.total}]{r} "
-                f"[{g}{bar}{r}] "
-                f"{d}[{pct:>3.0f}%]{r} "
-                f"{c}{self.findings} routes{r} "
-                f"{d}| {rps:.0f} req/s{r}")
+                f"{d}[{total_pct:>3.0f}%]{r} "
+                f"{d}| Phase {self.phase}{r} [{g}{phase_bar}{r}] "
+                f"{d}|{r} {c}{self.findings} findings{r} "
+                f"{d}| {rps:.0f} req/s{r}"
+                f"{hidden_str}")
         print(f"{line:<80}", end="", flush=True, file=sys.stderr)
         if self.completed == self.total:
             print(file=sys.stderr)

@@ -125,15 +125,14 @@ def _build_index(kite_path: str, cache_dir: Path, mode: str, use_color: bool = T
 
     index_path = cache_dir / index_name
 
-    def _index_progress(parsed: int, total: int) -> None:
+    def _progress(label: str, parsed: int, total: int) -> None:
         pct = parsed * 100 / total if total else 0
         bar = braille_bar(pct)
-        print(f"\r  {c}loading{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
+        print(f"\r{label} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
 
-    print(f"  {c}loading{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
-    routes = load_kite(kite_path, on_progress=_index_progress)
+    _progress(f"  {c}parsing kite{r}", 0, 1)
+    routes = load_kite(kite_path, on_progress=lambda p, t: _progress(f"  {c}parsing kite{r}", p, t))
 
-    # Count how many distinct source APIs each (path, method) appears in
     route_apis: dict[tuple[str, str], set[str]] = {}
     total = len(routes)
     for i, route in enumerate(routes):
@@ -142,16 +141,14 @@ def _build_index(kite_path: str, cache_dir: Path, mode: str, use_color: bool = T
             route_apis[key] = set()
         route_apis[key].add(route.source_api_url)
         if i % 50_000 == 0:
-            pct = i * 100 / total if total else 0
-            bar = braille_bar(pct)
-            print(f"\r  {c}dedup{r}   [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
+            _progress(f"  {c}building {mode} index{r}", i, total)
 
     fast_keys = [list(k) for k, apis in route_apis.items() if len(apis) >= threshold]
 
     with open(index_path, "w") as f:
         json.dump(fast_keys, f)
 
-    print(f"\r  {c}{mode} index:{r} {len(fast_keys):,} routes (from {len(route_apis):,} unique, threshold >={threshold} APIs){' ' * 10}")
+    print(f"\r  {c}{mode} index:{r} {len(fast_keys):,} routes (>={threshold} APIs, from {len(route_apis):,} unique){' ' * 20}")
     return index_path
 
 
@@ -307,15 +304,17 @@ async def _scan(args: argparse.Namespace) -> None:
     r = RESET if use_color else ""
 
     g = GREEN if use_color else ""
+    c2 = CYAN if use_color else ""
     kite_path = _ensure_kite(args, use_color)
+    kite_name = os.path.basename(kite_path)
 
     def _load_progress(parsed: int, total: int) -> None:
         pct = parsed * 100 / total if total else 0
         bar = braille_bar(pct)
-        print(f"\r  {d}loading{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
+        print(f"\r  {c2}parsing {kite_name}{r} [{g}{bar}{r}] {d}[{pct:>3.0f}%]{r}", end="", flush=True)
 
     if not args.quiet:
-        print(f"  {d}loading{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
+        print(f"  {c2}parsing {kite_name}{r} [{g}{braille_bar(0)}{r}] {d}[  0%]{r}", end="", flush=True)
     routes = load_kite(kite_path, on_progress=_load_progress if not args.quiet else None)
 
     # Apply --fast/--short filter if requested (before safety filter)
@@ -327,16 +326,15 @@ async def _scan(args: argparse.Namespace) -> None:
         routes = _apply_fast_filter(routes, index_path)
 
     if not args.quiet:
-        print(f"\r  {d}loaded {len(routes):,} routes, applying filters...{' ' * 20}{r}", end="", flush=True)
+        print(f"\r  {d}filtering {len(routes):,} routes...{' ' * 40}{r}", end="", flush=True)
     unsafe_methods = args.unsafe_all or args.unsafe_methods
     unsafe_keywords = args.unsafe_all or args.unsafe_keywords
     filtered_routes, stats = apply_safety_filter(
         routes, unsafe_methods=unsafe_methods, unsafe_keywords=unsafe_keywords,
     )
 
-    # Shuffle routes so we spread across path prefixes rather than hammering one API
-    # at a time. Seeded for deterministic re-runs.
-    random.Random(42).shuffle(filtered_routes)
+    # Route ordering is handled by complexity phasing in the scanner —
+    # bare paths first, then progressively heavier. Seeded shuffle within each phase.
 
     if not args.quiet:
         print(f"\r{' ' * 80}\r", end="")  # clear the status line
@@ -379,15 +377,22 @@ async def _scan(args: argparse.Namespace) -> None:
             asyncio.create_task(_replay(result))
         display_key = (result.status_code, result.method, result.path, result.content_length)
         if display_key in seen_results:
+            # Mutation of an already-shown route — sent to CSV/proxy but not printed
+            if progress:
+                progress.hidden += 1
             return
         seen_results.add(display_key)
         if progress:
-            print(f"\r{' ' * 60}\r", end="", file=sys.stderr, flush=True)
+            print(f"\r{' ' * 80}\r", end="", file=sys.stderr, flush=True)
         print(format_result(result, use_color))
 
     def on_progress(findings_delta: int) -> None:
         if progress:
             progress.update(findings_delta)
+
+    def on_phase(label: str, phase_total: int) -> None:
+        if progress:
+            progress.set_phase(label, phase_total)
 
     start = time.monotonic()
     warnings.filterwarnings("ignore", message="Unverified HTTPS request")
@@ -403,6 +408,7 @@ async def _scan(args: argparse.Namespace) -> None:
         status_whitelist=_parse_codes(args.status_codes),
         unsafe=unsafe_methods,
         extra_headers=_parse_headers(args.header),
+        on_phase=on_phase,
         on_result=on_result,
         on_progress=on_progress,
     )
