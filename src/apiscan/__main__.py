@@ -457,7 +457,7 @@ async def _scan(args: argparse.Namespace) -> None:
     start = time.monotonic()
     warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
-    findings = await scan(
+    findings, scan_tree = await scan(
         target_url=args.url,
         routes=filtered_routes,
         concurrency=args.concurrency,
@@ -480,6 +480,11 @@ async def _scan(args: argparse.Namespace) -> None:
 
     if csv_writer:
         csv_writer.close()
+
+    if args.debug:
+        print(f"\n{d}--- scan tree ---{r}", file=sys.stderr)
+        print(scan_tree.format_tree(), file=sys.stderr)
+        print(f"{d}--- end tree ---{r}\n", file=sys.stderr)
 
     if not args.quiet:
         print_summary(len(findings), len(filtered_routes), elapsed, use_color)

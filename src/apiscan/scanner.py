@@ -2,6 +2,7 @@
 
 Thin transport layer — sends requests, manages concurrency and rate limiting.
 All response classification is delegated to :mod:`apiscan.inference`.
+Route ordering and baseline management are handled by :mod:`apiscan.scantree`.
 """
 
 from __future__ import annotations
@@ -20,34 +21,11 @@ from apiscan.inference import (
 )
 from apiscan.kite import Route, render_body, render_headers, render_path, render_query
 from apiscan.output import ScanResult
+from apiscan.scantree import ScanTree
 
 
 # ---------------------------------------------------------------------------
-# Complexity phasing (unchanged from previous implementation)
-# ---------------------------------------------------------------------------
-
-def route_complexity(route: Route) -> int:
-    """Total crumb count across all parameter locations."""
-    return (len(route.path_crumbs) + len(route.query_crumbs)
-            + len(route.body_crumbs) + len(route.header_crumbs))
-
-
-def group_by_complexity(routes: list[Route]) -> list[tuple[str, list[Route]]]:
-    """Split routes into per-complexity phases, sorted alphabetically within each."""
-    buckets: dict[int, list[Route]] = {}
-    for r in routes:
-        c = route_complexity(r)
-        buckets.setdefault(c, []).append(r)
-    phases: list[tuple[str, list[Route]]] = []
-    for complexity in sorted(buckets):
-        phase_routes = sorted(buckets[complexity], key=lambda r: r.template_path)
-        label = f"{complexity} mutations"
-        phases.append((label, phase_routes))
-    return phases
-
-
-# ---------------------------------------------------------------------------
-# Rate limiter (unchanged)
+# Rate limiter
 # ---------------------------------------------------------------------------
 
 class RateLimiter:
@@ -85,17 +63,21 @@ async def scan(
     on_result: Callable[[ScanResult], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
     on_filtered: Callable[[str, str, int, str], None] | None = None,
-) -> list[ScanResult]:
-    """Scan *target_url* with the given routes. Returns list of findings."""
+) -> tuple[list[ScanResult], ScanTree]:
+    """Scan *target_url* with the given routes. Returns (findings, tree)."""
     base_url = target_url.rstrip("/")
     limiter = RateLimiter(rate_limit) if rate_limit else None
     results: list[ScanResult] = []
+
+    # Build the unified scan tree (routes + baselines)
+    tree = ScanTree(routes)
 
     def _inference_filtered(route, path, sig, reason):
         if on_filtered:
             on_filtered(route.method, path, sig.status_code, reason)
 
     engine = InferenceEngine(
+        tree=tree,
         status_blacklist=status_blacklist,
         status_whitelist=status_whitelist,
         on_filtered=_inference_filtered,
@@ -108,7 +90,7 @@ async def scan(
         headers=extra_headers or {},
     ) as client:
 
-        # -- send_fn: the bridge between inference and HTTP ------------------
+        # -- send_fn: the bridge between tree/inference and HTTP -------------
 
         async def send_fn(
             method: str,
@@ -116,7 +98,6 @@ async def scan(
             headers: dict[str, str] | None = None,
             body: str | None = None,
         ) -> ResponseSignature:
-            """Send a request and return a ``ResponseSignature``."""
             url = f"{base_url}{path}"
             if limiter:
                 await limiter.acquire()
@@ -133,9 +114,9 @@ async def scan(
                 path,
             )
 
-        # -- Initialize inference engine with root baseline ------------------
+        # -- Initialize root baselines --------------------------------------
 
-        await engine.initialize(send_fn)
+        await tree.initialize(send_fn)
 
         # -- Connection failure tracking -------------------------------------
 
@@ -150,13 +131,11 @@ async def scan(
                     on_progress(0)
                 return
 
-            # Render request from route crumbs
             path = render_path(route)
             query = render_query(route)
             url = f"{base_url}{path}"
             if query:
                 url += f"?{query}"
-            # Cap URL length to avoid 414 errors
             if len(url) > 2000:
                 url = url[:2000]
 
@@ -165,7 +144,6 @@ async def scan(
             if body_str and not any(k.lower() == "content-type" for k in headers):
                 headers["Content-Type"] = "application/json"
 
-            # Send initial probe
             if limiter:
                 await limiter.acquire()
             try:
@@ -190,7 +168,6 @@ async def scan(
                 path,
             )
 
-            # Delegate classification to inference engine
             finding = await engine.process(route, sig, path, send_fn)
 
             if finding is None:
@@ -198,7 +175,6 @@ async def scan(
                     on_progress(0)
                 return
 
-            # Build ScanResult from Finding
             redirect_location = None
             if resp.history:
                 redirect_location = str(resp.url)
@@ -225,11 +201,13 @@ async def scan(
             if on_progress:
                 on_progress(1)
 
-        # -- Phase-based orchestration ---------------------------------------
-        # Routes are fed through a bounded worker pool so each route completes
-        # fully (including verification probes) before a new one starts.
-        # This prevents semaphore starvation where thousands of initial probes
-        # block verification probes from completing.
+        # -- Tree-driven orchestration ---------------------------------------
+        # The scan tree yields routes depth-first, probing empty intermediate
+        # nodes for baselines before yielding their children.  A bounded
+        # worker pool ensures each route completes fully before the next starts.
+
+        if on_phase:
+            on_phase("scanning", len(tree))
 
         async def _worker(queue: asyncio.Queue) -> None:
             while True:
@@ -239,23 +217,18 @@ async def scan(
                 finally:
                     queue.task_done()
 
-        phases = group_by_complexity(routes)
-        for phase_label, phase_routes in phases:
-            if on_phase:
-                on_phase(phase_label, len(phase_routes))
+        queue: asyncio.Queue[Route] = asyncio.Queue(maxsize=concurrency * 2)
+        workers = [asyncio.create_task(_worker(queue)) for _ in range(concurrency)]
 
-            queue: asyncio.Queue[Route] = asyncio.Queue(maxsize=concurrency * 2)
-            workers = [asyncio.create_task(_worker(queue)) for _ in range(concurrency)]
+        try:
+            async for route in tree.walk(send_fn):
+                await queue.put(route)
+            await queue.join()
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
-            try:
-                for route in phase_routes:
-                    await queue.put(route)
-                await queue.join()
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                pass
-            finally:
-                for w in workers:
-                    w.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
-
-    return results
+    return results, tree

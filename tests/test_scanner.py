@@ -10,53 +10,8 @@ from apiscan.kite import Crumb, Route
 from apiscan.output import ScanResult
 from apiscan.scanner import (
     RateLimiter,
-    group_by_complexity,
-    route_complexity,
     scan,
 )
-
-
-# ---------------------------------------------------------------------------
-# Unit tests for route complexity / phasing
-# ---------------------------------------------------------------------------
-
-class TestRouteComplexity:
-    def test_bare_route(self):
-        r = Route(template_path="/health", method="GET")
-        assert route_complexity(r) == 0
-
-    def test_with_crumbs(self):
-        r = Route(
-            template_path="/users/{id}",
-            method="GET",
-            path_crumbs=[Crumb("uuid", name="id")],
-            query_crumbs=[Crumb("static", name="q", fields={"v": "1"})],
-        )
-        assert route_complexity(r) == 2
-
-
-class TestGroupByComplexity:
-    def test_ordering(self):
-        routes = [
-            Route(template_path="/a", method="GET", query_crumbs=[Crumb("static", name="q", fields={"v": "1"})]),
-            Route(template_path="/b", method="GET"),
-            Route(template_path="/c", method="GET"),
-        ]
-        phases = group_by_complexity(routes)
-        assert phases[0][0] == "0 mutations"
-        assert len(phases[0][1]) == 2  # /b and /c
-        assert phases[1][0] == "1 mutations"
-        assert len(phases[1][1]) == 1  # /a
-
-    def test_alphabetical_within_phase(self):
-        routes = [
-            Route(template_path="/z", method="GET"),
-            Route(template_path="/a", method="GET"),
-            Route(template_path="/m", method="GET"),
-        ]
-        phases = group_by_complexity(routes)
-        paths = [r.template_path for r in phases[0][1]]
-        assert paths == ["/a", "/m", "/z"]
 
 
 class TestRateLimiter:
@@ -82,7 +37,7 @@ class TestScanIntegration:
             Route(template_path="/api/v1/users", method="GET"),
             Route(template_path="/api/v1/health", method="GET"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         paths = {r.path for r in results}
         assert "/api/v1/users" in paths
         assert "/api/v1/health" in paths
@@ -95,7 +50,7 @@ class TestScanIntegration:
             Route(template_path="/nonexistent/random/path", method="GET"),
             Route(template_path="/also/does/not/exist", method="GET"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         paths = {r.path for r in results}
         assert "/api/v1/users" in paths
         assert "/nonexistent/random/path" not in paths
@@ -107,7 +62,7 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/api/v1/users", method="POST"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         assert len(results) >= 1
         assert results[0].method == "POST"
 
@@ -117,7 +72,7 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/api/v1/users", method="PUT"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         found_405 = any(r.status_code == 405 for r in results)
         assert found_405
 
@@ -127,7 +82,7 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/api/v1/users", method="GET"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         assert len(results) >= 1
         for r in results:
             assert r.reason, f"Finding {r.path} has no reason"
@@ -138,7 +93,7 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/api/v1/users", method="GET"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         assert len(results) >= 1
         for r in results:
             assert r.confidence in ("high", "medium", "low")
@@ -149,7 +104,7 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/internal/metrics", method="GET"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         # /internal/metrics returns text/plain 200 vs gateway text/html 404
         paths = {r.path for r in results}
         assert "/internal/metrics" in paths
@@ -160,7 +115,7 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/admin/dashboard", method="GET"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         paths = {r.path for r in results}
         assert "/admin/dashboard" in paths
         dashboard = [r for r in results if r.path == "/admin/dashboard"][0]
@@ -173,7 +128,7 @@ class TestScanIntegration:
             Route(template_path="/slow", method="GET"),
         ]
         start = time.monotonic()
-        results = await scan(test_server_url, routes, concurrency=2, timeout=1.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=1.0)
         elapsed = time.monotonic() - start
         assert elapsed < 4.0
         assert len(results) == 0
@@ -184,7 +139,7 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/redirect", method="GET"),
         ]
-        results = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         assert isinstance(results, list)
 
     @pytest.mark.asyncio
@@ -199,7 +154,7 @@ class TestScanIntegration:
                 body_crumbs=[Crumb("static", name="key", fields={"v": "val"})],
             ),
         ]
-        results = await scan(test_server_url, routes, concurrency=1, timeout=5.0)
+        results, _ = await scan(test_server_url, routes, concurrency=1, timeout=5.0)
         assert len(results) >= 1
 
     @pytest.mark.asyncio
@@ -210,7 +165,7 @@ class TestScanIntegration:
             for _ in range(10)
         ]
         start = time.monotonic()
-        await scan(test_server_url, routes, concurrency=5, rate_limit=5.0, timeout=5.0)
+        await scan(test_server_url, routes, concurrency=5, rate_limit=5.0, timeout=5.0)  # ignore return
         elapsed = time.monotonic() - start
         assert elapsed >= 1.5
 
@@ -220,8 +175,30 @@ class TestScanIntegration:
         routes = [
             Route(template_path="/api/v1/users", method="GET"),
         ]
-        results = await scan(
+        results, _ = await scan(
             test_server_url, routes, concurrency=2, timeout=5.0,
             status_blacklist={200},
         )
         assert not any(r.status_code == 200 for r in results)
+
+    @pytest.mark.asyncio
+    async def test_admin_wildcard_children_filtered(self, test_server_url):
+        """Children of a wildcard handler should be filtered by the tree walk.
+
+        /admin/* returns 403 json for everything.  /admin/dashboard returns 401.
+        The tree ensures /admin/random is tested first (via intermediate walk),
+        establishing /admin as a 403 handler boundary.  /admin/settings (which
+        doesn't exist) should then be filtered against that boundary.
+        """
+        routes = [
+            Route(template_path="/admin/dashboard", method="GET"),
+            Route(template_path="/admin/settings", method="GET"),
+            Route(template_path="/admin/logs", method="GET"),
+        ]
+        results, _ = await scan(test_server_url, routes, concurrency=1, timeout=5.0)
+        paths = {r.path for r in results}
+        # /admin/dashboard is real (401 vs 403 baseline) — should be found
+        assert "/admin/dashboard" in paths
+        # /admin/settings and /admin/logs are 403 like the wildcard — should be filtered
+        assert "/admin/settings" not in paths
+        assert "/admin/logs" not in paths

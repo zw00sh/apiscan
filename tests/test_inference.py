@@ -8,7 +8,6 @@ import pytest
 
 from apiscan.inference import (
     Baseline,
-    BaselineTree,
     Finding,
     InferenceEngine,
     ResponseSignature,
@@ -18,6 +17,7 @@ from apiscan.inference import (
     matches_baseline,
 )
 from apiscan.kite import Route
+from apiscan.scantree import ScanTree
 
 
 # ---------------------------------------------------------------------------
@@ -180,64 +180,6 @@ class TestMatchesBaseline:
 # BaselineTree
 # ---------------------------------------------------------------------------
 
-class TestBaselineTree:
-    def test_root_lookup(self):
-        tree = BaselineTree()
-        bl = _baseline(_sig())
-        tree.set("/", "GET", bl)
-        result = tree.lookup("/api/v1/users", "GET")
-        assert result is not None
-        assert result[0] == "/"
-
-    def test_nearest_ancestor(self):
-        tree = BaselineTree()
-        root_bl = _baseline(_sig(content_type="text/html"))
-        api_bl = _baseline(_sig(content_type="application/json"))
-        tree.set("/", "GET", root_bl)
-        tree.set("/api/v1", "GET", api_bl)
-        result = tree.lookup("/api/v1/users", "GET")
-        assert result is not None
-        assert result[0] == "/api/v1"
-
-    def test_deeper_prefix_wins(self):
-        tree = BaselineTree()
-        tree.set("/", "GET", _baseline(_sig()))
-        tree.set("/api", "GET", _baseline(_sig()))
-        tree.set("/api/v1", "GET", _baseline(_sig()))
-        result = tree.lookup("/api/v1/users/123", "GET")
-        assert result[0] == "/api/v1"
-
-    def test_no_match(self):
-        tree = BaselineTree()
-        assert tree.lookup("/anything", "GET") is None
-
-    def test_exact_path_match(self):
-        tree = BaselineTree()
-        tree.set("/admin", "GET", _baseline(_sig()))
-        result = tree.lookup("/admin", "GET")
-        assert result is not None
-        assert result[0] == "/admin"
-
-    def test_method_specific_baseline(self):
-        tree = BaselineTree()
-        get_bl = _baseline(_sig(content_type="text/html"))
-        post_bl = _baseline(_sig(content_type="application/json"))
-        tree.set("/", "GET", get_bl)
-        tree.set("/", "POST", post_bl)
-        get_result = tree.lookup("/api/users", "GET")
-        post_result = tree.lookup("/api/users", "POST")
-        assert get_result[1].signatures[0].content_type == "text/html"
-        assert post_result[1].signatures[0].content_type == "application/json"
-
-    def test_method_fallback_to_get(self):
-        tree = BaselineTree()
-        tree.set("/", "GET", _baseline(_sig()))
-        # PUT has no baseline, should fall back to GET
-        result = tree.lookup("/api/users", "PUT")
-        assert result is not None
-        assert result[0] == "/"
-
-
 # ---------------------------------------------------------------------------
 # is_known_bad_site
 # ---------------------------------------------------------------------------
@@ -261,31 +203,19 @@ class TestKnownBadSites:
 # InferenceEngine
 # ---------------------------------------------------------------------------
 
+def _make_engine(**kw) -> tuple[ScanTree, InferenceEngine]:
+    """Create a ScanTree + InferenceEngine pair for testing."""
+    tree = ScanTree()
+    engine = InferenceEngine(tree=tree, **kw)
+    return tree, engine
+
+
 class TestInferenceEngine:
     @pytest.mark.asyncio
-    async def test_initialize_sets_root_baseline(self):
-        engine = InferenceEngine()
-        calls: list[str] = []
-
-        async def mock_send(method, path, headers=None, body=None):
-            calls.append(method)
-            return _sig(status_code=404, content_type="text/html")
-
-        await engine.initialize(mock_send)
-        # 2 probes per method x 5 methods = 10 total
-        assert len(calls) == 10
-        assert set(calls) == {"GET", "POST", "PUT", "DELETE", "PATCH"}
-        assert engine.tree.lookup("/", "GET") is not None
-        assert engine.tree.lookup("/", "POST") is not None
-
-    @pytest.mark.asyncio
     async def test_baseline_match_returns_none(self):
-        """A response matching baseline should be filtered."""
-        engine = InferenceEngine()
-        # Pre-set root baseline
-        engine.tree.set("/", "GET", _baseline(_sig(status_code=404, content_type="text/html",
-                                                content_length=50)))
-
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html",
+                                                      content_length=50)))
         route = Route(template_path="/random/path", method="GET")
         sig = _sig(status_code=404, content_type="text/html", content_length=50)
 
@@ -297,22 +227,14 @@ class TestInferenceEngine:
 
     @pytest.mark.asyncio
     async def test_status_deviation_returns_finding(self):
-        """A response with different status should be a finding."""
-        engine = InferenceEngine()
-        engine.tree.set("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
 
         route = Route(template_path="/api/v1/users", method="GET")
         sig = _sig(status_code=200, content_type="application/json",
                   content_length=100, word_count=5, line_count=1)
 
-        probe_calls = []
-
         async def mock_send(method, path, headers=None, body=None):
-            probe_calls.append((method, path))
-            # Sibling returns something different from candidate (not a handler boundary)
-            if "sibling" not in path and method == "GET" and path != "/api/v1/users":
-                return _sig(status_code=404, content_type="text/html")
-            # Method change probe
             return _sig(status_code=405, content_type="application/json",
                        content_length=30, word_count=3, line_count=1)
 
@@ -322,32 +244,31 @@ class TestInferenceEngine:
         assert "status:" in result.reason
 
     @pytest.mark.asyncio
-    async def test_handler_boundary_discovery(self):
-        """When sibling matches candidate, a new handler boundary is registered."""
-        engine = InferenceEngine()
-        engine.tree.set("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+    async def test_handler_boundary_filters_children(self):
+        """When a prefix baseline is set, children matching it are filtered."""
+        tree, engine = _make_engine()
+        # Insert a route so the /api/v1 node exists in the tree
+        tree.insert(Route(template_path="/api/v1/users", method="GET"))
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+        # Simulate tree.walk having probed /api/v1 as a handler boundary
+        tree.set_baseline("/api/v1", "GET", _baseline(
+            _sig(status_code=404, content_type="application/json",
+                 content_length=25, word_count=3, line_count=1)))
 
         route = Route(template_path="/api/v1/users", method="GET")
-        # Candidate: JSON 404 (different from root HTML 404)
         candidate_sig = _sig(status_code=404, content_type="application/json",
                             content_length=25, word_count=3, line_count=1)
 
         async def mock_send(method, path, headers=None, body=None):
-            # Sibling under /api/v1 returns same JSON 404 -> handler boundary
-            return _sig(status_code=404, content_type="application/json",
-                       content_length=25, word_count=3, line_count=1)
+            return _sig()
 
         result = await engine.process(route, candidate_sig, "/api/v1/users", mock_send)
-        # Candidate matches the new handler baseline -> filtered
         assert result is None
-        # Handler boundary should be registered
-        assert engine.tree.lookup("/api/v1", "GET") is not None
 
     @pytest.mark.asyncio
     async def test_method_sensitive_405(self):
-        """405 on method change probe -> high confidence finding."""
-        engine = InferenceEngine()
-        engine.tree.set("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
 
         route = Route(template_path="/api/v1/users", method="GET")
         sig = _sig(status_code=200, content_type="application/json",
@@ -365,16 +286,14 @@ class TestInferenceEngine:
 
     @pytest.mark.asyncio
     async def test_content_type_change_high_confidence(self):
-        """Content-type change from baseline -> high confidence."""
-        engine = InferenceEngine()
-        engine.tree.set("/", "GET", _baseline(_sig(content_type="text/html")))
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(content_type="text/html")))
 
         route = Route(template_path="/api/health", method="GET")
         sig = _sig(status_code=200, content_type="application/json",
                   content_length=20, word_count=2, line_count=1)
 
         async def mock_send(method, path, headers=None, body=None):
-            # Sibling differs from candidate
             return _sig(status_code=404, content_type="text/html")
 
         result = await engine.process(route, sig, "/api/health", mock_send)
@@ -384,8 +303,8 @@ class TestInferenceEngine:
 
     @pytest.mark.asyncio
     async def test_status_blacklist(self):
-        engine = InferenceEngine(status_blacklist={500, 502})
-        engine.tree.set("/", "GET", _baseline(_sig()))
+        tree, engine = _make_engine(status_blacklist={500, 502})
+        tree.set_baseline("/", "GET", _baseline(_sig()))
 
         route = Route(template_path="/error", method="GET")
         sig = _sig(status_code=500)
@@ -398,8 +317,8 @@ class TestInferenceEngine:
 
     @pytest.mark.asyncio
     async def test_status_whitelist(self):
-        engine = InferenceEngine(status_whitelist={200, 301})
-        engine.tree.set("/", "GET", _baseline(_sig()))
+        tree, engine = _make_engine(status_whitelist={200, 301})
+        tree.set_baseline("/", "GET", _baseline(_sig()))
 
         route = Route(template_path="/auth", method="GET")
         sig = _sig(status_code=401)
@@ -412,8 +331,8 @@ class TestInferenceEngine:
 
     @pytest.mark.asyncio
     async def test_known_bad_site_filtered(self):
-        engine = InferenceEngine()
-        engine.tree.set("/", "GET", _baseline(_sig()))
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig()))
 
         route = Route(template_path="/api", method="GET")
         sig = _sig(status_code=400, content_length=1555, word_count=82, line_count=12)
@@ -426,9 +345,8 @@ class TestInferenceEngine:
 
     @pytest.mark.asyncio
     async def test_new_headers_in_reason(self):
-        """New headers not in baseline should appear in reason."""
-        engine = InferenceEngine()
-        engine.tree.set("/", "GET", _baseline(_sig(header_names=frozenset({"content-type", "date"}))))
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(header_names=frozenset({"content-type", "date"}))))
 
         route = Route(template_path="/admin/dashboard", method="GET")
         sig = _sig(status_code=401, content_type="application/json",
@@ -441,70 +359,3 @@ class TestInferenceEngine:
         result = await engine.process(route, sig, "/admin/dashboard", mock_send)
         assert result is not None
         assert "x-request-id" in result.reason
-
-    @pytest.mark.asyncio
-    async def test_deep_path_walks_intermediates(self):
-        """A deep path like /foo/bar/bin/baz should probe /foo, /foo/bar, /foo/bar/bin."""
-        engine = InferenceEngine()
-        # Root: html 404
-        engine.tree.set("/", "GET", _baseline(_sig(status_code=404, content_type="text/html",
-                                                    content_length=50)))
-
-        route = Route(template_path="/foo/bar/bin/baz", method="GET")
-        # Candidate returns json 200 (real route behind two handler boundaries)
-        candidate_sig = _sig(status_code=200, content_type="application/json",
-                            content_length=80, word_count=5, line_count=1)
-
-        probed_paths: list[str] = []
-
-        async def mock_send(method, path, headers=None, body=None):
-            probed_paths.append(path)
-            # /foo/* returns html 404 (same as root — not a boundary)
-            if path.startswith("/foo/") and not path.startswith("/foo/bar"):
-                return _sig(status_code=404, content_type="text/html", content_length=50)
-            # /foo/bar/* returns json 404 (new boundary at /foo/bar)
-            if path.startswith("/foo/bar/") and not path.startswith("/foo/bar/bin/baz"):
-                return _sig(status_code=404, content_type="application/json",
-                           content_length=25, word_count=3, line_count=1)
-            # method change probe or anything else
-            return _sig(status_code=405)
-
-        result = await engine.process(route, candidate_sig, "/foo/bar/bin/baz", mock_send)
-
-        # /foo/bar should be registered as a handler boundary
-        assert engine.tree.lookup("/foo/bar/anything", "GET") is not None
-        bar_node = engine.tree.lookup("/foo/bar/anything", "GET")
-        assert bar_node[0] == "/foo/bar"
-
-        # /foo should NOT be a boundary (same as root)
-        foo_node = engine.tree.lookup("/foo/something", "GET")
-        assert foo_node[0] == "/"  # falls back to root
-
-        # Candidate should be a finding (200 json != 404 json baseline at /foo/bar)
-        assert result is not None
-
-    @pytest.mark.asyncio
-    async def test_deep_path_filtered_at_intermediate(self):
-        """If a deep candidate matches an intermediate baseline, it should be filtered."""
-        engine = InferenceEngine()
-        engine.tree.set("/", "GET", _baseline(_sig(status_code=404, content_type="text/html",
-                                                    content_length=50)))
-
-        route = Route(template_path="/api/v2/anything", method="GET")
-        # Candidate returns json 404 — same as what /api/v2 handler will return
-        candidate_sig = _sig(status_code=404, content_type="application/json",
-                            content_length=25, word_count=3, line_count=1)
-
-        async def mock_send(method, path, headers=None, body=None):
-            # /api/* returns html 404 (same as root)
-            if path.startswith("/api/") and not path.startswith("/api/v2"):
-                return _sig(status_code=404, content_type="text/html", content_length=50)
-            # /api/v2/* returns json 404 (handler boundary)
-            return _sig(status_code=404, content_type="application/json",
-                       content_length=25, word_count=3, line_count=1)
-
-        result = await engine.process(route, candidate_sig, "/api/v2/anything", mock_send)
-        # Candidate matches the /api/v2 baseline → filtered
-        assert result is None
-        # /api/v2 should be in the tree
-        assert engine.tree.lookup("/api/v2/test", "GET")[0] == "/api/v2"
