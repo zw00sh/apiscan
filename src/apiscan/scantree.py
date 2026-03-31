@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import AsyncIterator
 
 from apiscan.inference import (
     Baseline,
@@ -45,6 +44,17 @@ class BoundaryProbe:
     method: str
     signature: ResponseSignature
     ancestor_signature: ResponseSignature
+
+
+@dataclass(frozen=True)
+class BoundaryGroup:
+    """All boundary probes for a single prefix, pushed as one queue item.
+
+    Allows the scanner to collapse per-method boundary probes into a
+    single output line instead of N separate findings.
+    """
+    prefix: str
+    probes: tuple[BoundaryProbe, ...]
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +121,8 @@ class ScanTree:
 
         Only returns method-specific baselines.  Falls back to GET only at
         root, where all methods are explicitly probed during initialization.
+
+        Read-only — safe for concurrent callers without locks.
         """
         parts = path.rstrip("/").split("/")
         for i in range(len(parts), 0, -1):
@@ -162,29 +174,40 @@ class ScanTree:
     # Depth-first walk with parallel prefix probing
     # ------------------------------------------------------------------
 
-    async def walk(self, send_fn, tracker=None) -> AsyncIterator[Route | BoundaryProbe]:
-        """Depth-first iteration.  Probes intermediate nodes and yields
-        boundary discoveries before yielding routes."""
-        async for item in self._walk(self._root, "", send_fn, tracker):
-            yield item
+    async def walk(self, send_fn, queue: asyncio.Queue, tracker=None) -> None:
+        """Depth-first iteration with concurrent sibling branches.
+
+        Pushes :class:`Route` and :class:`BoundaryProbe` items directly
+        into *queue*.  Sibling branches are walked concurrently via
+        ``asyncio.gather``; the bounded queue provides backpressure.
+        """
+        await self._walk(self._root, "", send_fn, queue, tracker)
 
     async def _walk(
-        self, node: _Node, prefix: str, send_fn, tracker=None,
-    ) -> AsyncIterator[Route | BoundaryProbe]:
-        # Probe this node for handler boundaries (if it has children)
+        self, node: _Node, prefix: str, send_fn, queue: asyncio.Queue, tracker=None,
+    ) -> None:
+        # Probe this node for handler boundaries (if it has children).
+        # Must complete before gathering children — children call
+        # lookup_baseline() which reads baselines written here.
         if node.children and prefix:
-            async for bp in self._probe_node(node, prefix, send_fn, tracker):
-                yield bp
+            probes = [bp async for bp in self._probe_node(node, prefix, send_fn, tracker)]
+            if probes:
+                await queue.put(BoundaryGroup(prefix=prefix, probes=tuple(probes)))
 
-        # Yield this node's routes
+        # Push this node's routes
         for route in node.routes:
-            yield route
+            await queue.put(route)
 
-        # Recurse into children in insertion order
-        for seg in node._insertion_order:
-            child_prefix = f"{prefix}/{seg}" if prefix else f"/{seg}"
-            async for item in self._walk(node.children[seg], child_prefix, send_fn, tracker):
-                yield item
+        # Walk children concurrently — sibling branches are independent
+        if node._insertion_order:
+            await asyncio.gather(*[
+                self._walk(
+                    node.children[seg],
+                    f"{prefix}/{seg}" if prefix else f"/{seg}",
+                    send_fn, queue, tracker,
+                )
+                for seg in node._insertion_order
+            ])
 
     async def _probe_node(
         self, node: _Node, prefix: str, send_fn, tracker=None,
@@ -244,7 +267,9 @@ class ScanTree:
         variance_results = await asyncio.gather(*[_variance_probe(m) for m, _, _ in discoveries])
         variance_by_method = {m: sig for m, sig in variance_results}
 
-        # Register baselines and yield boundary probes
+        # Register baselines and yield boundary probes.
+        # Safe: only this node's walk task writes to node.baselines,
+        # and this completes before child tasks are spawned by _walk().
         for method, probe_sig, ancestor_baseline in discoveries:
             extra_sig = variance_by_method.get(method)
             sigs = [probe_sig, extra_sig] if extra_sig else [probe_sig]

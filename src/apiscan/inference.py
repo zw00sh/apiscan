@@ -295,6 +295,10 @@ class InferenceEngine:
     ) -> Finding | list[Finding] | None:
         """Classify a candidate response.
 
+        Stateless w.r.t. the tree — reads baselines only via
+        ``lookup_baseline()``.  Safe for concurrent calls from
+        multiple workers.
+
         Returns a single ``Finding``, a list of findings (from alternate
         method probing), or ``None`` if filtered.
         """

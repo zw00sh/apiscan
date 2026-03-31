@@ -7,7 +7,8 @@
 │                          SCAN TREE                                  │
 │                                                                     │
 │  Routes organised by path segments, depth-first iteration.          │
-│  At each node: probe for baselines, yield events, recurse.          │
+│  Sibling branches walked concurrently (asyncio.gather).             │
+│  At each node: probe for baselines, push to queue, gather children. │
 │                                                                     │
 │  ┌─────────────┐    ┌──────────────────┐    ┌────────────────────┐  │
 │  │ initialize()│───>│ Root baselines   │    │ Per-method probes  │  │

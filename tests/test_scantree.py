@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from apiscan.inference import ResponseSignature, build_baseline
 from apiscan.kite import Route
-from apiscan.scantree import BoundaryProbe, ScanTree
+from apiscan.scantree import BoundaryGroup, BoundaryProbe, ScanTree
+
+
+async def _collect_walk(tree, send_fn=None):
+    """Helper: run tree.walk() and collect all items from the queue."""
+    queue: asyncio.Queue = asyncio.Queue()
+    await tree.walk(send_fn, queue)
+    items = []
+    while not queue.empty():
+        items.append(queue.get_nowait())
+    return items
 
 
 def _route(path: str, method: str = "GET") -> Route:
@@ -36,11 +48,12 @@ def _sig(
 
 class TestRouteOrdering:
     @pytest.mark.asyncio
-    async def test_flat_preserves_order(self):
+    async def test_flat_all_present(self):
         tree = ScanTree([_route("/b"), _route("/a"), _route("/c")])
-        items = [i async for i in tree.walk(None)]
+        items = await _collect_walk(tree)
         paths = [r.template_path for r in items if isinstance(r, Route)]
-        assert paths == ["/b", "/a", "/c"]
+        # Siblings walked concurrently — order is nondeterministic
+        assert set(paths) == {"/b", "/a", "/c"}
 
     @pytest.mark.asyncio
     async def test_parent_before_children(self):
@@ -53,29 +66,31 @@ class TestRouteOrdering:
         async def mock_send(method, path, headers=None, body=None):
             return _sig()
 
-        items = [i async for i in tree.walk(mock_send)]
+        items = await _collect_walk(tree, mock_send)
         routes = [r for r in items if isinstance(r, Route)]
         paths = [r.template_path for r in routes]
         assert paths.index("/api") < paths.index("/api/v1")
         assert paths.index("/api/v1") < paths.index("/api/v1/users")
 
     @pytest.mark.asyncio
-    async def test_siblings_preserve_insertion_order(self):
+    async def test_siblings_all_present(self):
         tree = ScanTree([_route("/api/users"), _route("/api/health"), _route("/api/orders")])
 
         async def mock_send(method, path, headers=None, body=None):
             return _sig()
 
-        items = [i async for i in tree.walk(mock_send)]
+        items = await _collect_walk(tree, mock_send)
         paths = [r.template_path for r in items if isinstance(r, Route)]
-        assert paths == ["/api/users", "/api/health", "/api/orders"]
+        # Siblings walked concurrently — order is nondeterministic
+        assert set(paths) == {"/api/users", "/api/health", "/api/orders"}
 
     @pytest.mark.asyncio
     async def test_extensions_are_siblings(self):
         tree = ScanTree([_route("/files"), _route("/files.html"), _route("/files.zip")])
-        items = [i async for i in tree.walk(None)]
+        items = await _collect_walk(tree)
         paths = [r.template_path for r in items if isinstance(r, Route)]
-        assert paths == ["/files", "/files.html", "/files.zip"]
+        # Siblings walked concurrently — order is nondeterministic
+        assert set(paths) == {"/files", "/files.html", "/files.zip"}
 
     @pytest.mark.asyncio
     async def test_children_after_parent(self):
@@ -84,7 +99,7 @@ class TestRouteOrdering:
         async def mock_send(method, path, headers=None, body=None):
             return _sig()
 
-        items = [i async for i in tree.walk(mock_send)]
+        items = await _collect_walk(tree, mock_send)
         paths = [r.template_path for r in items if isinstance(r, Route)]
         assert paths.index("/files") < paths.index("/files/cache/")
         assert paths.index("/files") < paths.index("/files/tmp/")
@@ -98,7 +113,7 @@ class TestRouteOrdering:
     @pytest.mark.asyncio
     async def test_multiple_methods_same_path(self):
         tree = ScanTree([_route("/api/users", "GET"), _route("/api/users", "POST")])
-        items = [i async for i in tree.walk(None)]
+        items = await _collect_walk(tree)
         pairs = [(r.template_path, r.method) for r in items if isinstance(r, Route)]
         assert pairs == [("/api/users", "GET"), ("/api/users", "POST")]
 
@@ -155,11 +170,11 @@ class TestPrefixProbing:
                            content_length=25, word_count=3, line_count=1)
             return _sig(status_code=404, content_type="text/html")
 
-        items = [i async for i in tree.walk(mock_send)]
+        items = await _collect_walk(tree, mock_send)
 
-        # Should have BoundaryProbe events for /api/v1
-        boundaries = [i for i in items if isinstance(i, BoundaryProbe)]
-        assert any(bp.prefix == "/api/v1" for bp in boundaries)
+        # Should have a BoundaryGroup for /api/v1
+        groups = [i for i in items if isinstance(i, BoundaryGroup)]
+        assert any(g.prefix == "/api/v1" for g in groups)
 
         # Baseline should be registered
         result = tree.lookup_baseline("/api/v1/users", "GET")
@@ -175,11 +190,11 @@ class TestPrefixProbing:
         async def mock_send(method, path, headers=None, body=None):
             return _sig(status_code=404, content_type="text/html", content_length=50)
 
-        items = [i async for i in tree.walk(mock_send)]
+        items = await _collect_walk(tree, mock_send)
 
-        # No boundary probes — same handler as root
-        boundaries = [i for i in items if isinstance(i, BoundaryProbe)]
-        assert len(boundaries) == 0
+        # No boundary groups — same handler as root
+        groups = [i for i in items if isinstance(i, BoundaryGroup)]
+        assert len(groups) == 0
         assert tree.lookup_baseline("/foo/bar", "GET")[0] == "/"
 
     @pytest.mark.asyncio
@@ -237,8 +252,8 @@ class TestPrefixProbing:
                            content_length=25, word_count=3, line_count=1)
             return _sig(status_code=404, content_type="text/html")
 
-        items = [i async for i in tree.walk(mock_send)]
-        # Find first BoundaryProbe and first Route
-        first_bp = next((i, idx) for idx, i in enumerate(items) if isinstance(i, BoundaryProbe))
+        items = await _collect_walk(tree, mock_send)
+        # Find first BoundaryGroup and first Route
+        first_bg = next((i, idx) for idx, i in enumerate(items) if isinstance(i, BoundaryGroup))
         first_route = next((i, idx) for idx, i in enumerate(items) if isinstance(i, Route))
-        assert first_bp[1] < first_route[1]
+        assert first_bg[1] < first_route[1]

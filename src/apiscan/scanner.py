@@ -21,7 +21,7 @@ from apiscan.inference import (
 )
 from apiscan.kite import Route, render_body, render_headers, render_path, render_query
 from apiscan.output import ScanResult
-from apiscan.scantree import BoundaryProbe, ScanTree
+from apiscan.scantree import BoundaryGroup, BoundaryProbe, ScanTree
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +179,9 @@ async def scan(
         # Initialize root baselines
         await tree.initialize(send_fn)
 
-        # Connection failure tracking
+        # Connection failure tracking.
+        # Shared across concurrent workers — the race between await points
+        # is benign for a threshold heuristic (worst case: one extra request).
         conn_failures = 0
 
         def _emit(finding: Finding, **kw) -> None:
@@ -188,10 +190,28 @@ async def scan(
             if on_result:
                 on_result(result)
 
-        def _handle_boundary(probe: BoundaryProbe) -> None:
-            finding = engine.classify_boundary(probe)
-            if finding is not None:
-                _emit(finding)
+        def _handle_boundary_group(group: BoundaryGroup) -> None:
+            findings = []
+            for probe in group.probes:
+                finding = engine.classify_boundary(probe)
+                if finding is not None:
+                    findings.append(finding)
+            if not findings:
+                return
+            # Collapse into a single result: use the first finding's
+            # signature for display, merge method summaries into reason.
+            method_statuses = []
+            for f in findings:
+                method_statuses.append(f"{f.route.method}={f.signature.status_code}")
+            collapsed_reason = f"boundary: {', '.join(method_statuses)}"
+            primary = findings[0]
+            collapsed = Finding(
+                route=Route(template_path=group.prefix, method="*"),
+                signature=primary.signature,
+                reason=collapsed_reason,
+                confidence=primary.confidence,
+            )
+            _emit(collapsed)
 
         async def _handle_route(route: Route) -> None:
             nonlocal conn_failures
@@ -264,8 +284,8 @@ async def scan(
             while True:
                 item = await queue.get()
                 try:
-                    if isinstance(item, BoundaryProbe):
-                        _handle_boundary(item)
+                    if isinstance(item, BoundaryGroup):
+                        _handle_boundary_group(item)
                     else:
                         await _handle_route(item)
                 finally:
@@ -275,8 +295,7 @@ async def scan(
         workers = [asyncio.create_task(_worker(queue)) for _ in range(concurrency)]
 
         try:
-            async for item in tree.walk(send_fn, tracker):
-                await queue.put(item)
+            await tree.walk(send_fn, queue, tracker)
             await queue.join()
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass

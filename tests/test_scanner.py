@@ -159,7 +159,7 @@ class TestScanIntegration:
         ]
         results, tree = await scan(test_server_url, routes, concurrency=1, timeout=5.0)
         # The /admin boundary should be reported (403 json vs 404 html root)
-        boundary_results = [r for r in results if "probe:" in r.reason]
+        boundary_results = [r for r in results if "boundary:" in r.reason]
         assert len(boundary_results) >= 1
 
     @pytest.mark.asyncio
