@@ -328,9 +328,13 @@ class ScanTree:
             except Exception:
                 return method, None, None
 
+            # Check against ALL ancestor baselines, not just nearest.
+            # A response matching any ancestor is falling back to a known
+            # handler (e.g. framework default 404), not a new boundary.
             probe_len = len(probe_path.lstrip("/"))
-            if matches_baseline(probe_sig, ancestor_baseline, probe_len) is not None:
-                return method, None, None
+            for bl in self._ancestor_baselines(prefix, method):
+                if matches_baseline(probe_sig, bl, probe_len) is not None:
+                    return method, None, None
 
             return method, probe_sig, ancestor_baseline
 
@@ -409,10 +413,13 @@ class ScanTree:
         from the ancestor baseline, the sub-prefix is a hidden boundary —
         ``probe_prefix`` is called on it for full multi-method probing.
         """
-        ancestor_result = self.lookup_baseline(prefix, "GET")
-        if ancestor_result is None:
+        # Collect all ancestor baselines for GET — a response matching any
+        # ancestor is falling back to a known handler, not a new boundary.
+        # This handles reverse proxy setups where different backends have
+        # different default 404s at different depths.
+        ancestor_baselines = self._ancestor_baselines(prefix, "GET")
+        if not ancestor_baselines:
             return []
-        _, ancestor_baseline = ancestor_result
 
         if tracker:
             tracker.plan(len(_LOOKAHEAD_SEGMENTS))
@@ -428,8 +435,12 @@ class ScanTree:
                 sig = await send_fn("GET", probe_path, None, None)
             except Exception:
                 return None
-            if matches_baseline(sig, ancestor_baseline, len(probe_path.lstrip("/"))) is not None:
-                return None
+            path_len = len(probe_path.lstrip("/"))
+            # Must differ from ALL ancestor baselines — matching any means
+            # it's falling back to that handler, not a new one.
+            for bl in ancestor_baselines:
+                if matches_baseline(sig, bl, path_len) is not None:
+                    return None
             return sub_prefix
 
         results = await asyncio.gather(*[_probe_segment(s) for s in _LOOKAHEAD_SEGMENTS])
@@ -442,6 +453,32 @@ class ScanTree:
             if group:
                 groups.append(group)
         return groups
+
+    def _ancestor_baselines(self, prefix: str, method: str) -> list[Baseline]:
+        """Collect all baselines in the ancestor chain for a given method.
+
+        Includes GET fallback at root — many servers return the same default
+        404 regardless of method, so a POST probe matching the root GET
+        baseline is still a known handler, not a new boundary.
+        """
+        baselines = []
+        parts = prefix.rstrip("/").split("/")
+        for i in range(len(parts), 0, -1):
+            candidate = "/".join(parts[:i]) or "/"
+            node = self._resolve(candidate)
+            if node and method in node.baselines:
+                baselines.append(node.baselines[method])
+        # Include root for this method
+        if method in self._root.baselines:
+            root_bl = self._root.baselines[method]
+            if root_bl not in baselines:
+                baselines.append(root_bl)
+        # Fall back to GET at root — default 404 often identical across methods
+        if "GET" in self._root.baselines:
+            get_bl = self._root.baselines["GET"]
+            if get_bl not in baselines:
+                baselines.append(get_bl)
+        return baselines
 
     def _infer_depth(self, prefix: str) -> int:
         """Infer recursion depth from nearest ancestor with a known depth."""
