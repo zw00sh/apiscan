@@ -29,22 +29,25 @@ Root baselines established by probing `/{random}` × 2 for each HTTP method
 (GET, POST, PUT, DELETE, PATCH) — 10 parallel requests. Captures the
 default handler response per verb.
 
-### 2. Tree Walk (depth-first, concurrent siblings, recursive)
+### 2. Priority Queue Scheduling
 
-Routes are organised into a tree by path segments. At each node:
+All work goes through a single priority queue, ordered by expected value:
 
-1. **Probe for handler boundaries** — send `/{prefix}/{random}` for each
-   method. If the response differs from the ancestor baseline, register a
-   new baseline and push a `BoundaryGroup` event to the work queue.
-2. **Recurse** (if `--recurse` enabled) — when a boundary is found, re-apply
-   the entire wordlist under this prefix (e.g. boundary at `/api` inserts
-   `/api/users`, `/api/health`, etc.). Controlled by `--max-depth`.
-3. **Push routes** to the work queue.
-4. **Walk children concurrently** via `asyncio.gather` — sibling branches
-   are independent and explored in parallel, including recursively-added ones.
+1. **Original routes** (priority 0) — direct wordlist hits, processed first.
+2. **Prefix probes** (priority 1) — send `/{prefix}/{random}` per method.
+   If the response differs from ancestor baselines, register a new baseline
+   and emit a `BoundaryGroup` finding. Routes are parked until their prefix
+   probe completes (baseline invariant).
+3. **Recursive routes** (priority 2, if `--recurse` enabled) — when a
+   boundary is found, re-apply the entire wordlist under that prefix.
+   Controlled by `--max-depth`.
+4. **Lookahead probes** (priority 3+i, if `--lookahead` enabled) — probe
+   common path segments one level deeper at leaf nodes to discover hidden
+   N+1 boundaries. Ordered by segment popularity (`api` first, then `v1`,
+   etc.).
 
-Parent probing completes before children start, ensuring baselines are
-established before children are scanned.
+Workers pull the highest-priority item available. The operator sees original
+route findings before recursive or exploratory results.
 
 ### 3. Route Classification
 

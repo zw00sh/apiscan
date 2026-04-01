@@ -15,185 +15,132 @@
 │                           scan() — scanner.py                          │
 │                                                                        │
 │  Creates: ScanTree, InferenceEngine, httpx.AsyncClient, worker pool    │
-│  Owns:    send_fn (HTTP bridge), rate limiter, connection tracking      │
+│  Owns:    priority queue, send_fn, rate limiter, scheduling            │
 │                                                                        │
-│  ┌──────────┐   ┌──────────────┐   ┌────────────┐   ┌──────────────┐  │
-│  │ ScanTree │──>│ asyncio.Queue│──>│ Worker Pool│──>│ Results      │  │
-│  │ (walk)   │   │ (bounded)    │   │ (N tasks)  │   │ (on_result)  │  │
-│  │ pushes   │   │              │   │            │   │              │  │
-│  │ directly │   │              │   │            │   │              │  │
-│  └──────────┘   └──────────────┘   └────────────┘   └──────────────┘  │
+│  ┌──────────┐   ┌───────────────────┐   ┌────────────┐                │
+│  │ ScanTree │   │ PriorityQueue     │──>│ Worker Pool│──> Results     │
+│  │ (data)   │   │                   │   │ (N tasks)  │                │
+│  │ baselines│   │ probes → routes   │   │            │                │
+│  │ prefixes │   │ → recursive       │   │ feedback   │                │
+│  └──────────┘   │ → lookahead       │   │ → queue    │                │
+│                 └───────────────────┘   └────────────┘                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Concurrency Model
+## Priority Queue Model
+
+All work goes through a single `asyncio.PriorityQueue`:
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │      TREE WALK (concurrent tasks)   │
-                    │                                     │
-                    │  await tree.walk(send_fn, queue)    │
-                    │                                     │
-                    │  Pushes: Route | BoundaryProbe      │
-                    │  Order:  depth-first per branch,    │
-                    │          siblings concurrent         │
-                    │          (asyncio.gather)            │
-                    └────────────────┬────────────────────┘
-                                     │
-                          ┌──────────▼──────────┐
-                          │   asyncio.Queue     │
-                          │   maxsize = N × 2   │
-                          │                     │
-                          │   Backpressure:     │
-                          │   put() blocks      │
-                          │   branch walkers    │
-                          │   when full         │
-                          └──┬──┬──┬──┬──┬──┬───┘
-                             │  │  │  │  │  │
-              ┌──────────────┘  │  │  │  │  └──────────────┐
-              ▼                 ▼  ▼  ▼  ▼                 ▼
-        ┌──────────┐    ┌──────────────────────┐    ┌──────────┐
-        │ Worker 1 │    │     Workers 2..N-1   │    │ Worker N │
-        │          │    │                      │    │          │
-        │ get()    │    │  (identical logic)    │    │ get()    │
-        │ classify │    │                      │    │ classify │
-        │ emit     │    │                      │    │ emit     │
-        └──────────┘    └──────────────────────┘    └──────────┘
-              │                                           │
-              │         All workers share:                │
-              │         • send_fn (HTTP via httpx)        │
-              │         • RateLimiter (if --rate set)     │
-              │         • InferenceEngine                 │
-              │         • RequestTracker                  │
-              └─────────────────┬─────────────────────────┘
-                                ▼
-                        ┌───────────────┐
-                        │   on_result() │──> terminal, CSV, proxy replay
-                        │  on_progress()│──> progress bar
-                        └───────────────┘
+PRIORITY    ITEM TYPE           DESCRIPTION
+────────    ─────────           ───────────
+0           Route (original)    Direct wordlist routes — highest value
+1           ProbePrefix         Prefix probing for boundary detection
+2           Route (recursive)   Routes injected under discovered boundaries
+3+i         LookaheadProbe      Common segment probes, ordered by popularity
+                                (api=3, v1=4, user=5, ... search=22)
 ```
 
-## IPC / Shared State
+Workers pull items in priority order. Original routes are processed first,
+giving the operator results immediately. Recursive routes and lookahead
+probes run at lower priority without blocking.
+
+## Scheduling Flow
+
+```
+STARTUP
+  1. tree.initialize(send_fn)     Root baselines (10 parallel probes)
+  2. _seed_queue()                Synchronous tree traversal:
+                                  - Depth-1 prefix probes enqueued at priority 1
+                                  - Deeper probes parked in pending_children
+                                  - Routes parked in pending_routes
+                                  - Root routes enqueued at priority 0
+
+WORKER PULLS ProbePrefix(prefix, depth)
+  1. tree.probe_prefix()          Probes all methods, stores baselines
+  2. If boundary found:
+     - Emit collapsed boundary finding
+     - If --recurse: enqueue recursive routes at priority 2
+     - Enqueue child prefix probes at priority 1
+  3. If no boundary + --lookahead + leaf node:
+     - Enqueue lookahead probes at priority 3+i
+  4. Release parked routes for this prefix at priority 0
+  5. Release parked child probes
+
+WORKER PULLS Route
+  1. Render path/headers/body
+  2. Send HTTP request
+  3. Classify via InferenceEngine
+  4. If finding: reactive probe_prefix (inline, idempotent)
+  5. If redirect in scope: enqueue target at priority 0
+  6. Emit findings
+
+WORKER PULLS LookaheadProbe(prefix, segment)
+  1. Send GET {prefix}/{segment}/{random}
+  2. Check against all ancestor baselines
+  3. If hit: enqueue ProbePrefix at priority 1
+```
+
+## Baseline Invariant
+
+Routes are only enqueued AFTER their prefix probe completes. Child probes
+are only enqueued AFTER their parent probe completes. This guarantees
+`lookup_baseline()` finds the correct baseline when a route is classified.
+
+```
+ProbePrefix("/api")  completes → baseline stored
+  ├── releases Route("/api/users")     → worker can classify
+  ├── releases Route("/api/health")    → worker can classify
+  └── releases ProbePrefix("/api/v1")  → child can now probe
+        completes → baseline stored
+          └── releases Route("/api/v1/login")
+```
+
+## Shared State
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                       SHARED OBJECTS                                │
 │                                                                    │
-│  ┌──────────────────┐    All three producers call plan()/tick():   │
+│  ┌──────────────────┐    All producers call plan()/tick():         │
 │  │  RequestTracker   │                                             │
-│  │                   │    ScanTree.initialize()  ─── plan(10)      │
-│  │  .plan(n)  ◄──────┤    ScanTree._probe_node() ── plan(N)       │
-│  │  .tick()   ◄──────┤    InferenceEngine ────────── plan(N)       │
-│  │  .sent     ───────┤──> ProgressTracker reads sent/planned       │
-│  │  .planned  ───────┤                                             │
-│  │  .on_tick  ──────►│──> ProgressTracker.tick_request()           │
+│  │  .plan(n)         │    tree.initialize()  ─── plan(10)          │
+│  │  .plan_routes(n)  │    probe_prefix()     ─── plan(N)           │
+│  │  .tick()          │    InferenceEngine     ── plan(N)           │
+│  │  .sent/.planned   │    send_fn()          ─── tick()            │
 │  └──────────────────┘                                              │
 │                                                                    │
 │  ┌──────────────────┐                                              │
-│  │  ScanTree         │    Owns: route tree + per-node baselines    │
+│  │  ScanTree         │    Data only — no walk, no scheduling       │
 │  │                   │                                             │
 │  │  Written by:      │    .initialize()  (root baselines)          │
-│  │                   │    ._probe_node() (intermediate baselines)  │
+│  │                   │    .probe_prefix() (prefix baselines)       │
 │  │  Read by:         │    InferenceEngine.process()                │
 │  │                   │     └─ .lookup_baseline(path, method)       │
 │  └──────────────────┘                                              │
 │                                                                    │
 │  ┌──────────────────┐                                              │
 │  │  RateLimiter      │    asyncio.Lock serializes acquire()        │
-│  │                   │                                             │
-│  │  Called by:       │    send_fn() in every HTTP request          │
-│  │                   │    (tree probes + route requests +          │
-│  │                   │     verification probes)                    │
-│  └──────────────────┘                                              │
-│                                                                    │
-│  ┌──────────────────┐                                              │
-│  │  httpx.AsyncClient│    Single connection pool shared by all     │
-│  │                   │    workers via send_fn closure               │
+│  │                   │    Called by send_fn() and _handle_route()  │
 │  └──────────────────┘                                              │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Parallelism Points
+## Concurrency
 
 ```
-PARALLEL (asyncio.gather)                    SEQUENTIAL (awaited in order)
-─────────────────────────                    ──────────────────────────────
+PARALLEL                                 SEQUENTIAL / ORDERED
+────────                                 ────────────────────
 
-Root init: 10 probes at once                 Prefix probing blocks branch:
-  2 random × 5 methods                        node probed before children
-                                               start (baseline invariant)
-Prefix probing: 5 methods per node
-  all fired in parallel                      Rate limiter lock: serializes
-                                               all HTTP through one lock
-Variance probes: N methods per node
-  all fired in parallel
-
-Sibling branches: walked concurrently
-  via asyncio.gather — /api/v1/* and
-  /api/v2/* explored in parallel
-
-Alternate method probing: 4 methods
-  per baseline-matched route
-
-Worker pool: N routes processed
-  concurrently from queue
-```
-
-## Data Flow Per Route
-
-```
-          Route from queue
-               │
-               ▼
-    ┌─────────────────────┐
-    │ render_path/query/   │
-    │ headers/body         │   kite.py: expand crumbs to concrete values
-    └──────────┬──────────┘
-               │
-               ▼
-    ┌─────────────────────┐
-    │ client.request()     │   httpx: actual HTTP call
-    │ (via rate limiter)   │   tracker.tick() on completion
-    └──────────┬──────────┘
-               │
-               ▼
-    ┌─────────────────────┐
-    │ compute_signature()  │   inference.py: extract status, content-type,
-    │                      │   content-length, word/line count, headers
-    └──────────┬──────────┘
-               │
-               ▼
-    ┌─────────────────────┐
-    │ engine.process()     │   inference.py: classify against baselines
-    │                      │
-    │  ┌─ pre-filter ─────┐│   status blacklist, known bad sites
-    │  ├─ baseline match ─┤│   lookup_baseline() → matches_baseline()
-    │  │   └─ alt methods ┤│   4 parallel probes (may add findings)
-    │  ├─ verification ───┤│   method sensitivity, new headers
-    │  └─ classification ─┘│   build reason, score confidence
-    └──────────┬──────────┘
-               │
-          Finding | None
-               │
-               ▼
-    ┌─────────────────────┐
-    │ _finding_to_result() │   scanner.py: Finding → ScanResult
-    │ _emit() → on_result()│   terminal output, CSV, proxy replay
-    └─────────────────────┘
-```
-
-## Bottlenecks
-
-```
-BOTTLENECK                          WHERE                    WHY
-──────────────────────────────────  ───────────────────────  ──────────────────────────
-Prefix probing blocks branch        scantree.py:_probe_node  5-10 HTTP round-trips per
-                                                             interior node before any
-                                                             routes from that subtree
-                                                             reach workers. Required by
-                                                             baseline invariant.
-
-Rate limiter lock contention        scanner.py:34            asyncio.Lock serializes all
-                                                             rate-limited requests across
-                                                             all workers + tree probes
+Root init: 10 probes at once             Prefix probes before child probes
+                                         (parent baseline needed for children)
+Prefix probing: 5 methods per prefix
+  all fired in parallel                  Routes after their prefix probe
+                                         (baseline needed for classification)
+Worker pool: N tasks process items
+  concurrently from priority queue       Rate limiter serializes HTTP requests
+                                         when --rate is set
+All priority levels interleave:
+  workers pull whatever is highest
+  priority at any given moment
 ```
