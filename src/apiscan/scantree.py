@@ -1,23 +1,18 @@
-"""Unified scan tree: routes, baselines, and prefix probing in one structure.
+"""Scan tree: route storage, baseline management, and prefix probing.
 
-Organises routes into a tree by URL path segments.  Each node can hold:
+Organises routes into a trie by URL path segments.  Each node can hold:
 - **Routes** from the wordlist (in insertion order)
 - **Baselines** per HTTP method (discovered by probing)
 
-Async iteration is depth-first.  At each node the tree:
-1. Probes for handler boundaries (if the node has children and no baseline yet)
-2. Yields ``BoundaryProbe`` events for any newly-discovered boundaries
-3. Yields the node's routes
-
-This ensures baselines are established before children are scanned, and
-boundary discoveries flow through the same classification pipeline as routes.
+The tree is a data store — scheduling is handled by the priority queue
+in :mod:`apiscan.scanner`.  The key method is :meth:`probe_prefix`,
+which probes a prefix for handler boundaries and stores baselines.
 """
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Callable
 
 from apiscan.inference import (
     Baseline,
@@ -42,16 +37,12 @@ _LOOKAHEAD_SEGMENTS = [
 
 
 # ---------------------------------------------------------------------------
-# Events yielded during tree walk
+# Events from prefix probing
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class BoundaryProbe:
-    """A handler boundary discovered during prefix probing.
-
-    Yielded by the tree walk so the scanner can classify it through the
-    same pipeline as normal routes.
-    """
+    """A handler boundary discovered during prefix probing."""
     prefix: str
     method: str
     signature: ResponseSignature
@@ -60,11 +51,7 @@ class BoundaryProbe:
 
 @dataclass(frozen=True)
 class BoundaryGroup:
-    """All boundary probes for a single prefix, pushed as one queue item.
-
-    Allows the scanner to collapse per-method boundary probes into a
-    single output line instead of N separate findings.
-    """
+    """All boundary probes for a single prefix, collapsed for display."""
     prefix: str
     probes: tuple[BoundaryProbe, ...]
 
@@ -93,31 +80,16 @@ class _Node:
 # ---------------------------------------------------------------------------
 
 class ScanTree:
-    """Unified tree holding routes and baselines, iterable depth-first.
+    """Route trie with baseline storage and prefix probing.
 
-    Yields :class:`Route` and :class:`BoundaryProbe` objects during walk.
+    Data store only — no walk, no scheduling.  The scanner's priority
+    queue controls work ordering.
     """
 
-    def __init__(
-        self,
-        routes: list[Route] | None = None,
-        *,
-        recurse: bool = False,
-        max_depth: int = 2,
-        wordlist: list[Route] | None = None,
-        on_recurse: Callable[[str, int, int], None] | None = None,
-        lookahead: bool = False,
-    ) -> None:
+    def __init__(self, routes: list[Route] | None = None) -> None:
         self._root = _Node(segment="")
         self.route_count = 0
-        self._recurse = recurse
-        self._max_depth = max_depth
-        self._wordlist = wordlist or []
         self._seen: set[tuple[str, str]] = set()
-        self._skip: set[str] = set()
-        self._on_recurse = on_recurse  # (prefix, new_routes, depth)
-        self._prefix_depth: dict[str, int] = {}  # prefix → recursion depth
-        self._lookahead = lookahead
         if routes:
             for route in routes:
                 self.insert(route)
@@ -136,10 +108,6 @@ class ScanTree:
 
     def __len__(self) -> int:
         return self.route_count
-
-    def skip_prefix(self, prefix: str) -> None:
-        """Mark a prefix to be skipped during walk. Single-threaded asyncio — no locks."""
-        self._skip.add(prefix)
 
     # ------------------------------------------------------------------
     # Baseline access
@@ -171,6 +139,30 @@ class ScanTree:
         if "GET" in self._root.baselines:
             return "/", self._root.baselines["GET"]
         return None
+
+    def ancestor_baselines(self, prefix: str, method: str) -> list[Baseline]:
+        """Collect all baselines in the ancestor chain for a given method.
+
+        Includes GET fallback at root — many servers return the same default
+        404 regardless of method, so a POST probe matching the root GET
+        baseline is still a known handler, not a new boundary.
+        """
+        baselines = []
+        parts = prefix.rstrip("/").split("/")
+        for i in range(len(parts), 0, -1):
+            candidate = "/".join(parts[:i]) or "/"
+            node = self._resolve(candidate)
+            if node and method in node.baselines:
+                baselines.append(node.baselines[method])
+        if method in self._root.baselines:
+            root_bl = self._root.baselines[method]
+            if root_bl not in baselines:
+                baselines.append(root_bl)
+        if "GET" in self._root.baselines:
+            get_bl = self._root.baselines["GET"]
+            if get_bl not in baselines:
+                baselines.append(get_bl)
+        return baselines
 
     # ------------------------------------------------------------------
     # Initialization (parallel)
@@ -205,27 +197,23 @@ class ScanTree:
                 self._root.baselines[method] = build_baseline(sigs)
 
     # ------------------------------------------------------------------
-    # Prefix probing (unified — called by _walk and by scanner workers)
+    # Prefix probing — pure probe + report, no scheduling
     # ------------------------------------------------------------------
 
     async def probe_prefix(
-        self, prefix: str, send_fn, tracker=None, depth: int | None = None,
+        self, prefix: str, send_fn, tracker=None,
     ) -> BoundaryGroup | None:
         """Probe a prefix for handler boundaries across all methods.
 
         Resolves or creates the tree node, probes each method against its
-        ancestor baseline, stores baselines for deviations, and optionally
-        injects recursive routes.  Idempotent — methods already probed at
-        this prefix are skipped.
+        ancestor baselines, stores baselines for deviations.  Idempotent —
+        methods already probed at this prefix are skipped.
 
-        Called by ``_walk`` (proactively for tree nodes with children) and
-        by scanner workers (reactively when a finding deviates from baseline).
+        Returns a :class:`BoundaryGroup` if any boundaries were found,
+        or ``None``.  Does NOT handle recursion or scheduling — the caller
+        decides what to do with the result.
         """
         node = self._resolve_or_create(prefix)
-
-        # Infer depth from parent if not provided
-        if depth is None:
-            depth = self._infer_depth(prefix)
 
         # Determine which methods need probing (skip already-probed)
         methods_to_probe = [m for m in _ALTERNATE_METHODS
@@ -233,7 +221,7 @@ class ScanTree:
                             and self.lookup_baseline(prefix, m) is not None
                             and (self.lookup_baseline(prefix, m) or (None,))[0] != prefix]
         if not methods_to_probe:
-            return None, []
+            return None
 
         if tracker:
             tracker.plan(len(methods_to_probe))
@@ -258,7 +246,7 @@ class ScanTree:
             # A response matching any ancestor is falling back to a known
             # handler (e.g. framework default 404), not a new boundary.
             probe_len = len(probe_path.lstrip("/"))
-            for bl in self._ancestor_baselines(prefix, method):
+            for bl in self.ancestor_baselines(prefix, method):
                 if matches_baseline(probe_sig, bl, probe_len) is not None:
                     return method, None, None
 
@@ -270,7 +258,7 @@ class ScanTree:
         # Collect methods that need a second variance probe
         discoveries = [(m, sig, bl) for m, sig, bl in results if sig is not None]
         if not discoveries:
-            return None, []
+            return None
 
         # Variance probes in parallel
         if tracker:
@@ -288,7 +276,6 @@ class ScanTree:
         variance_by_method = {m: sig for m, sig in variance_results}
 
         # Register baselines and collect boundary probes.
-        # Safe: only one caller probes a given prefix (idempotent skip above).
         probes = []
         for method, probe_sig, ancestor_baseline in discoveries:
             extra_sig = variance_by_method.get(method)
@@ -301,73 +288,7 @@ class ScanTree:
                 ancestor_signature=ancestor_baseline.signatures[0],
             ))
 
-        # Recursion: inject prefixed wordlist into tree.
-        # insert() adds to _insertion_order for tree structure / debug.
-        # Returns injected routes so the caller can enqueue them.
-        injected: list[Route] = []
-        if probes and self._recurse and depth < self._max_depth:
-            for route in self._wordlist:
-                new_path = f"{prefix}{route.template_path}"
-                key = (new_path, route.method)
-                if key not in self._seen:
-                    self._seen.add(key)
-                    new_route = Route(
-                        template_path=new_path,
-                        method=route.method,
-                        path_crumbs=route.path_crumbs,
-                        header_crumbs=route.header_crumbs,
-                        query_crumbs=route.query_crumbs,
-                        body_crumbs=route.body_crumbs,
-                        content_types=route.content_types,
-                        source_api_url=route.source_api_url,
-                    )
-                    self.insert(new_route)
-                    injected.append(new_route)
-                    if tracker:
-                        tracker.plan(1)
-            if injected:
-                if tracker and hasattr(tracker, 'plan_routes'):
-                    tracker.plan_routes(len(injected))
-                if self._on_recurse:
-                    self._on_recurse(prefix, len(injected), depth + 1)
-
-        group = BoundaryGroup(prefix=prefix, probes=tuple(probes)) if probes else None
-        return group, injected
-
-    def _ancestor_baselines(self, prefix: str, method: str) -> list[Baseline]:
-        """Collect all baselines in the ancestor chain for a given method.
-
-        Includes GET fallback at root — many servers return the same default
-        404 regardless of method, so a POST probe matching the root GET
-        baseline is still a known handler, not a new boundary.
-        """
-        baselines = []
-        parts = prefix.rstrip("/").split("/")
-        for i in range(len(parts), 0, -1):
-            candidate = "/".join(parts[:i]) or "/"
-            node = self._resolve(candidate)
-            if node and method in node.baselines:
-                baselines.append(node.baselines[method])
-        # Include root for this method
-        if method in self._root.baselines:
-            root_bl = self._root.baselines[method]
-            if root_bl not in baselines:
-                baselines.append(root_bl)
-        # Fall back to GET at root — default 404 often identical across methods
-        if "GET" in self._root.baselines:
-            get_bl = self._root.baselines["GET"]
-            if get_bl not in baselines:
-                baselines.append(get_bl)
-        return baselines
-
-    def _infer_depth(self, prefix: str) -> int:
-        """Infer recursion depth from nearest ancestor with a known depth."""
-        parts = prefix.rstrip("/").split("/")
-        for i in range(len(parts) - 1, 0, -1):
-            ancestor = "/".join(parts[:i]) or "/"
-            if ancestor in self._prefix_depth:
-                return self._prefix_depth[ancestor] + 1
-        return 0
+        return BoundaryGroup(prefix=prefix, probes=tuple(probes)) if probes else None
 
     # ------------------------------------------------------------------
     # Debug: ASCII tree representation

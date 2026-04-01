@@ -4,11 +4,11 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          SCAN TREE                                  │
+│                     PRIORITY QUEUE SCHEDULER                        │
 │                                                                     │
-│  Routes organised by path segments, depth-first iteration.          │
-│  Sibling branches walked concurrently (asyncio.gather).             │
-│  At each node: probe for baselines, push to queue, gather children. │
+│  Routes organised by path segments in a trie (data only).           │
+│  Work scheduled via asyncio.PriorityQueue, pulled by worker pool.   │
+│  Probes fire before routes (baseline invariant).                    │
 │                                                                     │
 │  ┌─────────────┐    ┌──────────────────┐    ┌────────────────────┐  │
 │  │ initialize()│───>│ Root baselines   │    │ Per-method probes  │  │
@@ -25,11 +25,11 @@
 │                                              no ──> skip            │
 │                                              yes ──> store baseline │
 │                                                       │             │
-│                          depth-first walk             │             │
+│                       priority queue                  │             │
 │                              │                        │             │
 │                    ┌─────────┴──────────┐             │             │
 │                    ▼                    ▼             ▼             │
-│             BoundaryProbe          Route          (next node)       │
+│             BoundaryGroup          Route        LookaheadProbe     │
 └─────────────┬──────────────────────┬────────────────────────────────┘
               │                      │
               ▼                      ▼
@@ -155,17 +155,18 @@ TIER 3 — Filtered before reaching pipeline
 ## Module Responsibilities
 
 ```
-scantree.py     Route ordering, baseline storage, prefix probing
-                Yields: Route | BoundaryProbe
-                Owns: tree structure, baselines, initialization probes
+scantree.py     Baseline storage, prefix probing
+                Data only — no walk, no scheduling
+                Owns: tree structure, baselines, _seen dedup
+                Methods: probe_prefix(), initialize(), lookup_baseline()
 
 inference.py    Response classification (stateless w.r.t. HTTP)
                 Reads: baselines from ScanTree
                 Produces: Finding | None
                 Methods: classify_boundary(), process()
 
-scanner.py      HTTP transport, concurrency, rate limiting
-                Consumes: Route | BoundaryProbe from tree walk
+scanner.py      Priority queue scheduler, HTTP transport, concurrency
+                Owns: work scheduling, probe ordering, lookahead dispatch
                 Produces: ScanResult via _finding_to_result()
-                Owns: httpx client, worker pool, send_fn
+                Owns: httpx client, worker pool, send_fn, PriorityQueue
 ```

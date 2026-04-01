@@ -321,8 +321,8 @@ class ProgressTracker:
                 recurse_str = f" {d}| +{added} recursive{r}"
 
         print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
-        line = (f"[{g}{route_bar}{r}{d}{route_pct:02.0f}%{r}] | "
-                f"{d}{self.routes_completed}/{self.route_total} routes{r} "
+        line = (f"[{g}{route_bar}{r}{d}{route_pct:02.0f}%{r}] "
+                f"|   {d}{self.routes_completed}/{self.route_total} routes{r} "
                 f"| {d}{reqs_sent}/{reqs_total} reqs{r} "
                 f"{d}({rps:.0f} req/s){r} "
                 f"| {c}{self.findings} found{r}"

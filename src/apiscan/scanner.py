@@ -1,30 +1,33 @@
-"""Async HTTP scanning engine.
+"""Async HTTP scanning engine with priority queue scheduling.
 
-Thin transport layer — sends requests, manages concurrency and rate limiting.
+Work is scheduled via a single ``asyncio.PriorityQueue``:
+
+- Priority 0: Original wordlist routes (direct hits)
+- Priority 1: Prefix probes (boundary detection)
+- Priority 2: Recursive routes under confirmed boundaries
+- Priority 3+i: Lookahead probes by segment popularity
+
 Baseline management is handled by :mod:`apiscan.scantree`.
 Response classification is handled by :mod:`apiscan.inference`.
-
-Work is scheduled via a priority queue:
-  Priority 0: Original wordlist routes
-  Priority 1: Prefix probes (boundary detection)
-  Priority 2: Recursive routes under confirmed boundaries
-  Priority 3+i: Lookahead probes by segment popularity
 """
 
 from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import time
-from typing import Callable
+from dataclasses import dataclass
+from typing import Any, Callable
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from apiscan.inference import (
     Finding,
     InferenceEngine,
     ResponseSignature,
-    _ALTERNATE_METHODS,
     _random_segment,
     compute_signature,
     matches_baseline,
@@ -32,6 +35,72 @@ from apiscan.inference import (
 from apiscan.kite import Route, render_body, render_headers, render_path, render_query
 from apiscan.output import ScanResult
 from apiscan.scantree import BoundaryGroup, ScanTree, _LOOKAHEAD_SEGMENTS
+
+
+# ---------------------------------------------------------------------------
+# Work items
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _ProbeWork:
+    """Probe a prefix for handler boundaries."""
+    prefix: str = ""
+    depth: int = 0
+
+
+@dataclass
+class _RouteWork:
+    """Scan a route against its baseline."""
+    route: Route = None
+
+
+@dataclass
+class _LookaheadWork:
+    """Lightweight GET probe for a single lookahead segment."""
+    prefix: str = ""
+    segment: str = ""
+
+
+# Transient errors that a worker should swallow (network, timeout, server).
+# Programming errors (TypeError, KeyError, AttributeError, etc.) propagate.
+_TRANSIENT_ERRORS = (httpx.HTTPError, OSError, TimeoutError)
+
+
+# ---------------------------------------------------------------------------
+# Work queue — wraps PriorityQueue with inflight tracking
+# ---------------------------------------------------------------------------
+
+class _WorkQueue:
+    """Single entry point for scheduling and completing work items.
+
+    Items are stored as ``(priority, order, item)`` tuples so that
+    ``heapq`` never compares the work-item dataclasses directly.
+    """
+
+    def __init__(self) -> None:
+        self._pq: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._order = itertools.count()
+        self._inflight = 0
+        self._done = asyncio.Event()
+        self._done.set()  # no work yet → "done"
+
+    def enqueue(self, priority: int, item: Any) -> None:
+        self._inflight += 1
+        self._done.clear()
+        self._pq.put_nowait((priority, next(self._order), item))
+
+    async def get(self) -> Any:
+        """Pull the next item. Raises ``CancelledError`` on shutdown."""
+        _, _, item = await self._pq.get()
+        return item
+
+    def item_done(self) -> None:
+        self._inflight -= 1
+        if self._inflight == 0:
+            self._done.set()
+
+    async def wait(self) -> None:
+        await self._done.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -54,17 +123,11 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# Request tracker — single object shared across tree, inference, and scanner
+# Request tracker
 # ---------------------------------------------------------------------------
 
 class RequestTracker:
-    """Tracks planned and completed HTTP requests.
-
-    Passed to the scan tree and inference engine so they can call
-    :meth:`plan` before sending batches.  The scanner calls :meth:`tick`
-    after each completed request.  The progress tracker reads
-    :attr:`sent` and :attr:`planned` directly.
-    """
+    """Tracks planned and completed HTTP requests."""
 
     def __init__(self, initial_planned: int = 0, on_tick: Callable[[], None] | None = None) -> None:
         self.sent = 0
@@ -73,15 +136,12 @@ class RequestTracker:
         self._on_tick = on_tick
 
     def plan(self, n: int) -> None:
-        """Register *n* additional requests that will be sent."""
         self.planned += n
 
     def plan_routes(self, n: int) -> None:
-        """Register *n* additional routes (for progress display)."""
         self.routes_planned += n
 
     def tick(self) -> None:
-        """Record one completed HTTP request."""
         self.sent += 1
         if self._on_tick:
             self._on_tick()
@@ -100,9 +160,8 @@ def _finding_to_result(
     request_body: str | None = None,
 ) -> ScanResult:
     path = finding.route.template_path
-    url = f"{base_url}{path}"
     return ScanResult(
-        url=url,
+        url=f"{base_url}{path}",
         method=finding.route.method,
         path=path,
         status_code=finding.signature.status_code,
@@ -116,52 +175,6 @@ def _finding_to_result(
         request_headers=request_headers,
         request_body=request_body,
     )
-
-
-# ---------------------------------------------------------------------------
-# Priority queue seeding — synchronous tree traversal, no HTTP
-# ---------------------------------------------------------------------------
-
-def _seed_queue(
-    tree: ScanTree,
-    pq: asyncio.PriorityQueue,
-    order: itertools.count,
-    pending_routes: dict[str, list[tuple[int, Route]]],
-    pending_children: dict[str, list[tuple[str, int]]],
-    tracker: RequestTracker,
-) -> None:
-    """Walk the tree synchronously and enqueue initial work items.
-
-    Only depth-1 prefix probes are enqueued immediately (their parent is
-    root, which is already probed).  Deeper probes are parked in
-    *pending_children* and released when their parent probe completes.
-    This preserves the baseline invariant: parent baselines exist before
-    child probes fire.
-
-    Routes are parked in *pending_routes* and released when their
-    prefix probe completes.  Root routes are enqueued immediately.
-    """
-    def _visit(node, prefix: str, parent_prefix: str) -> None:
-        if prefix:
-            # Park routes for this prefix
-            for route in node.routes:
-                pending_routes.setdefault(prefix, []).append((0, route))
-            # Only enqueue probe if parent is root (already probed).
-            # Deeper probes are parked until parent completes.
-            if parent_prefix == "":
-                pq.put_nowait((1, next(order), ("probe", prefix, 0)))
-            else:
-                pending_children.setdefault(parent_prefix, []).append((prefix, 0))
-        else:
-            # Root routes enqueued immediately
-            for route in node.routes:
-                pq.put_nowait((0, next(order), ("route", route)))
-        # Recurse into children
-        for seg in node._insertion_order:
-            child_prefix = f"{prefix}/{seg}" if prefix else f"/{seg}"
-            _visit(node.children[seg], child_prefix, prefix)
-
-    _visit(tree._root, "", "")
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +210,8 @@ async def scan(
     if tracker is None:
         tracker = RequestTracker()
 
-    tree = ScanTree(routes, recurse=recurse, max_depth=max_depth, wordlist=routes,
-                    on_recurse=on_recurse, lookahead=lookahead)
+    tree = ScanTree(routes)
 
-    # Initial planned: root init (10) + 1 per route
     tracker.plan(10 + len(tree))
     tracker.plan_routes(len(tree))
 
@@ -243,21 +254,20 @@ async def scan(
                 resp.status_code, dict(resp.headers), resp.content, path,
             )
 
-        # Initialize root baselines
         await tree.initialize(send_fn)
 
-        # -- Priority queue scheduler ------------------------------------
+        # -- Scheduler state ---------------------------------------------
 
-        pq: asyncio.PriorityQueue = asyncio.PriorityQueue()
-        order = itertools.count()
-        pending_routes: dict[str, list[tuple[int, Route]]] = {}
-        pending_children: dict[str, list[tuple[str, int]]] = {}  # parent → [(child_prefix, depth)]
+        wq = _WorkQueue()
+        pending_routes: dict[str, list[tuple[int, _RouteWork]]] = {}
+        pending_children: dict[str, list[_ProbeWork]] = {}
         probed_prefixes: set[str] = set()
-
-        # Connection failure tracking.
-        # Shared across concurrent workers — the race between await points
-        # is benign for a threshold heuristic (worst case: one extra request).
+        prefix_depth: dict[str, int] = {}
+        skip_prefixes: set[str] = set()
         conn_failures = 0
+        wordlist = routes
+
+        # -- Helpers ------------------------------------------------------
 
         def _emit(finding: Finding, **kw) -> None:
             result = _finding_to_result(finding, base_url, **kw)
@@ -265,7 +275,7 @@ async def scan(
             if on_result:
                 on_result(result)
 
-        def _handle_boundary_group(group: BoundaryGroup) -> None:
+        def _emit_boundary(group: BoundaryGroup) -> None:
             findings = []
             for probe in group.probes:
                 finding = engine.classify_boundary(probe)
@@ -273,70 +283,87 @@ async def scan(
                     findings.append(finding)
             if not findings:
                 return
-            method_statuses = []
-            for f in findings:
-                method_statuses.append(f"{f.route.method}={f.signature.status_code}")
-            collapsed_reason = f"boundary: {', '.join(method_statuses)}"
+            method_statuses = [f"{f.route.method}={f.signature.status_code}" for f in findings]
             primary = findings[0]
-            collapsed = Finding(
+            _emit(Finding(
                 route=Route(template_path=group.prefix, method="*"),
                 signature=primary.signature,
-                reason=collapsed_reason,
+                reason=f"boundary: {', '.join(method_statuses)}",
                 confidence=primary.confidence,
-            )
-            _emit(collapsed)
+            ))
+
+        def _is_skipped(prefix: str) -> bool:
+            return any(prefix.startswith(sp) for sp in skip_prefixes)
 
         def _release_routes(prefix: str) -> None:
-            """Enqueue routes that were waiting for this prefix's probe."""
             if prefix in pending_routes:
-                for priority, route in pending_routes.pop(prefix):
-                    pq.put_nowait((priority, next(order), ("route", route)))
+                for priority, item in pending_routes.pop(prefix):
+                    wq.enqueue(priority, item)
 
         def _release_children(prefix: str) -> None:
-            """Enqueue child probes that were waiting for this prefix."""
             if prefix in pending_children:
-                for child_prefix, child_depth in pending_children.pop(prefix):
-                    pq.put_nowait((1, next(order), ("probe", child_prefix, child_depth)))
+                for item in pending_children.pop(prefix):
+                    wq.enqueue(1, item)
 
-        async def _handle_probe(prefix: str, depth: int) -> None:
-            """Probe a prefix for handler boundaries, release waiting routes."""
-            if prefix in probed_prefixes:
-                _release_routes(prefix)
+        def _inject_recursive(prefix: str, depth: int) -> None:
+            if not recurse or depth >= max_depth:
                 return
-            probed_prefixes.add(prefix)
-            tree._prefix_depth[prefix] = depth
-
-            group, injected = await tree.probe_prefix(prefix, send_fn, tracker, depth)
-            if group:
-                _handle_boundary_group(group)
-                # Enqueue recursive routes at priority 2
-                for route in injected:
-                    pq.put_nowait((2, next(order), ("route", route)))
-                # Enqueue probes for recursive sub-prefixes
-                seen_sub: set[str] = set()
-                for route in injected:
-                    parts = route.template_path.rstrip("/").rsplit("/", 1)
+            injected = 0
+            seen_sub: set[str] = set()
+            for route in wordlist:
+                new_path = f"{prefix}{route.template_path}"
+                key = (new_path, route.method)
+                if key not in tree._seen:
+                    new_route = Route(
+                        template_path=new_path, method=route.method,
+                        path_crumbs=route.path_crumbs,
+                        header_crumbs=route.header_crumbs,
+                        query_crumbs=route.query_crumbs,
+                        body_crumbs=route.body_crumbs,
+                        content_types=route.content_types,
+                        source_api_url=route.source_api_url,
+                    )
+                    tree.insert(new_route)
+                    wq.enqueue(2, _RouteWork(route=new_route))
+                    tracker.plan(1)
+                    tracker.plan_routes(1)
+                    injected += 1
+                    # Enqueue probe for this route's parent prefix
+                    parts = new_path.rstrip("/").rsplit("/", 1)
                     sub_prefix = parts[0] if len(parts) > 1 and parts[0] else "/"
                     if sub_prefix != prefix and sub_prefix not in seen_sub and sub_prefix not in probed_prefixes:
                         seen_sub.add(sub_prefix)
-                        pq.put_nowait((1, next(order), ("probe", sub_prefix, depth + 1)))
-            elif lookahead and not tree._resolve(prefix).children:
-                # No boundary at this leaf — enqueue lookahead probes
+                        wq.enqueue(1, _ProbeWork(prefix=sub_prefix, depth=depth + 1))
+            if injected and on_recurse:
+                on_recurse(prefix, injected, depth + 1)
+
+        # -- Work handlers ------------------------------------------------
+
+        async def _handle_probe(work: _ProbeWork) -> None:
+            if work.prefix in probed_prefixes or _is_skipped(work.prefix):
+                _release_routes(work.prefix)
+                _release_children(work.prefix)
+                return
+            probed_prefixes.add(work.prefix)
+            prefix_depth[work.prefix] = work.depth
+
+            group = await tree.probe_prefix(work.prefix, send_fn, tracker)
+            if group:
+                _emit_boundary(group)
+                _inject_recursive(work.prefix, work.depth)
+            elif lookahead and not tree._resolve(work.prefix).children:
                 for i, seg in enumerate(_LOOKAHEAD_SEGMENTS):
-                    pq.put_nowait((3 + i, next(order), ("lookahead", prefix, seg, i)))
+                    wq.enqueue(3 + i, _LookaheadWork(prefix=work.prefix, segment=seg))
 
-            _release_routes(prefix)
-            _release_children(prefix)
+            _release_routes(work.prefix)
+            _release_children(work.prefix)
 
-        async def _handle_lookahead(prefix: str, segment: str, seg_index: int) -> None:
-            """Lightweight GET probe for a single lookahead segment."""
-            sub_prefix = f"{prefix}/{segment}"
-            # Skip if already probed
+        async def _handle_lookahead(work: _LookaheadWork) -> None:
+            sub_prefix = f"{work.prefix}/{work.segment}"
             sub_node = tree._resolve(sub_prefix)
             if sub_node and "GET" in sub_node.baselines:
                 return
-            # Check against all ancestor baselines
-            ancestor_baselines = tree._ancestor_baselines(prefix, "GET")
+            ancestor_baselines = tree.ancestor_baselines(work.prefix, "GET")
             if not ancestor_baselines:
                 return
             tracker.plan(1)
@@ -349,11 +376,18 @@ async def scan(
             for bl in ancestor_baselines:
                 if matches_baseline(sig, bl, path_len) is not None:
                     return
-            # Hit — enqueue full probe for this sub-prefix
-            pq.put_nowait((1, next(order), ("probe", sub_prefix, tree._infer_depth(sub_prefix))))
+            depth = 0
+            parts = sub_prefix.rstrip("/").split("/")
+            for i in range(len(parts) - 1, 0, -1):
+                ancestor = "/".join(parts[:i]) or "/"
+                if ancestor in prefix_depth:
+                    depth = prefix_depth[ancestor] + 1
+                    break
+            wq.enqueue(1, _ProbeWork(prefix=sub_prefix, depth=depth))
 
-        async def _handle_route(route: Route) -> None:
+        async def _handle_route(work: _RouteWork) -> None:
             nonlocal conn_failures
+            route = work.route
             if conn_failures >= quarantine_threshold:
                 if on_progress:
                     on_progress(0)
@@ -401,42 +435,27 @@ async def scan(
                     on_progress(0)
                 return
 
-            # This path deviates from baseline — probe it as a potential
-            # handler boundary. probe_prefix is idempotent (skips methods
-            # already probed at this prefix).
-            group, reactive_injected = await tree.probe_prefix(path, send_fn, tracker)
+            group = await tree.probe_prefix(path, send_fn, tracker)
             if group:
-                _handle_boundary_group(group)
-                for injected_route in reactive_injected:
-                    pq.put_nowait((2, next(order), ("route", injected_route)))
+                _emit_boundary(group)
+                _inject_recursive(path, prefix_depth.get(path, 0))
 
             redirect_location = str(resp.url) if resp.history else None
-
-            # If redirected within scope, add the target path to the tree
-            # for independent probing — the server revealed a real path.
             if resp.history:
                 final_url = str(resp.url)
                 if final_url.startswith(base_url):
                     redir_path = final_url[len(base_url):]
                     if redir_path and redir_path.startswith("/"):
-                        redir_key = (redir_path, route.method)
-                        if redir_key not in tree._seen:
-                            tree.insert(Route(
-                                template_path=redir_path, method=route.method,
-                            ))
+                        if (redir_path, route.method) not in tree._seen:
+                            tree.insert(Route(template_path=redir_path, method=route.method))
                             tracker.plan(1)
-                            pq.put_nowait((0, next(order), ("route", Route(
-                                template_path=redir_path, method=route.method,
-                            ))))
+                            wq.enqueue(0, _RouteWork(
+                                route=Route(template_path=redir_path, method=route.method)))
 
             all_findings = result if isinstance(result, list) else [result]
             for finding in all_findings:
-                _emit(
-                    finding,
-                    redirect_location=redirect_location,
-                    request_headers=headers,
-                    request_body=body_str,
-                )
+                _emit(finding, redirect_location=redirect_location,
+                      request_headers=headers, request_body=body_str)
 
             if on_progress:
                 on_progress(len(all_findings))
@@ -448,28 +467,34 @@ async def scan(
 
         async def _worker() -> None:
             while True:
-                _, _, item = await pq.get()
                 try:
-                    kind = item[0]
-                    if kind == "probe":
-                        _, prefix, depth = item
-                        await _handle_probe(prefix, depth)
-                    elif kind == "route":
-                        _, route = item
-                        await _handle_route(route)
-                    elif kind == "lookahead":
-                        _, prefix, segment, seg_index = item
-                        await _handle_lookahead(prefix, segment, seg_index)
-                finally:
-                    pq.task_done()
+                    item = await wq.get()
+                except asyncio.CancelledError:
+                    return
+                try:
+                    if isinstance(item, _ProbeWork):
+                        await _handle_probe(item)
+                    elif isinstance(item, _RouteWork):
+                        await _handle_route(item)
+                    elif isinstance(item, _LookaheadWork):
+                        await _handle_lookahead(item)
+                except asyncio.CancelledError:
+                    wq.item_done()
+                    raise
+                except _TRANSIENT_ERRORS:
+                    logger.debug("Transient error processing %s", type(item).__name__, exc_info=True)
+                except Exception:
+                    logger.exception("Bug in worker processing %s", type(item).__name__)
+                    raise
+                wq.item_done()
 
-        # Seed the priority queue from the tree structure
-        _seed_queue(tree, pq, order, pending_routes, pending_children, tracker)
+        # Seed the priority queue
+        _seed_queue(tree, wq, pending_routes, pending_children)
 
         workers = [asyncio.create_task(_worker()) for _ in range(concurrency)]
 
         try:
-            await pq.join()
+            await wq.wait()
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
@@ -478,3 +503,35 @@ async def scan(
             await asyncio.gather(*workers, return_exceptions=True)
 
     return results, tree
+
+
+# ---------------------------------------------------------------------------
+# Queue seeding
+# ---------------------------------------------------------------------------
+
+def _seed_queue(
+    tree: ScanTree,
+    wq: _WorkQueue,
+    pending_routes: dict[str, list[tuple[int, _RouteWork]]],
+    pending_children: dict[str, list[_ProbeWork]],
+) -> None:
+    """Traverse the tree and enqueue initial work items."""
+
+    def _visit(node, prefix: str, parent_prefix: str) -> None:
+        if prefix:
+            for route in node.routes:
+                pending_routes.setdefault(prefix, []).append(
+                    (0, _RouteWork(route=route)))
+            if parent_prefix == "":
+                wq.enqueue(1, _ProbeWork(prefix=prefix, depth=0))
+            else:
+                pending_children.setdefault(parent_prefix, []).append(
+                    _ProbeWork(prefix=prefix, depth=0))
+        else:
+            for route in node.routes:
+                wq.enqueue(0, _RouteWork(route=route))
+        for seg in node._insertion_order:
+            child_prefix = f"{prefix}/{seg}" if prefix else f"/{seg}"
+            _visit(node.children[seg], child_prefix, prefix)
+
+    _visit(tree._root, "", "")
