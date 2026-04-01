@@ -183,3 +183,99 @@ class TestScanIntegration:
         # Exactly one on_progress call per route (3 routes = 3 calls)
         # Boundary probes should NOT increment progress
         assert len(progress_calls) == len(routes)
+
+
+class TestRecursionIntegration:
+    @pytest.mark.asyncio
+    async def test_recursion_discovers_sub_handler(self, test_server_url):
+        """Recursion should discover /deep/secret when wordlist has /secret
+        and /deep is found as a boundary."""
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/secret/thing", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=2,
+        )
+        paths = {r.path for r in results}
+        # /deep boundary should be discovered (403 json vs root 404 html)
+        boundary_results = [r for r in results if "boundary:" in r.reason]
+        assert any("/deep" in r.path for r in boundary_results)
+        # Recursion at /deep injects /deep/secret/thing. The /deep/secret
+        # prefix is itself a boundary (401 vs /deep's 403), discovered via
+        # tree walk probing. /deep/secret should appear as a finding.
+        assert "/deep/secret" in paths or any("/deep/secret" in r.path for r in results)
+
+    @pytest.mark.asyncio
+    async def test_flat_wordlist_boundary_discovery(self, test_server_url):
+        """A flat wordlist with no nested paths should still discover boundaries
+        via worker-initiated probe_prefix."""
+        routes = [
+            Route(template_path="/deep", method="GET"),
+            Route(template_path="/nonexistent", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=1,
+        )
+        # /deep should be a finding (403 json vs root 404 html)
+        paths = {r.path for r in results}
+        assert "/deep" in paths or any("/deep" in r.path for r in results)
+        # Worker should have probed /deep as a prefix and registered a baseline
+        bl = tree.lookup_baseline("/deep/anything", "GET")
+        assert bl is not None
+        assert bl[0] == "/deep"
+
+    @pytest.mark.asyncio
+    async def test_recursion_respects_max_depth(self, test_server_url):
+        """max_depth=1 should prevent second-level recursion."""
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/secret", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=1,
+        )
+        paths = {r.path for r in results}
+        # Depth 0: /deep is a boundary → recursion adds /deep/secret
+        # Depth 1: /deep/secret could be a boundary → but max_depth=1 blocks
+        # /deep/secret/secret should NOT exist
+        assert "/deep/secret/secret" not in paths
+
+    @pytest.mark.asyncio
+    async def test_no_recursion_without_flag(self, test_server_url):
+        """Without recurse=True, no recursive routes should be discovered."""
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/secret", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=False,
+        )
+        paths = {r.path for r in results}
+        # /deep/secret should NOT appear — no recursion
+        assert "/deep/secret" not in paths
+
+    @pytest.mark.asyncio
+    async def test_recursion_progress_tracking(self, test_server_url):
+        """Recursive route injection should increase the tracker's planned count."""
+        from apiscan.scanner import RequestTracker
+        tracker = RequestTracker()
+
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/secret", method="GET"),
+        ]
+        initial_plan = 0
+
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=1,
+            tracker=tracker,
+        )
+        # Planned count should exceed initial routes + init probes
+        # because recursion added more routes
+        assert tracker.planned > 10 + len(routes)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import Callable
 
 from apiscan.inference import (
     Baseline,
@@ -27,6 +28,26 @@ from apiscan.inference import (
     matches_baseline,
 )
 from apiscan.kite import Route
+
+# Top 100 non-leaf path segments from routes-large.kite, by frequency.
+# Used by --lookahead to discover N+1 boundaries that require combining
+# multiple path segments (e.g. /users/v1 from flat wordlists).
+_LOOKAHEAD_SEGMENTS = [
+    "api", "v1", "user", "v2", "admin", "users", "app", "rest", "order",
+    "auth", "services", "account", "wx", "customer", "product", "sys", "v3",
+    "web", "report", "search", "project", "v1.0", "member", "accounts",
+    "device", "projects", "test", "common", "public", "system", "company",
+    "orders", "mobile", "client", "delete", "reports", "a", "organizations",
+    "payment", "update", "manage", "service", "list", "dashboard", "data",
+    "profile", "login", "store", "events", "1.0", "file", "cms", "products",
+    "get", "wechat", "role", "me", "config", "activity", "pay", "customers",
+    "group", "1", "open", "course", "message", "category", "devices", "task",
+    "goods", "info", "companies", "event", "User", "apis", "1.0.0", "shop",
+    "groups", "countries", "content", "_search", "city", "manager", "status",
+    "home", "merchant", "organization", "upload", "state", "tasks", "article",
+    "v4", "business", "video", "game", "base", "sms", "address", "Account",
+    "page",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -86,9 +107,26 @@ class ScanTree:
     Yields :class:`Route` and :class:`BoundaryProbe` objects during walk.
     """
 
-    def __init__(self, routes: list[Route] | None = None) -> None:
+    def __init__(
+        self,
+        routes: list[Route] | None = None,
+        *,
+        recurse: bool = False,
+        max_depth: int = 2,
+        wordlist: list[Route] | None = None,
+        on_recurse: Callable[[str, int, int], None] | None = None,
+        lookahead: bool = False,
+    ) -> None:
         self._root = _Node(segment="")
         self.route_count = 0
+        self._recurse = recurse
+        self._max_depth = max_depth
+        self._wordlist = wordlist or []
+        self._seen: set[tuple[str, str]] = set()
+        self._skip: set[str] = set()
+        self._on_recurse = on_recurse  # (prefix, new_routes, depth)
+        self._prefix_depth: dict[str, int] = {}  # prefix → recursion depth
+        self._lookahead = lookahead
         if routes:
             for route in routes:
                 self.insert(route)
@@ -103,9 +141,14 @@ class ScanTree:
             node = node.get_or_create(seg)
         node.routes.append(route)
         self.route_count += 1
+        self._seen.add((route.template_path, route.method))
 
     def __len__(self) -> int:
         return self.route_count
+
+    def skip_prefix(self, prefix: str) -> None:
+        """Mark a prefix to be skipped during walk. Single-threaded asyncio — no locks."""
+        self._skip.add(prefix)
 
     # ------------------------------------------------------------------
     # Baseline access
@@ -180,45 +223,93 @@ class ScanTree:
         Pushes :class:`Route` and :class:`BoundaryProbe` items directly
         into *queue*.  Sibling branches are walked concurrently via
         ``asyncio.gather``; the bounded queue provides backpressure.
+        When recursion is enabled, boundary discoveries trigger insertion
+        of the wordlist under the boundary prefix before children are gathered.
         """
-        await self._walk(self._root, "", send_fn, queue, tracker)
+        await self._walk(self._root, "", send_fn, queue, tracker, depth=0)
 
     async def _walk(
-        self, node: _Node, prefix: str, send_fn, queue: asyncio.Queue, tracker=None,
+        self, node: _Node, prefix: str, send_fn, queue: asyncio.Queue,
+        tracker=None, depth: int = 0,
     ) -> None:
-        # Probe this node for handler boundaries (if it has children).
+        # Skip check
+        if self._skip and any(prefix.startswith(sp) for sp in self._skip):
+            return
+
+        # Record depth for this prefix (used by worker-initiated probe_prefix)
+        if prefix:
+            self._prefix_depth[prefix] = depth
+
+        # Probe this node as a potential handler boundary.
         # Must complete before gathering children — children call
         # lookup_baseline() which reads baselines written here.
-        if node.children and prefix:
-            probes = [bp async for bp in self._probe_node(node, prefix, send_fn, tracker)]
-            if probes:
-                await queue.put(BoundaryGroup(prefix=prefix, probes=tuple(probes)))
+        has_boundary = False
+        if prefix:
+            group = await self.probe_prefix(prefix, send_fn, tracker, depth)
+            if group:
+                has_boundary = True
+                await queue.put(group)
+            elif self._lookahead:
+                # No boundary at this prefix — try common segments one level
+                # deeper to discover hidden N+1 boundaries.
+                lookahead_groups = await self._lookahead_prefix(
+                    prefix, send_fn, tracker, depth,
+                )
+                for lg in lookahead_groups:
+                    has_boundary = True
+                    await queue.put(lg)
 
         # Push this node's routes
         for route in node.routes:
             await queue.put(route)
 
-        # Walk children concurrently — sibling branches are independent
+        # Walk children concurrently — sibling branches are independent.
+        # list() snapshots _insertion_order AFTER recursive insertion
+        # (which happens inside probe_prefix above).
         if node._insertion_order:
+            child_depth = depth + 1 if has_boundary else depth
             await asyncio.gather(*[
                 self._walk(
                     node.children[seg],
                     f"{prefix}/{seg}" if prefix else f"/{seg}",
                     send_fn, queue, tracker,
+                    depth=child_depth,
                 )
-                for seg in node._insertion_order
+                for seg in list(node._insertion_order)
             ])
 
-    async def _probe_node(
-        self, node: _Node, prefix: str, send_fn, tracker=None,
-    ) -> AsyncIterator[BoundaryProbe]:
-        """Probe a node in parallel for all methods, yield boundary discoveries."""
-        # Count methods that actually need probing
+    # ------------------------------------------------------------------
+    # Prefix probing (unified — called by _walk and by scanner workers)
+    # ------------------------------------------------------------------
+
+    async def probe_prefix(
+        self, prefix: str, send_fn, tracker=None, depth: int | None = None,
+    ) -> BoundaryGroup | None:
+        """Probe a prefix for handler boundaries across all methods.
+
+        Resolves or creates the tree node, probes each method against its
+        ancestor baseline, stores baselines for deviations, and optionally
+        injects recursive routes.  Idempotent — methods already probed at
+        this prefix are skipped.
+
+        Called by ``_walk`` (proactively for tree nodes with children) and
+        by scanner workers (reactively when a finding deviates from baseline).
+        """
+        node = self._resolve_or_create(prefix)
+
+        # Infer depth from parent if not provided
+        if depth is None:
+            depth = self._infer_depth(prefix)
+
+        # Determine which methods need probing (skip already-probed)
         methods_to_probe = [m for m in _ALTERNATE_METHODS
                             if m not in node.baselines
                             and self.lookup_baseline(prefix, m) is not None
                             and (self.lookup_baseline(prefix, m) or (None,))[0] != prefix]
-        if methods_to_probe and tracker:
+        if not methods_to_probe:
+            return None
+
+        if tracker:
             tracker.plan(len(methods_to_probe))
 
         async def _probe_method(method: str) -> tuple[str, ResponseSignature | None, Baseline | None]:
@@ -249,13 +340,12 @@ class ScanTree:
         # Collect methods that need a second variance probe
         discoveries = [(m, sig, bl) for m, sig, bl in results if sig is not None]
         if not discoveries:
-            return
+            return None
 
-        # Add variance probes to the total
+        # Variance probes in parallel
         if tracker:
             tracker.plan(len(discoveries))
 
-        # Fire all variance probes in parallel
         async def _variance_probe(method: str) -> tuple[str, ResponseSignature | None]:
             extra_path = f"{prefix.rstrip('/')}/{_random_segment()}"
             try:
@@ -267,19 +357,100 @@ class ScanTree:
         variance_results = await asyncio.gather(*[_variance_probe(m) for m, _, _ in discoveries])
         variance_by_method = {m: sig for m, sig in variance_results}
 
-        # Register baselines and yield boundary probes.
-        # Safe: only this node's walk task writes to node.baselines,
-        # and this completes before child tasks are spawned by _walk().
+        # Register baselines and collect boundary probes.
+        # Safe: only one caller probes a given prefix (idempotent skip above).
+        probes = []
         for method, probe_sig, ancestor_baseline in discoveries:
             extra_sig = variance_by_method.get(method)
             sigs = [probe_sig, extra_sig] if extra_sig else [probe_sig]
             node.baselines[method] = build_baseline(sigs)
-            yield BoundaryProbe(
+            probes.append(BoundaryProbe(
                 prefix=prefix,
                 method=method,
                 signature=probe_sig,
                 ancestor_signature=ancestor_baseline.signatures[0],
-            )
+            ))
+
+        # Recursion: inject prefixed wordlist into tree.
+        # insert() adds to _insertion_order, so any subsequent gather
+        # on this node's children will pick up the new nodes.
+        if probes and self._recurse and depth < self._max_depth:
+            added = 0
+            for route in self._wordlist:
+                new_path = f"{prefix}{route.template_path}"
+                key = (new_path, route.method)
+                if key not in self._seen:
+                    self._seen.add(key)
+                    self.insert(Route(
+                        template_path=new_path,
+                        method=route.method,
+                        path_crumbs=route.path_crumbs,
+                        header_crumbs=route.header_crumbs,
+                        query_crumbs=route.query_crumbs,
+                        body_crumbs=route.body_crumbs,
+                        content_types=route.content_types,
+                        source_api_url=route.source_api_url,
+                    ))
+                    added += 1
+                    if tracker:
+                        tracker.plan(1)
+            if added and self._on_recurse:
+                self._on_recurse(prefix, added, depth + 1)
+
+        return BoundaryGroup(prefix=prefix, probes=tuple(probes))
+
+    async def _lookahead_prefix(
+        self, prefix: str, send_fn, tracker=None, depth: int = 0,
+    ) -> list[BoundaryGroup]:
+        """Try common segments one level deeper to find hidden boundaries.
+
+        For each segment in ``_LOOKAHEAD_SEGMENTS``, sends a single GET
+        probe to ``{prefix}/{segment}/{random}``.  If the response differs
+        from the ancestor baseline, the sub-prefix is a hidden boundary —
+        ``probe_prefix`` is called on it for full multi-method probing.
+        """
+        ancestor_result = self.lookup_baseline(prefix, "GET")
+        if ancestor_result is None:
+            return []
+        _, ancestor_baseline = ancestor_result
+
+        if tracker:
+            tracker.plan(len(_LOOKAHEAD_SEGMENTS))
+
+        async def _probe_segment(seg: str) -> str | None:
+            sub_prefix = f"{prefix}/{seg}"
+            # Skip if already probed
+            sub_node = self._resolve(sub_prefix)
+            if sub_node and "GET" in sub_node.baselines:
+                return None
+            probe_path = f"{sub_prefix}/{_random_segment()}"
+            try:
+                sig = await send_fn("GET", probe_path, None, None)
+            except Exception:
+                return None
+            if matches_baseline(sig, ancestor_baseline, len(probe_path.lstrip("/"))) is not None:
+                return None
+            return sub_prefix
+
+        results = await asyncio.gather(*[_probe_segment(s) for s in _LOOKAHEAD_SEGMENTS])
+        hits = [r for r in results if r is not None]
+
+        # Full probe each hit (multi-method, variance, recursion)
+        groups = []
+        for sub_prefix in hits:
+            group = await self.probe_prefix(sub_prefix, send_fn, tracker, depth)
+            if group:
+                groups.append(group)
+        return groups
+
+    def _infer_depth(self, prefix: str) -> int:
+        """Infer recursion depth from nearest ancestor with a known depth."""
+        parts = prefix.rstrip("/").split("/")
+        for i in range(len(parts) - 1, 0, -1):
+            ancestor = "/".join(parts[:i]) or "/"
+            if ancestor in self._prefix_depth:
+                return self._prefix_depth[ancestor] + 1
+        return 0
 
     # ------------------------------------------------------------------
     # Debug: ASCII tree representation
@@ -332,6 +503,16 @@ class ScanTree:
             if seg not in node.children:
                 return None
             node = node.children[seg]
+        return node
+
+    def _resolve_or_create(self, prefix: str) -> _Node:
+        """Like _resolve but creates nodes along the path if missing."""
+        if prefix == "/" or prefix == "":
+            return self._root
+        segments = _split(prefix)
+        node = self._root
+        for seg in segments:
+            node = node.get_or_create(seg)
         return node
 
 

@@ -56,6 +56,8 @@ By default, apiscan runs in **safe mode**: GET requests only, with dangerous pat
 | `--unsafe-all` | off | All HTTP methods, no keyword filter |
 | `--unsafe-methods` | off | All HTTP methods (keep keyword filter) |
 | `--unsafe-keywords` | off | No keyword filter (keep GET-only) |
+| `--recurse` | off | Re-apply wordlist under discovered handler boundaries |
+| `--max-depth` | 2 | Max recursion depth |
 | `--concurrency` | 10 | Max concurrent requests |
 | `--rate` | unlimited | Requests per second cap |
 | `--timeout` | 10s | Per-request timeout |

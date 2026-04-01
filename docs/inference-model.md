@@ -29,16 +29,19 @@ Root baselines established by probing `/{random}` × 2 for each HTTP method
 (GET, POST, PUT, DELETE, PATCH) — 10 parallel requests. Captures the
 default handler response per verb.
 
-### 2. Tree Walk (depth-first, concurrent siblings)
+### 2. Tree Walk (depth-first, concurrent siblings, recursive)
 
 Routes are organised into a tree by path segments. At each node:
 
 1. **Probe for handler boundaries** — send `/{prefix}/{random}` for each
    method. If the response differs from the ancestor baseline, register a
-   new baseline and push a `BoundaryProbe` event to the work queue.
-2. **Push routes** to the work queue.
-3. **Walk children concurrently** via `asyncio.gather` — sibling branches
-   are independent and explored in parallel.
+   new baseline and push a `BoundaryGroup` event to the work queue.
+2. **Recurse** (if `--recurse` enabled) — when a boundary is found, re-apply
+   the entire wordlist under this prefix (e.g. boundary at `/api` inserts
+   `/api/users`, `/api/health`, etc.). Controlled by `--max-depth`.
+3. **Push routes** to the work queue.
+4. **Walk children concurrently** via `asyncio.gather` — sibling branches
+   are independent and explored in parallel, including recursively-added ones.
 
 Parent probing completes before children start, ensuring baselines are
 established before children are scanned.

@@ -4,6 +4,8 @@ The test server simulates a multi-service gateway:
 - Gateway default: 404 text/html
 - /api/v1/*: JSON service with method-aware routing
 - /api/v2/*: Different JSON service with soft-404 wildcard
+- /deep/*: Handler boundary (403 json) with nested sub-handler
+- /deep/secret/*: Sub-handler boundary (401 json) for recursion testing
 - /admin/*: Auth-required service with custom headers
 - /internal/metrics: Standalone plaintext service
 """
@@ -93,6 +95,29 @@ async def _app(scope: dict, receive: Any, send: Any) -> None:
         await send({"type": "http.response.start", "status": 200,
                      "headers": [[b"content-type", b"text/plain"]]})
         await send({"type": "http.response.body", "body": body})
+        return
+
+    # /deep/secret and /deep/secret/* — nested sub-handler (401 json, distinct from /deep's 403)
+    if path == "/deep/secret" or path.startswith("/deep/secret/"):
+        body = json.dumps({"error": "unauthorized", "area": "secret"}).encode()
+        await send({"type": "http.response.start", "status": 401,
+                     "headers": [[b"content-type", b"application/json"]]})
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    # /deep and /deep/* — handler boundary (403 json, distinct from root 404 html)
+    if path == "/deep" or path.startswith("/deep/"):
+        body = json.dumps({"error": "forbidden", "area": "deep"}).encode()
+        await send({"type": "http.response.start", "status": 403,
+                     "headers": [[b"content-type", b"application/json"]]})
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    # /redir-internal -> /deep/secret/panel (in-scope redirect to a handler)
+    if path == "/redir-internal" and method == "GET":
+        await send({"type": "http.response.start", "status": 302,
+                     "headers": [[b"location", b"/deep/secret/panel"]]})
+        await send({"type": "http.response.body", "body": b""})
         return
 
     # /admin/* — auth-required service with custom headers

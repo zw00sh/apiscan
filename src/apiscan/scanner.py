@@ -123,7 +123,11 @@ async def scan(
     on_result: Callable[[ScanResult], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
     on_filtered: Callable[[str, str, int, str], None] | None = None,
+    on_recurse: Callable[[str, int, int], None] | None = None,
     tracker: RequestTracker | None = None,
+    recurse: bool = False,
+    max_depth: int = 2,
+    lookahead: bool = False,
 ) -> tuple[list[ScanResult], ScanTree]:
     """Scan *target_url* with the given routes. Returns (findings, tree)."""
     base_url = target_url.rstrip("/")
@@ -132,7 +136,8 @@ async def scan(
     if tracker is None:
         tracker = RequestTracker()
 
-    tree = ScanTree(routes)
+    tree = ScanTree(routes, recurse=recurse, max_depth=max_depth, wordlist=routes,
+                    on_recurse=on_recurse, lookahead=lookahead)
 
     # Initial planned: root init (10) + 1 per route
     tracker.plan(10 + len(tree))
@@ -262,7 +267,32 @@ async def scan(
                     on_progress(0)
                 return
 
+            # This path deviates from baseline — probe it as a potential
+            # handler boundary. probe_prefix is idempotent (skips methods
+            # already probed at this prefix).
+            group = await tree.probe_prefix(path, send_fn, tracker)
+            if group:
+                _handle_boundary_group(group)
+
             redirect_location = str(resp.url) if resp.history else None
+
+            # If redirected within scope, add the target path to the tree
+            # for independent probing — the server revealed a real path.
+            if resp.history:
+                final_url = str(resp.url)
+                if final_url.startswith(base_url):
+                    redir_path = final_url[len(base_url):]
+                    if redir_path and redir_path.startswith("/"):
+                        redir_key = (redir_path, route.method)
+                        if redir_key not in tree._seen:
+                            tree.insert(Route(
+                                template_path=redir_path, method=route.method,
+                            ))
+                            tracker.plan(1)
+                            await queue.put(Route(
+                                template_path=redir_path, method=route.method,
+                            ))
+
             all_findings = result if isinstance(result, list) else [result]
             for finding in all_findings:
                 _emit(

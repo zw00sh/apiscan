@@ -21,6 +21,7 @@ from apiscan.output import (
     CYAN,
     DIM,
     GREEN,
+    MAGENTA,
     RESET,
     CSVWriter,
     ProgressTracker,
@@ -236,6 +237,14 @@ def _build_parser() -> argparse.ArgumentParser:
     safety = sc.add_argument_group("safety")
     safety.add_argument("--unsafe-keywords", action="store_true",
                         help="Disable keyword filtering for dangerous paths")
+
+    recursion = sc.add_argument_group("recursion")
+    recursion.add_argument("--recurse", action="store_true",
+                           help="Re-apply wordlist under discovered handler boundaries")
+    recursion.add_argument("--max-depth", type=int, default=2,
+                           help="Max recursion depth (default: 2)")
+    recursion.add_argument("--lookahead", action="store_true",
+                           help="Probe common path segments one level deeper to find hidden boundaries")
 
     http = sc.add_argument_group("http")
     http.add_argument("--concurrency", type=int, default=10,
@@ -461,6 +470,15 @@ async def _scan(args: argparse.Namespace) -> None:
             print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
         print(f"{d2}  filtered {method:<7} {status:>3} {path} -- {reason}{r2}", file=sys.stderr)
 
+    def on_recurse(prefix: str, new_routes: int, depth: int) -> None:
+        m = MAGENTA if use_color else ""
+        r2 = RESET if use_color else ""
+        d2 = DIM if use_color else ""
+        b2 = BOLD if use_color else ""
+        if progress:
+            print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
+        print(f"{m}  recurse{r2} {b2}{prefix}/*{r2} {d2}+{new_routes} routes (depth {depth}){r2}", file=sys.stderr)
+
     start = time.monotonic()
     warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
@@ -478,7 +496,11 @@ async def _scan(args: argparse.Namespace) -> None:
         on_result=on_result,
         on_progress=on_progress,
         on_filtered=on_filtered,
+        on_recurse=on_recurse if args.recurse else None,
         tracker=req_tracker,
+        recurse=args.recurse,
+        max_depth=args.max_depth,
+        lookahead=args.lookahead,
     )
 
     elapsed = time.monotonic() - start

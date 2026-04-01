@@ -240,7 +240,7 @@ class TestPrefixProbing:
 
     @pytest.mark.asyncio
     async def test_boundary_probes_before_routes(self):
-        """BoundaryProbe events should come before routes at the same node."""
+        """BoundaryGroup events should come before routes at the same node."""
         tree = ScanTree([_route("/api/v1/users")])
         tree._root.baselines["GET"] = build_baseline([
             _sig(status_code=404, content_type="text/html"),
@@ -257,3 +257,369 @@ class TestPrefixProbing:
         first_bg = next((i, idx) for idx, i in enumerate(items) if isinstance(i, BoundaryGroup))
         first_route = next((i, idx) for idx, i in enumerate(items) if isinstance(i, Route))
         assert first_bg[1] < first_route[1]
+
+
+# ---------------------------------------------------------------------------
+# Recursion
+# ---------------------------------------------------------------------------
+
+class TestRecursion:
+    @pytest.mark.asyncio
+    async def test_boundary_triggers_recursive_insertion(self):
+        """When recursion is enabled and a boundary is found, the wordlist
+        should be re-applied under the boundary prefix."""
+        wordlist = [_route("/users"), _route("/health")]
+        tree = ScanTree(wordlist, recurse=True, max_depth=2, wordlist=wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            # /api responds differently → boundary
+            if path.startswith("/api/") and not path.startswith("/api/users") and not path.startswith("/api/health"):
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        # Insert a route under /api to trigger probing
+        tree.insert(_route("/api/endpoint"))
+
+        items = await _collect_walk(tree, mock_send)
+        paths = [r.template_path for r in items if isinstance(r, Route)]
+
+        # Should have original routes plus recursive routes under /api
+        assert "/api/endpoint" in paths
+        assert "/api/users" in paths
+        assert "/api/health" in paths
+
+    @pytest.mark.asyncio
+    async def test_max_depth_limits_recursion(self):
+        """Recursion should stop at max_depth."""
+        wordlist = [_route("/sub")]
+        tree = ScanTree(wordlist, recurse=True, max_depth=1, wordlist=wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        boundaries_seen: list[str] = []
+
+        async def mock_send(method, path, headers=None, body=None):
+            # Every prefix is a boundary (returns json instead of html)
+            for seg in path.split("/"):
+                if seg and len(seg) == 8:  # skip random probe segments
+                    return _sig(status_code=200, content_type="application/json",
+                               content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        # /a/sub — /a is probed, becomes boundary, recurses to /a/sub
+        tree.insert(_route("/a/sub"))
+        items = await _collect_walk(tree, mock_send)
+        paths = [r.template_path for r in items if isinstance(r, Route)]
+
+        # /a/sub exists in original, /a/sub/sub would be depth-1 recursion
+        assert "/a/sub" in paths
+        # depth-1 recursion from /a: adds /a/sub (already exists, deduped)
+        # depth-2 recursion from /a/sub would add /a/sub/sub — should NOT exist
+        assert "/a/sub/sub" not in paths
+
+    @pytest.mark.asyncio
+    async def test_no_recursion_by_default(self):
+        """Without recurse=True, no recursive routes should be added."""
+        wordlist = [_route("/users")]
+        tree = ScanTree(wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            if path.startswith("/api/"):
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        tree.insert(_route("/api/endpoint"))
+        items = await _collect_walk(tree, mock_send)
+        paths = [r.template_path for r in items if isinstance(r, Route)]
+
+        assert "/api/endpoint" in paths
+        assert "/users" in paths
+        # /api/users should NOT exist — no recursion
+        assert "/api/users" not in paths
+
+    @pytest.mark.asyncio
+    async def test_dedup_prevents_duplicate_routes(self):
+        """Recursive insertion should not create routes that already exist."""
+        wordlist = [_route("/users"), _route("/health")]
+        tree = ScanTree(wordlist, recurse=True, max_depth=2, wordlist=wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            if path.startswith("/api/") and len(path.split("/")) <= 3:
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        # Manually insert /api/users — it should not be duplicated by recursion from /api
+        tree.insert(_route("/api/users"))
+        tree.insert(_route("/api/endpoint"))
+
+        items = await _collect_walk(tree, mock_send)
+        paths = [r.template_path for r in items if isinstance(r, Route)]
+
+        # /api/users should appear exactly once
+        assert paths.count("/api/users") == 1
+
+    @pytest.mark.asyncio
+    async def test_skip_prefix(self):
+        """Skipped prefixes should not be walked."""
+        wordlist = [_route("/users")]
+        tree = ScanTree(wordlist, recurse=True, max_depth=2, wordlist=wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            if path.startswith("/api/"):
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        tree.insert(_route("/api/endpoint"))
+        tree.insert(_route("/skip/endpoint"))
+        tree.skip_prefix("/skip")
+
+        items = await _collect_walk(tree, mock_send)
+        paths = [r.template_path for r in items if isinstance(r, Route)]
+
+        assert "/api/endpoint" in paths
+        assert "/skip/endpoint" not in paths
+
+    @pytest.mark.asyncio
+    async def test_probe_prefix_standalone(self):
+        """probe_prefix can be called directly (as workers do) to discover
+        boundaries at paths that have no children in the tree."""
+        tree = ScanTree()
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            if path.startswith("/api/"):
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        # /api has no children in the tree — would never be probed by _walk
+        group = await tree.probe_prefix("/api", mock_send)
+        assert group is not None
+        assert group.prefix == "/api"
+        assert len(group.probes) >= 1
+
+        # Baseline should be registered
+        result = tree.lookup_baseline("/api/anything", "GET")
+        assert result is not None
+        assert result[0] == "/api"
+
+    @pytest.mark.asyncio
+    async def test_probe_prefix_idempotent(self):
+        """Calling probe_prefix twice on the same prefix should not re-probe."""
+        tree = ScanTree()
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+        probe_count = 0
+
+        async def mock_send(method, path, headers=None, body=None):
+            nonlocal probe_count
+            probe_count += 1
+            if path.startswith("/api/"):
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        group1 = await tree.probe_prefix("/api", mock_send)
+        assert group1 is not None
+        probes_after_first = probe_count
+
+        group2 = await tree.probe_prefix("/api", mock_send)
+        assert group2 is None  # already probed — nothing new
+        assert probe_count == probes_after_first  # no new HTTP requests
+
+    def test_infer_depth(self):
+        """_infer_depth should return parent depth + 1, or 0 if no parent known."""
+        tree = ScanTree()
+        tree._prefix_depth["/api"] = 0
+        tree._prefix_depth["/api/v1"] = 1
+
+        assert tree._infer_depth("/api/v1/users") == 2
+        assert tree._infer_depth("/api/health") == 1
+        assert tree._infer_depth("/unknown/path") == 0
+
+    @pytest.mark.asyncio
+    async def test_probe_prefix_with_recursion(self):
+        """probe_prefix with recurse=True should inject wordlist routes."""
+        wordlist = [_route("/users"), _route("/health")]
+        tree = ScanTree(recurse=True, max_depth=2, wordlist=wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            if path.startswith("/api/"):
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        group = await tree.probe_prefix("/api", mock_send, depth=0)
+        assert group is not None
+
+        # Recursive routes should be inserted into the tree
+        node = tree._resolve("/api/users")
+        assert node is not None
+        assert len(node.routes) == 1
+        assert node.routes[0].template_path == "/api/users"
+
+        node2 = tree._resolve("/api/health")
+        assert node2 is not None
+
+    @pytest.mark.asyncio
+    async def test_recursive_routes_are_walkable(self):
+        """Routes injected by probe_prefix should appear in walk output."""
+        wordlist = [_route("/users"), _route("/health")]
+        tree = ScanTree([_route("/api/endpoint")], recurse=True, max_depth=2, wordlist=wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            if path.startswith("/api/") and "/endpoint" not in path:
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        items = await _collect_walk(tree, mock_send)
+        paths = [r.template_path for r in items if isinstance(r, Route)]
+
+        # Original route present
+        assert "/api/endpoint" in paths
+        # Recursive routes walked and present in output
+        assert "/api/users" in paths
+        assert "/api/health" in paths
+
+    @pytest.mark.asyncio
+    async def test_max_depth_strict(self):
+        """Recursion should respect max_depth with distinct per-level responses."""
+        wordlist = [_route("/child")]
+        tree = ScanTree([_route("/a/original")], recurse=True, max_depth=1, wordlist=wordlist)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        # /a/* returns 403 json (boundary), /a/child/* returns 401 json (sub-boundary)
+        async def mock_send(method, path, headers=None, body=None):
+            if path.startswith("/a/child/"):
+                return _sig(status_code=401, content_type="application/json",
+                           content_length=30, word_count=4, line_count=1)
+            if path.startswith("/a/"):
+                return _sig(status_code=403, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        items = await _collect_walk(tree, mock_send)
+        paths = [r.template_path for r in items if isinstance(r, Route)]
+
+        # Depth 0: /a is boundary → injects /a/child
+        assert "/a/child" in paths
+        # Depth 1: /a/child could be boundary → but max_depth=1 prevents recursion
+        # /a/child/child should NOT exist
+        assert "/a/child/child" not in paths
+
+
+# ---------------------------------------------------------------------------
+# Lookahead
+# ---------------------------------------------------------------------------
+
+class TestLookahead:
+    @pytest.mark.asyncio
+    async def test_lookahead_discovers_hidden_boundary(self):
+        """Lookahead should discover boundaries one level deeper than the tree."""
+        # Flat wordlist — /users is a leaf, no children
+        tree = ScanTree([_route("/users"), _route("/login")], lookahead=True)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+
+        async def mock_send(method, path, headers=None, body=None):
+            # /users/v1/* is a different handler
+            if "/users/v1/" in path:
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        items = await _collect_walk(tree, mock_send)
+
+        # Lookahead should have discovered /users/v1 as a boundary
+        groups = [i for i in items if isinstance(i, BoundaryGroup)]
+        assert any(g.prefix == "/users/v1" for g in groups)
+
+        # Baseline should be registered
+        result = tree.lookup_baseline("/users/v1/anything", "GET")
+        assert result is not None
+        assert result[0] == "/users/v1"
+
+    @pytest.mark.asyncio
+    async def test_lookahead_skips_when_boundary_found(self):
+        """When standard probe finds a boundary at a prefix, lookahead
+        should not fire at THAT prefix (it may fire at child nodes)."""
+        tree = ScanTree([_route("/api/endpoint")], lookahead=True)
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+        lookahead_prefixes: list[str] = []
+        original_lookahead = tree._lookahead_prefix
+
+        async def tracking_lookahead(prefix, send_fn, tracker=None, depth=0):
+            lookahead_prefixes.append(prefix)
+            return await original_lookahead(prefix, send_fn, tracker, depth)
+
+        tree._lookahead_prefix = tracking_lookahead
+
+        async def mock_send(method, path, headers=None, body=None):
+            # /api/* is a boundary
+            if path.startswith("/api/"):
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        items = await _collect_walk(tree, mock_send)
+
+        # /api should be found as a boundary by standard probe
+        groups = [i for i in items if isinstance(i, BoundaryGroup)]
+        assert any(g.prefix == "/api" for g in groups)
+        # Lookahead should NOT have been called for /api (boundary found there)
+        assert "/api" not in lookahead_prefixes
+
+    @pytest.mark.asyncio
+    async def test_lookahead_disabled_by_default(self):
+        """Without lookahead=True, no lookahead probes should fire."""
+        tree = ScanTree([_route("/users"), _route("/login")])
+        tree._root.baselines["GET"] = build_baseline([
+            _sig(status_code=404, content_type="text/html"),
+        ])
+        probe_count = 0
+
+        async def mock_send(method, path, headers=None, body=None):
+            nonlocal probe_count
+            probe_count += 1
+            if "/users/v1/" in path:
+                return _sig(status_code=200, content_type="application/json",
+                           content_length=25, word_count=3, line_count=1)
+            return _sig(status_code=404, content_type="text/html")
+
+        items = await _collect_walk(tree, mock_send)
+
+        # No boundary groups for /users/v1 — lookahead disabled
+        groups = [i for i in items if isinstance(i, BoundaryGroup)]
+        assert not any(g.prefix == "/users/v1" for g in groups)
