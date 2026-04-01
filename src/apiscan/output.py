@@ -250,7 +250,7 @@ def braille_bar(pct: float) -> str:
 
 class ProgressTracker:
     def __init__(self, route_total: int, use_color: bool = True, tracker=None) -> None:
-        self.route_total = route_total
+        self._initial_route_total = route_total
         self.routes_completed = 0
         self.findings = 0
         self.hidden = 0
@@ -259,6 +259,13 @@ class ProgressTracker:
         self._last_print = 0.0
         self._start = time.monotonic()
         self._window: deque[float] = deque()
+
+    @property
+    def route_total(self) -> int:
+        """Dynamic total — grows when recursion adds routes."""
+        if self._tracker and hasattr(self._tracker, 'routes_planned'):
+            return self._tracker.routes_planned
+        return self._initial_route_total
 
     def set_phase(self, phase: str, phase_total: int) -> None:
         pass  # kept for API compat
@@ -306,22 +313,30 @@ class ProgressTracker:
 
         hidden_str = f" {d}| {self.hidden} hidden{r}" if self.hidden else ""
 
+        # Show if route total grew from recursion
+        recurse_str = ""
+        if self._tracker and hasattr(self._tracker, 'routes_planned'):
+            if self._tracker.routes_planned > self._initial_route_total:
+                added = self._tracker.routes_planned - self._initial_route_total
+                recurse_str = f" {d}| +{added} recursive{r}"
+
         print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
         line = (f"[{g}{route_bar}{r}{d}{route_pct:02.0f}%{r}] | "
                 f"{d}{self.routes_completed}/{self.route_total} routes{r} "
                 f"| {d}{reqs_sent}/{reqs_total} reqs{r} "
                 f"{d}({rps:.0f} req/s){r} "
-                f"| {c}{self.findings} found{r} "
+                f"| {c}{self.findings} found{r}"
+                f"{recurse_str}"
                 f"{hidden_str}")
         print(f"\r{line}", end="", flush=True, file=sys.stderr)
         if self.routes_completed == self.route_total:
             print(file=sys.stderr)
 
 
-def print_summary(findings: int, total_requests: int, elapsed: float,
-                  use_color: bool = True) -> None:
+def print_summary(findings: int, total_candidates: int, total_requests: int,
+                  elapsed: float, use_color: bool = True) -> None:
     d = DIM if use_color else ""
     r = RESET if use_color else ""
     b = BOLD if use_color else ""
     avg_rps = total_requests / elapsed if elapsed > 0 else 0
-    print(f"\n{b}{findings} routes{r} from {total_requests} requests in {elapsed:.1f}s {d}({avg_rps:.0f} avg req/s){r}")
+    print(f"\n{b}{findings} findings{r} from {total_candidates} candidates in {total_requests} requests {d}({elapsed:.1f}s, {avg_rps:.0f} avg req/s){r}")

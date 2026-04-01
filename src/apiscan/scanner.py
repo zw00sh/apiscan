@@ -59,11 +59,16 @@ class RequestTracker:
     def __init__(self, initial_planned: int = 0, on_tick: Callable[[], None] | None = None) -> None:
         self.sent = 0
         self.planned = initial_planned
+        self.routes_planned = 0
         self._on_tick = on_tick
 
     def plan(self, n: int) -> None:
         """Register *n* additional requests that will be sent."""
         self.planned += n
+
+    def plan_routes(self, n: int) -> None:
+        """Register *n* additional routes (for progress display)."""
+        self.routes_planned += n
 
     def tick(self) -> None:
         """Record one completed HTTP request."""
@@ -141,6 +146,7 @@ async def scan(
 
     # Initial planned: root init (10) + 1 per route
     tracker.plan(10 + len(tree))
+    tracker.plan_routes(len(tree))
 
     def _inference_filtered(route, path, sig, reason):
         if on_filtered:

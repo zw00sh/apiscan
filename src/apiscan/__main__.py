@@ -517,7 +517,7 @@ async def _scan(args: argparse.Namespace) -> None:
         print(f"{d}--- end tree ---{r}\n", file=sys.stderr)
 
     if not args.quiet:
-        print_summary(len(findings), len(filtered_routes), elapsed, use_color)
+        print_summary(len(findings), req_tracker.routes_planned, req_tracker.sent, elapsed, use_color)
 
 
 # ---------------------------------------------------------------------------

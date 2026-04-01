@@ -398,8 +398,11 @@ class ScanTree:
                     added += 1
                     if tracker:
                         tracker.plan(1)
-            if added and self._on_recurse:
-                self._on_recurse(prefix, added, depth + 1)
+            if added:
+                if tracker and hasattr(tracker, 'plan_routes'):
+                    tracker.plan_routes(added)
+                if self._on_recurse:
+                    self._on_recurse(prefix, added, depth + 1)
 
         return BoundaryGroup(prefix=prefix, probes=tuple(probes))
 
