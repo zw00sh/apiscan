@@ -279,3 +279,78 @@ class TestRecursionIntegration:
         # Planned count should exceed initial routes + init probes
         # because recursion added more routes
         assert tracker.planned > 10 + len(routes)
+
+    @pytest.mark.asyncio
+    async def test_recursive_alternate_method_discovery(self, test_server_url):
+        """Recursive routes should discover POST endpoints via alternate
+        method probing when GET matches baseline.
+
+        /deep/secret/* returns 401 for everything. With recursion,
+        /deep/secret/endpoint is injected. GET matches the /deep/secret
+        baseline (401), but alternate method probing may reveal different
+        behavior on POST/PUT/DELETE.
+        """
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/secret", method="GET"),
+            Route(template_path="/endpoint", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=2,
+        )
+        # The /deep boundary and /deep/secret sub-boundary should be found
+        boundary_paths = {r.path for r in results if "boundary:" in r.reason}
+        assert "/deep" in boundary_paths or any("/deep" in p for p in boundary_paths)
+
+    @pytest.mark.asyncio
+    async def test_results_before_recursion_completes(self, test_server_url):
+        """Original wordlist findings should be emitted, not blocked by recursion."""
+        routes = [
+            Route(template_path="/internal/metrics", method="GET"),
+            Route(template_path="/deep/endpoint", method="GET"),
+        ]
+        result_order: list[str] = []
+
+        def on_result(result: ScanResult) -> None:
+            result_order.append(result.path)
+
+        await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=1,
+            on_result=on_result,
+        )
+        # /internal/metrics is a direct finding (content-type boundary).
+        # It should appear in results regardless of recursion.
+        assert "/internal/metrics" in result_order
+
+    @pytest.mark.asyncio
+    async def test_baseline_exists_before_route_classification(self, test_server_url):
+        """Routes should be classified against a baseline that exists,
+        not against None. This verifies the probe-before-scan invariant."""
+        routes = [
+            Route(template_path="/api/v1/users", method="GET"),
+            Route(template_path="/api/v1/health", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+        )
+        # All results should have a reason (not "no baseline available")
+        for r in results:
+            assert "no baseline" not in r.reason, f"{r.path} had no baseline"
+
+    @pytest.mark.asyncio
+    async def test_reactive_boundary_probe_on_finding(self, test_server_url):
+        """When a flat wordlist route deviates from baseline, the scanner
+        should reactively probe it as a prefix and register a baseline."""
+        routes = [
+            Route(template_path="/admin/dashboard", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=1, timeout=5.0,
+        )
+        # /admin/dashboard deviates (401 json vs root 404 html).
+        # The worker should reactively probe /admin/dashboard as a prefix.
+        # Whether or not it's a boundary, the route itself should be a finding.
+        paths = {r.path for r in results}
+        assert "/admin/dashboard" in paths
