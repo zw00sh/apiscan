@@ -249,9 +249,11 @@ class ScanTree:
             if group:
                 has_boundary = True
                 await queue.put(group)
-            elif self._lookahead:
-                # No boundary at this prefix — try common segments one level
-                # deeper to discover hidden N+1 boundaries.
+            elif self._lookahead and not node.children:
+                # No boundary at this leaf prefix — try common segments one
+                # level deeper to discover hidden N+1 boundaries.  Only at
+                # leaves: interior nodes already have children probed by the
+                # walk, so lookahead would be redundant.
                 lookahead_groups = await self._lookahead_prefix(
                     prefix, send_fn, tracker, depth,
                 )
