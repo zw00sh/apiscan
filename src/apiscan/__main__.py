@@ -75,6 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="Whitelist status codes, comma-separated (e.g. 200,301,403)")
     filtering.add_argument("--blacklist-codes", default=None,
                            help="Blacklist status codes, comma-separated (e.g. 404,500)")
+    filtering.add_argument("--no-skip-wildcard-siblings", action="store_true",
+                           help="Probe all segment-prefix siblings individually instead of skipping them when a wildcard handler is detected")
 
     output = sc.add_argument_group("output")
     output.add_argument("-o", "--output", default=None, metavar="PATH",
@@ -259,6 +261,7 @@ async def _scan(args: argparse.Namespace) -> None:
             max_depth=args.max_depth,
             lookahead=args.lookahead,
             methods=scan_methods,
+            skip_wildcard_siblings=not args.no_skip_wildcard_siblings,
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         interrupted = True
@@ -292,6 +295,7 @@ async def _scan(args: argparse.Namespace) -> None:
         print_hints(
             recurse=args.recurse, lookahead=args.lookahead,
             methods=scan_methods, boundaries_found=boundary_count,
+            wildcard_skipped=req_tracker.skipped_fn() if req_tracker.skipped_fn else 0,
             use_color=use_color,
         )
 

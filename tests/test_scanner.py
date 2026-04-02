@@ -367,9 +367,10 @@ class TestSegmentPrefixSuppression:
             f"/staticfiles should be suppressed, got: {paths}"
 
     @pytest.mark.asyncio
-    async def test_segment_prefix_allows_different_handler(self, test_server_url):
-        """A real endpoint at /staticmap with a different response should
-        survive even though /static is a prefix handler."""
+    async def test_wildcard_siblings_skipped_by_default(self, test_server_url):
+        """With default skip_wildcard_siblings=True, /staticmap is skipped
+        even though it has a different response — the hint tells the
+        operator to re-run with --no-skip-wildcard-siblings."""
         routes = [
             Route(template_path="/static", method="GET"),
             Route(template_path="/staticmap", method="GET"),
@@ -378,7 +379,21 @@ class TestSegmentPrefixSuppression:
             test_server_url, routes, concurrency=2, timeout=5.0,
         )
         paths = {r.path for r in results}
-        # /staticmap has a different response (200 json vs 403 json)
-        # so it should NOT be suppressed
+        assert "/staticmap" not in paths, \
+            f"/staticmap should be skipped by default, got: {paths}"
+
+    @pytest.mark.asyncio
+    async def test_no_skip_wildcard_siblings_preserves_different_handler(self, test_server_url):
+        """With skip_wildcard_siblings=False, /staticmap survives because
+        its response differs from the /static wildcard handler."""
+        routes = [
+            Route(template_path="/static", method="GET"),
+            Route(template_path="/staticmap", method="GET"),
+        ]
+        results, _ = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            skip_wildcard_siblings=False,
+        )
+        paths = {r.path for r in results}
         assert "/staticmap" in paths, \
-            f"Expected /staticmap to survive, got: {paths}"
+            f"Expected /staticmap to survive with skip disabled, got: {paths}"

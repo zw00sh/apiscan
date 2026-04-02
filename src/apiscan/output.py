@@ -335,11 +335,32 @@ class ProgressTracker:
         else:
             rps = 0
 
-        hidden_str = f"| {d}{self.hidden} hidden{r} " if self.hidden else ""
-        if queued >= 1000:
-            queue_str = f"{d}({queued / 1000:.1f}k queued){r}"
-        elif queued:
-            queue_str = f"{d}({queued} queued){r}"
+        skipped = 0
+        if self._tracker and self._tracker.skipped_fn:
+            skipped = self._tracker.skipped_fn()
+        hidden_str = ""
+        if self.hidden or skipped:
+            parts = []
+            if self.hidden:
+                parts.append(f"{self.hidden} hidden")
+            if skipped:
+                parts.append(f"{skipped} skipped")
+            hidden_str = f"| {d}{', '.join(parts)}{r} "
+        blocked = 0
+        if self._tracker and self._tracker.blocked_fn:
+            blocked = self._tracker.blocked_fn()
+        ready = max(0, queued - blocked)
+
+        def _fmt(n: int) -> str:
+            return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+        if queued:
+            parts = []
+            if ready:
+                parts.append(f"{_fmt(ready)} ready")
+            if blocked:
+                parts.append(f"{_fmt(blocked)} waiting")
+            queue_str = f"{d}({', '.join(parts)}){r}" if parts else ""
         else:
             queue_str = ""
 
@@ -445,7 +466,8 @@ def format_findings_tree(results: list[ScanResult], use_color: bool = True) -> s
 # ---------------------------------------------------------------------------
 
 def print_hints(*, recurse: bool, lookahead: bool, methods: list[str],
-                boundaries_found: int, use_color: bool = True) -> None:
+                boundaries_found: int, wildcard_skipped: int = 0,
+                use_color: bool = True) -> None:
     """Print contextual suggestions for improving scan coverage."""
     d = DIM if use_color else ""
     r = RESET if use_color else ""
@@ -453,6 +475,9 @@ def print_hints(*, recurse: bool, lookahead: bool, methods: list[str],
 
     if not recurse and boundaries_found > 0:
         hints.append(f"{boundaries_found} handler boundaries found — re-run with --recurse to explore them")
+
+    if wildcard_skipped > 0:
+        hints.append(f"{wildcard_skipped} wildcard siblings skipped — use --no-skip-wildcard-siblings to probe them individually")
 
     if not lookahead:
         hints.append("--lookahead probes common segments one level deeper")
