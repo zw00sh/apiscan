@@ -214,7 +214,7 @@ class TestClassifyBoundary:
 
 class TestInferenceProcess:
     @pytest.mark.asyncio
-    async def test_baseline_match_returns_none(self):
+    async def test_baseline_match_filtered(self):
         tree, engine = _make_engine()
         tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html",
                                                       content_length=50)))
@@ -225,7 +225,7 @@ class TestInferenceProcess:
 
         result = await engine.process(route, _sig(status_code=404, content_type="text/html",
                                                    content_length=50), "/random/path", mock_send)
-        assert result is None
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_status_deviation_returns_finding(self):
@@ -240,8 +240,8 @@ class TestInferenceProcess:
             return _sig(status_code=405)
 
         result = await engine.process(route, sig, "/api/v1/users", mock_send)
-        assert isinstance(result, Finding)
-        assert "status:" in result.reason
+        assert len(result) == 1
+        assert "status:" in result[0].reason
 
     @pytest.mark.asyncio
     async def test_handler_boundary_filters_children(self):
@@ -260,7 +260,7 @@ class TestInferenceProcess:
             return _sig()
 
         result = await engine.process(route, candidate, "/api/v1/users", mock_send)
-        assert result is None
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_method_sensitive_405(self):
@@ -277,9 +277,9 @@ class TestInferenceProcess:
             return _sig(status_code=404, content_type="text/html")
 
         result = await engine.process(route, sig, "/api/v1/users", mock_send)
-        assert result is not None
-        assert "405" in (result.reason if isinstance(result, Finding) else "")
-        assert (result.confidence if isinstance(result, Finding) else "") == "high"
+        assert len(result) == 1
+        assert "405" in result[0].reason
+        assert result[0].confidence == "high"
 
     @pytest.mark.asyncio
     async def test_content_type_change_high_confidence(self):
@@ -294,9 +294,9 @@ class TestInferenceProcess:
             return _sig(status_code=404, content_type="text/html")
 
         result = await engine.process(route, sig, "/api/health", mock_send)
-        assert isinstance(result, Finding)
-        assert "content-type:" in result.reason
-        assert result.confidence == "high"
+        assert len(result) == 1
+        assert "content-type:" in result[0].reason
+        assert result[0].confidence == "high"
 
     @pytest.mark.asyncio
     async def test_status_blacklist(self):
@@ -309,7 +309,7 @@ class TestInferenceProcess:
         result = await engine.process(
             Route(template_path="/error", method="GET"),
             _sig(status_code=500), "/error", mock_send)
-        assert result is None
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_status_whitelist(self):
@@ -322,7 +322,7 @@ class TestInferenceProcess:
         result = await engine.process(
             Route(template_path="/auth", method="GET"),
             _sig(status_code=401), "/auth", mock_send)
-        assert result is None
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_known_bad_site_filtered(self):
@@ -336,7 +336,7 @@ class TestInferenceProcess:
             Route(template_path="/api", method="GET"),
             _sig(status_code=400, content_length=1555, word_count=82, line_count=12),
             "/api", mock_send)
-        assert result is None
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_new_headers_in_reason(self):
@@ -353,8 +353,8 @@ class TestInferenceProcess:
         result = await engine.process(
             Route(template_path="/admin/dashboard", method="GET"),
             sig, "/admin/dashboard", mock_send)
-        assert isinstance(result, Finding)
-        assert "x-request-id" in result.reason
+        assert len(result) == 1
+        assert "x-request-id" in result[0].reason
 
     @pytest.mark.asyncio
     async def test_alternate_methods_grouped(self):
@@ -377,7 +377,6 @@ class TestInferenceProcess:
             return _sig(status_code=404, content_type="text/html", content_length=50)
 
         result = await engine.process(route, candidate, "/files/import", mock_send)
-        assert isinstance(result, list)
         assert len(result) == 1  # POST and PUT grouped
         assert "POST" in result[0].reason
         assert "PUT" in result[0].reason
@@ -415,5 +414,69 @@ class TestInferenceProcess:
             return _sig(status_code=403, content_type="application/json", content_length=131)
 
         result = await engine.process(route, candidate, "/users/add", mock_send)
-        # Should be fully filtered — no findings from alternate methods either
-        assert result is None
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_ancestor_baseline_match_filters_fallthrough(self):
+        """A response that deviates from its nearest baseline but matches an
+        ancestor baseline is falling through to the default handler — not a
+        real endpoint.
+
+        Example: /books/v1/ baseline is 401/119B (auth gate).  A route like
+        /books/v1/.terraform returns 404/205B — deviates from /books/v1/ but
+        matches the root 404 baseline exactly.  Should be filtered.
+        """
+        tree, engine = _make_engine()
+        # Insert route to create tree nodes for /books/v1/*
+        tree.insert(Route(template_path="/books/v1/.terraform", method="GET"))
+        # Root baseline: 404, text/html, 205 bytes
+        root_sig = _sig(status_code=404, content_type="text/html",
+                        content_length=205, word_count=35, line_count=7)
+        tree.set_baseline("/", "GET", _baseline(root_sig))
+        tree.set_baseline("/", "POST", _baseline(root_sig))
+        # Boundary at /books/v1: 401, application/json, 119 bytes
+        tree.set_baseline("/books/v1", "GET", _baseline(
+            _sig(status_code=401, content_type="application/json",
+                 content_length=119, word_count=16, line_count=7)))
+
+        route = Route(template_path="/books/v1/.terraform", method="GET")
+        # Response matches root baseline exactly
+        candidate = _sig(status_code=404, content_type="text/html",
+                         content_length=205, word_count=35, line_count=7)
+
+        async def mock_send(method, path, headers=None, body=None):
+            return root_sig
+
+        result = await engine.process(route, candidate, "/books/v1/.terraform", mock_send)
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_ancestor_match_does_not_suppress_real_endpoints(self):
+        """A response that deviates from both nearest AND ancestor baselines
+        should still be reported as a finding.
+
+        Example: root is 404/text/html, /api/ is 200/json.  /api/users returns
+        401/json — deviates from /api/ baseline, does NOT match root (different
+        content-type).  Should be a finding.
+        """
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(
+            _sig(status_code=404, content_type="text/html",
+                 content_length=205, word_count=35, line_count=7)))
+        tree.set_baseline("/", "POST", _baseline(
+            _sig(status_code=404, content_type="text/html",
+                 content_length=205, word_count=35, line_count=7)))
+        tree.set_baseline("/api", "GET", _baseline(
+            _sig(status_code=200, content_type="application/json",
+                 content_length=12, word_count=2, line_count=1)))
+
+        route = Route(template_path="/api/users", method="GET")
+        candidate = _sig(status_code=401, content_type="application/json",
+                         content_length=60, word_count=4, line_count=1)
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=405)
+
+        result = await engine.process(route, candidate, "/api/users", mock_send)
+        assert len(result) == 1
+        assert "405" in result[0].reason

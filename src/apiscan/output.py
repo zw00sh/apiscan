@@ -331,12 +331,12 @@ class ProgressTracker:
 
         # Show if route total grew from recursion
         recurse_str = ""
-        if self._tracker and hasattr(self._tracker, 'routes_planned'):
+        if self._tracker and hasattr(self._tracker, 'routes_planned') and stage == 'recursing':
             if self._tracker.routes_planned > self._initial_route_total:
                 added = self._tracker.routes_planned - self._initial_route_total
-                recurse_str = f"| {d}+{added} recursive{r} "
+                recurse_str = f"{d}(+{added} recursive){r} "
 
-        stage_str = f"| {d}{stage}{r} " if stage else ""
+        stage_str = f"| {d}{stage}{r} {recurse_str}" if stage else ""
 
         print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
         line = (f"[{g}{route_bar}{r}{d}{route_pct:02.0f}%{r}] "
@@ -344,7 +344,6 @@ class ProgressTracker:
                 f"| {d}{rps:.0f} req/s{r} {queue_str} "
                 f"| {c}{self.findings} found{r} "
                 f"{stage_str}"
-                f"{recurse_str}"
                 f"{hidden_str}")
         print(f"\r{line}", end="", flush=True, file=sys.stderr)
 

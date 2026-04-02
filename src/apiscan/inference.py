@@ -12,7 +12,7 @@ the same pipeline.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -294,55 +294,61 @@ class InferenceEngine:
     # Classify a route response
     # ------------------------------------------------------------------
 
+    def _matches_any_ancestor(
+        self, sig: ResponseSignature, path: str, method: str, path_len: int,
+    ) -> bool:
+        """True if sig matches any baseline in the ancestor chain."""
+        for bl in self._tree.ancestor_baselines(path, method):
+            if matches_baseline(sig, bl, path_len) is not None:
+                return True
+        return False
+
     async def process(
         self,
         route: Route,
         sig: ResponseSignature,
         path: str,
         send_fn,
-    ) -> Finding | list[Finding] | None:
+    ) -> list[Finding]:
         """Classify a candidate response.
 
-        Stateless w.r.t. the tree — reads baselines only via
-        ``lookup_baseline()``.  Safe for concurrent calls from
-        multiple workers.
-
-        Returns a single ``Finding``, a list of findings (from alternate
-        method probing), or ``None`` if filtered.
+        Returns a list of findings (empty if filtered).  Safe for
+        concurrent calls from multiple workers.
         """
         # Pre-filters
         if self._filter_status(sig.status_code):
             self._on_filtered(route, path, sig, f"status filter: {sig.status_code}")
-            return None
+            return []
         if is_known_bad_site(sig):
             self._on_filtered(route, path, sig, f"known bad site: {sig.status_code}, length={sig.content_length}")
-            return None
+            return []
 
-        # Baseline comparison
+        # Baseline lookup
         path_len = len(path.lstrip("/"))
-        method = route.method
-        node = self._tree.lookup_baseline(path, method)
+        node = self._tree.lookup_baseline(path, route.method)
 
-        if node is not None:
-            prefix, baseline = node
-            match_reason = matches_baseline(sig, baseline, path_len)
-            if match_reason is not None:
-                # Route matches baseline — try alternate methods before discarding
-                alt_findings = await self._try_alternate_methods(route, path, send_fn)
-                if alt_findings:
-                    return alt_findings
-                self._on_filtered(route, path, sig, f"baseline match at {prefix}: {match_reason}")
-                return None
-            baseline_ref = baseline.signatures[0]
-        else:
-            baseline_ref = None
+        if node is None:
+            return [Finding(route=route, signature=sig,
+                            reason="no baseline available", confidence="low")]
 
-        # No baseline available
-        if baseline_ref is None:
-            return Finding(
-                route=route, signature=sig,
-                reason="no baseline available", confidence="low",
-            )
+        prefix, baseline = node
+        baseline_ref = baseline.signatures[0]
+
+        # Check nearest baseline, then ancestors.
+        # Nearest match → try alternate methods before filtering.
+        # Ancestor match → filter (default handler leaking through).
+        match_reason = matches_baseline(sig, baseline, path_len)
+        if match_reason is not None:
+            alt_findings = await self._try_alternate_methods(
+                route, path, path_len, prefix, send_fn)
+            if alt_findings:
+                return alt_findings
+            self._on_filtered(route, path, sig, f"baseline match at {prefix}: {match_reason}")
+            return []
+
+        if self._matches_any_ancestor(sig, path, route.method, path_len):
+            self._on_filtered(route, path, sig, "matches ancestor baseline")
+            return []
 
         # Verification: method change probe
         if self._tracker:
@@ -358,8 +364,7 @@ class InferenceEngine:
             pass
 
         # Check for new headers
-        ref_headers = baseline_ref.header_names
-        new_headers = sig.header_names - ref_headers
+        new_headers = sig.header_names - baseline_ref.header_names
         new_headers -= {"date", "content-length", "transfer-encoding", "connection"}
 
         # Classification
@@ -372,11 +377,11 @@ class InferenceEngine:
         if not reason_parts:
             reason_parts = ["response differs from baseline"]
 
-        return Finding(
+        return [Finding(
             route=route, signature=sig,
             reason=", ".join(reason_parts),
             confidence=_score_confidence(reason_parts),
-        )
+        )]
 
     # ------------------------------------------------------------------
     # Parallel alternate method probing
@@ -386,6 +391,8 @@ class InferenceEngine:
         self,
         route: Route,
         path: str,
+        path_len: int,
+        match_prefix: str,
         send_fn,
     ) -> list[Finding]:
         """Probe all alternate HTTP methods in parallel.
@@ -393,28 +400,21 @@ class InferenceEngine:
         Returns findings grouped by distinct response: if POST and PUT both
         return 400, that's one finding with both methods in the reason.
         """
-        path_len = len(path.lstrip("/"))
         alt_methods = [m for m in self._methods if m != route.method]
         if self._tracker:
             self._tracker.plan(len(alt_methods))
 
-        # Fire all probes in parallel
         async def _probe(method: str) -> tuple[str, ResponseSignature | None]:
             try:
-                sig = await send_fn(method, path, None, None)
-                return method, sig
+                return method, await send_fn(method, path, None, None)
             except Exception:
                 return method, None
 
         results = await asyncio.gather(*[_probe(m) for m in alt_methods])
 
-        # Find the baseline prefix that the original route matched against.
-        # Only consider alternate methods that have a baseline at the same
-        # prefix or deeper — not a distant root fallback.
-        original_node = self._tree.lookup_baseline(path, route.method)
-        match_prefix = original_node[0] if original_node else "/"
-
-        # Filter and check each against its method's baseline
+        # Filter and check each against its method's baseline.
+        # Skip methods whose baseline is more distant than the original
+        # route's match — a root fallback means nothing new to discover.
         deviations: list[tuple[str, ResponseSignature, Baseline]] = []
         for method, sig in results:
             if sig is None:
@@ -423,15 +423,13 @@ class InferenceEngine:
                 continue
             if is_known_bad_site(sig):
                 continue
+            if self._matches_any_ancestor(sig, path, method, path_len):
+                continue
 
             node = self._tree.lookup_baseline(path, method)
             if node is None:
                 continue
             bl_prefix, method_baseline = node
-            # Skip methods whose baseline is at a more distant ancestor than
-            # the original route's match.  A root fallback when the boundary
-            # was probed for all methods means this method matched the ancestor
-            # during probing — nothing new to discover.
             if len(bl_prefix) < len(match_prefix):
                 continue
             if matches_baseline(sig, method_baseline, path_len) is not None:
@@ -451,28 +449,17 @@ class InferenceEngine:
         # Build one finding per distinct response
         findings: list[Finding] = []
         for _, group in groups.items():
-            methods = [m for m, _, _ in group]
+            methods_found = [m for m, _, _ in group]
             sig = group[0][1]
             baseline_ref = group[0][2].signatures[0]
             reason_parts = _build_reason(sig, baseline_ref)
             if not reason_parts:
-                reason_parts = [f"responds differently"]
-            method_label = ", ".join(methods)
-            finding = Finding(
-                route=Route(
-                    template_path=route.template_path,
-                    method=methods[0],
-                    path_crumbs=route.path_crumbs,
-                    header_crumbs=route.header_crumbs,
-                    query_crumbs=route.query_crumbs,
-                    body_crumbs=route.body_crumbs,
-                    content_types=route.content_types,
-                    source_api_url=route.source_api_url,
-                ),
+                reason_parts = ["responds differently"]
+            findings.append(Finding(
+                route=replace(route, method=methods_found[0]),
                 signature=sig,
-                reason=f"via {method_label}: {', '.join(reason_parts)}",
+                reason=f"via {', '.join(methods_found)}: {', '.join(reason_parts)}",
                 confidence=_score_confidence(reason_parts),
-            )
-            findings.append(finding)
+            ))
 
         return findings

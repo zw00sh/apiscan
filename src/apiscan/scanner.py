@@ -77,7 +77,7 @@ class _WorkQueue:
     ``heapq`` never compares the work-item dataclasses directly.
     """
 
-    _STAGE_NAMES = {0: "wordlist", 1: "probing", 2: "recursing", 3: "exploring"}
+    _STAGE_NAMES = {0: "wordlist", 1: "probing", 2: "recursing", 3: "lookahead"}
 
     def __init__(self) -> None:
         self._pq: asyncio.PriorityQueue = asyncio.PriorityQueue()
@@ -445,9 +445,9 @@ async def scan(
                 resp.status_code, dict(resp.headers), resp.content, path,
             )
 
-            result = await engine.process(route, sig, path, send_fn)
+            findings = await engine.process(route, sig, path, send_fn)
 
-            if result is None:
+            if not findings:
                 if on_progress:
                     on_progress(0)
                 return
@@ -469,13 +469,12 @@ async def scan(
                             wq.enqueue(0, _RouteWork(
                                 route=Route(template_path=redir_path, method=route.method)))
 
-            all_findings = result if isinstance(result, list) else [result]
-            for finding in all_findings:
+            for finding in findings:
                 _emit(finding, redirect_location=redirect_location,
                       request_headers=headers, request_body=body_str)
 
             if on_progress:
-                on_progress(len(all_findings))
+                on_progress(len(findings))
 
         # -- Worker dispatch ----------------------------------------------
 
