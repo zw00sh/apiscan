@@ -128,12 +128,7 @@ async def _scan(args: argparse.Namespace) -> None:
             print(f"error: unknown method '{m}' (valid: {', '.join(sorted(valid))})", file=sys.stderr)
             sys.exit(1)
 
-    # Load wordlist
-    if not args.quiet:
-        print(f"  {c2}loading wordlist{r} {os.path.basename(args.wordlist)}", end="", flush=True)
     routes = load_wordlist(args.wordlist)
-    if not args.quiet:
-        print(f"\r  {c2}wordlist:{r} {len(routes):,} paths{' ' * 40}")
 
     if not args.quiet:
         print_banner(args.url, len(routes), scan_methods, use_color,

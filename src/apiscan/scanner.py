@@ -297,6 +297,28 @@ async def scan(
         segment_prefix_handlers: dict[tuple[str, str], Baseline] = {}
         suppressed_indices: set[int] = set()
 
+        # Segment-prefix parking: superset segments (e.g. /auth.cgi when
+        # /auth exists) are held until the gate's _check_segment_prefix
+        # completes.  Maps gate path -> list of parked (priority, work).
+        pending_segment: dict[str, list[tuple[int, Any]]] = {}
+        # Maps deferred path -> gate path it's waiting on
+        _segment_deferred: dict[str, str] = {}
+
+        def _init_segment_deps(node, prefix: str) -> None:
+            sorted_segs = sorted(node.children)
+            for i, seg in enumerate(sorted_segs):
+                gate_path = f"{prefix}/{seg}" if prefix else f"/{seg}"
+                has_supersets = False
+                for later in sorted_segs[i + 1:]:
+                    if later.startswith(seg) and later != seg:
+                        later_path = f"{prefix}/{later}" if prefix else f"/{later}"
+                        _segment_deferred[later_path] = gate_path
+                        has_supersets = True
+                if has_supersets:
+                    pending_segment.setdefault(gate_path, [])
+                _init_segment_deps(node.children[seg], gate_path)
+        _init_segment_deps(tree._root, "")
+
         def _split_path_segment(path: str) -> tuple[str, str]:
             """Split '/foo/bar' into ('/foo', 'bar')."""
             parts = path.rstrip("/").rsplit("/", 1)
@@ -320,11 +342,20 @@ async def scan(
             Returns True if the finding should be suppressed (covered by
             an existing prefix handler).  Returns False if the finding
             should be emitted (it may itself be registered as a handler).
+
+            When this path is a gate (has superset siblings parked behind
+            it), releases them after the probe completes — whether or not
+            it turns out to be a prefix handler.
             """
             path = finding.route.template_path
+            parent, segment = _split_path_segment(path)
+            key = (parent, segment)
+            is_gate = path in pending_segment
 
             # Already covered by a known prefix handler?
             if _is_segment_suppressed(path, finding.signature):
+                if is_gate:
+                    _release_segment_siblings(path)
                 return True
 
             # Probe {path}{random} to see if this is a prefix handler
@@ -334,16 +365,19 @@ async def scan(
             try:
                 probe_sig = await send_fn("GET", probe_path, None, None)
             except Exception:
+                if is_gate:
+                    _release_segment_siblings(path)
                 return False
 
             finding_bl = build_baseline([finding.signature])
             probe_len = len(probe_path.lstrip("/"))
             if matches_baseline(probe_sig, finding_bl, probe_len) is None:
+                if is_gate:
+                    _release_segment_siblings(path)
                 return False  # not a prefix handler
 
             # Register as prefix handler
-            parent, segment = _split_path_segment(path)
-            segment_prefix_handlers[(parent, segment)] = finding_bl
+            segment_prefix_handlers[key] = finding_bl
 
             # Retroactively sweep already-emitted results
             for i, existing in enumerate(results):
@@ -357,9 +391,16 @@ async def scan(
                     if matches_baseline(existing.signature, finding_bl, elen) is not None:
                         suppressed_indices.add(i)
 
+            if is_gate:
+                _release_segment_siblings(path)
             return False  # the handler itself is emitted
 
         # -- Helpers ------------------------------------------------------
+
+        def _release_segment_siblings(gate_path: str) -> None:
+            """Release work items parked behind a segment-prefix gate."""
+            for pri, item in pending_segment.pop(gate_path, []):
+                wq.enqueue(pri, item)
 
         def _emit(finding: Finding, **kw) -> None:
             result = _finding_to_result(finding, base_url, **kw)
@@ -438,7 +479,12 @@ async def scan(
             if group:
                 await _emit_boundary(group)
                 _inject_recursive(work.prefix, work.depth)
-            elif lookahead and not tree._resolve(work.prefix).children:
+            else:
+                # No boundary — if this was a segment gate, release
+                # parked siblings (the gate isn't a prefix handler).
+                if work.prefix in pending_segment:
+                    _release_segment_siblings(work.prefix)
+            if not group and lookahead and not tree._resolve(work.prefix).children:
                 for i, seg in enumerate(_LOOKAHEAD_SEGMENTS):
                     wq.enqueue(3 + i, _LookaheadWork(prefix=work.prefix, segment=seg))
 
@@ -513,6 +559,8 @@ async def scan(
             findings = await engine.process(route, sig, path, send_fn)
 
             if not findings:
+                if path in pending_segment:
+                    _release_segment_siblings(path)
                 if on_progress:
                     on_progress(0)
                 return
@@ -574,7 +622,9 @@ async def scan(
                 wq.item_done(priority)
 
         # Seed the priority queue
-        _seed_queue(tree, wq, pending_routes, pending_children)
+        _seed_queue(tree, wq, pending_routes, pending_children,
+                    segment_deferred=_segment_deferred,
+                    pending_segment=pending_segment)
 
         workers = [asyncio.create_task(_worker()) for _ in range(concurrency)]
 
@@ -609,23 +659,38 @@ def _seed_queue(
     wq: _WorkQueue,
     pending_routes: dict[str, list[tuple[int, _RouteWork]]],
     pending_children: dict[str, list[_ProbeWork]],
+    segment_deferred: dict[str, str] | None = None,
+    pending_segment: dict[str, list[tuple[int, Any]]] | None = None,
 ) -> None:
-    """Traverse the tree and enqueue initial work items."""
+    """Traverse the tree and enqueue initial work items.
+
+    Segments that are supersets of a sibling (e.g. ``auth.cgi`` when
+    ``auth`` exists) are parked in ``pending_segment`` behind the
+    shorter sibling's gate path, released when the gate's segment-prefix
+    check completes.
+    """
+    deferred = segment_deferred or {}
 
     def _visit(node, prefix: str, parent_prefix: str) -> None:
         if prefix:
-            for route in node.routes:
+            for route in sorted(node.routes, key=lambda r: r.template_path):
                 pending_routes.setdefault(prefix, []).append(
                     (0, _RouteWork(route=route)))
-            if parent_prefix == "":
+            gate = deferred.get(prefix)
+            if gate and pending_segment is not None:
+                # Park this probe behind the gate — released when
+                # the gate's _check_segment_prefix completes.
+                pending_segment.setdefault(gate, []).append(
+                    (1, _ProbeWork(prefix=prefix, depth=0)))
+            elif parent_prefix == "":
                 wq.enqueue(1, _ProbeWork(prefix=prefix, depth=0))
             else:
                 pending_children.setdefault(parent_prefix, []).append(
                     _ProbeWork(prefix=prefix, depth=0))
         else:
-            for route in node.routes:
+            for route in sorted(node.routes, key=lambda r: r.template_path):
                 wq.enqueue(0, _RouteWork(route=route))
-        for seg in node._insertion_order:
+        for seg in sorted(node.children):
             child_prefix = f"{prefix}/{seg}" if prefix else f"/{seg}"
             _visit(node.children[seg], child_prefix, prefix)
 
