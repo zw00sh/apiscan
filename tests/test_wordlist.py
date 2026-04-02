@@ -18,7 +18,6 @@ class TestLoadWordlist:
             assert len(routes) == 3
             assert routes[0].template_path == "/api/v1/users"
             assert routes[0].method == "GET"
-            assert routes[0].path_crumbs == []
         finally:
             os.unlink(path)
 

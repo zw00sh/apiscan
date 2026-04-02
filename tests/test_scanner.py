@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from apiscan.kite import Crumb, Route
+from apiscan.kite import Route
 from apiscan.output import ScanResult
 from apiscan.scanner import RateLimiter, scan
 
@@ -107,19 +107,6 @@ class TestScanIntegration:
         routes = [Route(template_path="/redirect", method="GET")]
         results, _ = await scan(test_server_url, routes, concurrency=2, timeout=5.0)
         assert isinstance(results, list)
-
-    @pytest.mark.asyncio
-    async def test_request_construction(self, test_server_url):
-        routes = [
-            Route(
-                template_path="/echo", method="POST",
-                query_crumbs=[Crumb("static", name="q", fields={"v": "test"})],
-                header_crumbs=[Crumb("static", name="X-Custom", fields={"v": "myvalue"})],
-                body_crumbs=[Crumb("static", name="key", fields={"v": "val"})],
-            ),
-        ]
-        results, _ = await scan(test_server_url, routes, concurrency=1, timeout=5.0)
-        assert len(results) >= 1
 
     @pytest.mark.asyncio
     async def test_rate_limiting_integration(self, test_server_url):

@@ -173,7 +173,10 @@ BANNER = " ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █\n █�
 
 
 def print_banner(target: str, route_count: int,
-                 methods: list[str], use_color: bool = True) -> None:
+                 methods: list[str], use_color: bool = True, *,
+                 concurrency: int = 10, rate_limit: float | None = None,
+                 timeout: float = 10.0, recurse: bool = False,
+                 lookahead: bool = False) -> None:
     b = BOLD if use_color else ""
     r = RESET if use_color else ""
     d = DIM if use_color else ""
@@ -184,6 +187,15 @@ def print_banner(target: str, route_count: int,
     print(f"  routes:   {route_count}")
     g = GREEN if use_color else ""
     print(f"  methods:  {g}{b}{', '.join(methods)}{r}")
+    rate_str = f"{rate_limit:.0f} req/s" if rate_limit else "unlimited"
+    print(f"  http:     {concurrency} workers, {rate_str}, {timeout}s timeout")
+    features = []
+    if recurse:
+        features.append("--recurse")
+    if lookahead:
+        features.append("--lookahead")
+    if features:
+        print(f"  features: {', '.join(features)}")
     print()
 
 
@@ -357,3 +369,100 @@ def print_summary(findings: int, total_candidates: int, total_requests: int,
     b = BOLD if use_color else ""
     avg_rps = total_requests / elapsed if elapsed > 0 else 0
     print(f"\n{b}{findings} findings{r} from {total_candidates} candidates in {total_requests} requests {d}({elapsed:.1f}s, {avg_rps:.0f} avg req/s){r}")
+
+
+# ---------------------------------------------------------------------------
+# Findings tree
+# ---------------------------------------------------------------------------
+
+def format_findings_tree(results: list[ScanResult], use_color: bool = True) -> str:
+    """Build an ASCII tree of discovered paths from scan results."""
+    if not results:
+        return ""
+
+    d = DIM if use_color else ""
+    r = RESET if use_color else ""
+    c = CYAN if use_color else ""
+
+    # Build trie: each node maps segment → child node
+    # Leaves store list of (status_code, method)
+    root: dict[str, Any] = {"_hits": [], "_children": {}}
+
+    for res in results:
+        segments = [s for s in res.path.split("/") if s]
+        node = root
+        for seg in segments:
+            if seg not in node["_children"]:
+                node["_children"][seg] = {"_hits": [], "_children": {}}
+            node = node["_children"][seg]
+        node["_hits"].append((res.status_code, res.method))
+
+    # Collapse single-child chains
+    def _collapse(node: dict) -> dict:
+        children = node["_children"]
+        collapsed: dict[str, dict] = {}
+        for seg, child in children.items():
+            child = _collapse(child)
+            # Collapse if child has no hits and exactly one child
+            while not child["_hits"] and len(child["_children"]) == 1:
+                next_seg, next_child = next(iter(child["_children"].items()))
+                seg = f"{seg}/{next_seg}"
+                child = next_child
+            collapsed[seg] = child
+        node["_children"] = collapsed
+        return node
+
+    root = _collapse(root)
+
+    # Render
+    lines: list[str] = []
+
+    def _render(node: dict, indent: str, last: bool, label: str) -> None:
+        connector = "└── " if last else "├── "
+        hit_str = ""
+        if node["_hits"]:
+            # Sort and deduplicate
+            pairs = sorted(set(node["_hits"]))
+            parts = [f"{status} {method}" for status, method in pairs]
+            hit_str = f" {d}({', '.join(parts)}){r}"
+        lines.append(f"{indent}{connector}{c}/{label}{r}{hit_str}")
+        child_indent = indent + ("    " if last else "│   ")
+        children = sorted(node["_children"].items())
+        for i, (seg, child) in enumerate(children):
+            is_last = i == len(children) - 1
+            _render(child, child_indent, is_last, seg)
+
+    children = sorted(root["_children"].items())
+    for i, (seg, child) in enumerate(children):
+        is_last = i == len(children) - 1
+        _render(child, "", is_last, seg)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Post-scan hints
+# ---------------------------------------------------------------------------
+
+def print_hints(*, recurse: bool, lookahead: bool, methods: list[str],
+                boundaries_found: int, use_color: bool = True) -> None:
+    """Print contextual suggestions for improving scan coverage."""
+    d = DIM if use_color else ""
+    r = RESET if use_color else ""
+    hints: list[str] = []
+
+    if not recurse and boundaries_found > 0:
+        hints.append(f"{boundaries_found} handler boundaries found — re-run with --recurse to explore them")
+
+    if not lookahead:
+        hints.append("--lookahead probes common segments one level deeper")
+
+    if sorted(methods) == ["GET", "POST"]:
+        hints.append("-m GET,POST,PUT,DELETE,PATCH for broader method coverage")
+
+    if not hints:
+        return
+
+    print(file=sys.stderr)
+    for hint in hints:
+        print(f"  {d}{hint}{r}", file=sys.stderr)

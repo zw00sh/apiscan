@@ -34,7 +34,7 @@ from apiscan.inference import (
     compute_signature,
     matches_baseline,
 )
-from apiscan.kite import Route, render_body, render_headers, render_path, render_query
+from apiscan.kite import Route
 from apiscan.output import ScanResult
 from apiscan.scantree import BoundaryGroup, ScanTree, _LOOKAHEAD_SEGMENTS
 
@@ -407,15 +407,7 @@ async def scan(
                 new_path = f"{prefix}{route.template_path}"
                 key = (new_path, route.method)
                 if key not in tree._seen:
-                    new_route = Route(
-                        template_path=new_path, method=route.method,
-                        path_crumbs=route.path_crumbs,
-                        header_crumbs=route.header_crumbs,
-                        query_crumbs=route.query_crumbs,
-                        body_crumbs=route.body_crumbs,
-                        content_types=route.content_types,
-                        source_api_url=route.source_api_url,
-                    )
+                    new_route = Route(template_path=new_path, method=route.method)
                     tree.insert(new_route)
                     wq.enqueue(2, _RouteWork(route=new_route))
                     tracker.plan(1)
@@ -486,18 +478,13 @@ async def scan(
                     on_progress(0)
                 return
 
-            path = render_path(route)
-            query = render_query(route)
+            path = route.template_path
             url = f"{base_url}{path}"
-            if query:
-                url += f"?{query}"
             if len(url) > 2000:
                 url = url[:2000]
 
-            headers = render_headers(route)
-            body_str = render_body(route) if route.method != "GET" else None
-            if body_str and not any(k.lower() == "content-type" for k in headers):
-                headers["Content-Type"] = "application/json"
+            headers: dict[str, str] = {}
+            body_str: str | None = None
 
             if limiter:
                 await limiter.acquire()

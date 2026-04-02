@@ -9,8 +9,10 @@ import tempfile
 from apiscan.output import (
     CSVWriter,
     ScanResult,
+    format_findings_tree,
     format_result,
     print_banner,
+    print_hints,
 )
 
 
@@ -179,3 +181,108 @@ class TestBanner:
         print_banner("http://example.com", 100, ["GET", "POST", "PUT"], use_color=False)
         output = capsys.readouterr().out
         assert "GET, POST, PUT" in output
+
+    def test_banner_shows_http_config(self, capsys):
+        print_banner("http://example.com", 90, ["GET"], use_color=False,
+                     concurrency=20, rate_limit=50.0, timeout=5.0)
+        output = capsys.readouterr().out
+        assert "20 workers" in output
+        assert "50 req/s" in output
+        assert "5.0s timeout" in output
+
+    def test_banner_unlimited_rate(self, capsys):
+        print_banner("http://example.com", 90, ["GET"], use_color=False)
+        output = capsys.readouterr().out
+        assert "unlimited" in output
+
+    def test_banner_features(self, capsys):
+        print_banner("http://example.com", 90, ["GET"], use_color=False,
+                     recurse=True, lookahead=True)
+        output = capsys.readouterr().out
+        assert "--recurse" in output
+        assert "--lookahead" in output
+
+    def test_banner_no_features_line_when_none(self, capsys):
+        print_banner("http://example.com", 90, ["GET"], use_color=False)
+        output = capsys.readouterr().out
+        assert "features:" not in output
+
+
+class TestFindingsTree:
+    def test_empty_results(self):
+        assert format_findings_tree([], use_color=False) == ""
+
+    def test_single_result(self):
+        results = [_make_result(path="/api/users", status_code=200, method="GET")]
+        tree = format_findings_tree(results, use_color=False)
+        assert "api/users" in tree
+        assert "200 GET" in tree
+
+    def test_multiple_methods_same_path(self):
+        results = [
+            _make_result(path="/api/users", status_code=200, method="GET"),
+            _make_result(path="/api/users", status_code=201, method="POST"),
+        ]
+        tree = format_findings_tree(results, use_color=False)
+        assert "200 GET" in tree
+        assert "201 POST" in tree
+
+    def test_tree_structure(self):
+        results = [
+            _make_result(path="/api/v1/users", status_code=200, method="GET"),
+            _make_result(path="/api/v1/health", status_code=200, method="GET"),
+            _make_result(path="/admin/dashboard", status_code=401, method="GET"),
+        ]
+        tree = format_findings_tree(results, use_color=False)
+        assert "api/v1" in tree  # collapsed chain
+        assert "users" in tree
+        assert "health" in tree
+        assert "admin" in tree
+        assert "dashboard" in tree
+
+    def test_tree_connectors(self):
+        results = [
+            _make_result(path="/a/x"),
+            _make_result(path="/b/y"),
+        ]
+        tree = format_findings_tree(results, use_color=False)
+        assert "├──" in tree or "└──" in tree
+
+
+class TestHints:
+    def test_recurse_hint_when_boundaries(self, capsys):
+        print_hints(recurse=False, lookahead=True, methods=["GET", "POST", "PUT"],
+                    boundaries_found=3, use_color=False)
+        output = capsys.readouterr().err
+        assert "3 handler boundaries" in output
+        assert "--recurse" in output
+
+    def test_no_recurse_hint_when_already_set(self, capsys):
+        print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
+                    boundaries_found=3, use_color=False)
+        output = capsys.readouterr().err
+        assert "--recurse" not in output
+
+    def test_lookahead_hint(self, capsys):
+        print_hints(recurse=True, lookahead=False, methods=["GET", "POST", "PUT"],
+                    boundaries_found=0, use_color=False)
+        output = capsys.readouterr().err
+        assert "--lookahead" in output
+
+    def test_methods_hint_for_default(self, capsys):
+        print_hints(recurse=True, lookahead=True, methods=["GET", "POST"],
+                    boundaries_found=0, use_color=False)
+        output = capsys.readouterr().err
+        assert "broader method coverage" in output
+
+    def test_no_methods_hint_for_custom(self, capsys):
+        print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
+                    boundaries_found=0, use_color=False)
+        output = capsys.readouterr().err
+        assert "method coverage" not in output
+
+    def test_no_hints_when_all_enabled(self, capsys):
+        print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
+                    boundaries_found=0, use_color=False)
+        output = capsys.readouterr().err
+        assert output.strip() == ""

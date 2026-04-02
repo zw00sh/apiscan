@@ -12,9 +12,12 @@ the same pipeline.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from apiscan.kite import Route
 
@@ -328,25 +331,34 @@ class InferenceEngine:
         node = self._tree.lookup_baseline(path, route.method)
 
         if node is None:
+            logger.debug("%s %s: no baseline available", route.method, path)
             return [Finding(route=route, signature=sig,
                             reason="no baseline available", confidence="low")]
 
         prefix, baseline = node
         baseline_ref = baseline.signatures[0]
+        logger.debug("%s %s: baseline at %s (status=%d, ct=%s, len=%d)",
+                     route.method, path, prefix, baseline_ref.status_code,
+                     baseline_ref.content_type, baseline_ref.content_length)
 
         # Check nearest baseline, then ancestors.
         # Nearest match → try alternate methods before filtering.
         # Ancestor match → filter (default handler leaking through).
         match_reason = matches_baseline(sig, baseline, path_len)
         if match_reason is not None:
+            logger.debug("%s %s: matches nearest baseline (%s), trying alt methods",
+                         route.method, path, match_reason)
             alt_findings = await self._try_alternate_methods(
                 route, path, path_len, prefix, send_fn)
             if alt_findings:
+                logger.debug("%s %s: alt methods found %d findings",
+                             route.method, path, len(alt_findings))
                 return alt_findings
             self._on_filtered(route, path, sig, f"baseline match at {prefix}: {match_reason}")
             return []
 
         if self._matches_any_ancestor(sig, path, route.method, path_len):
+            logger.debug("%s %s: matches ancestor baseline, filtering", route.method, path)
             self._on_filtered(route, path, sig, "matches ancestor baseline")
             return []
 
@@ -360,8 +372,10 @@ class InferenceEngine:
             method_sig = await send_fn(alt_method, path, None, None)
             method_probe_status = method_sig.status_code
             method_allow = method_sig.allow
+            logger.debug("%s %s: verification %s -> status=%d, allow=%s",
+                         route.method, path, alt_method, method_probe_status, method_allow)
         except Exception:
-            pass
+            logger.debug("%s %s: verification %s failed", route.method, path, alt_method)
 
         # Check for new headers
         new_headers = sig.header_names - baseline_ref.header_names
@@ -377,10 +391,14 @@ class InferenceEngine:
         if not reason_parts:
             reason_parts = ["response differs from baseline"]
 
+        confidence = _score_confidence(reason_parts)
+        logger.debug("%s %s: finding -> reason=%s, confidence=%s",
+                     route.method, path, ", ".join(reason_parts), confidence)
+
         return [Finding(
             route=route, signature=sig,
             reason=", ".join(reason_parts),
-            confidence=_score_confidence(reason_parts),
+            confidence=confidence,
         )]
 
     # ------------------------------------------------------------------
@@ -418,23 +436,33 @@ class InferenceEngine:
         deviations: list[tuple[str, ResponseSignature, Baseline]] = []
         for method, sig in results:
             if sig is None:
+                logger.debug("alt %s %s: probe failed", method, path)
                 continue
             if self._filter_status(sig.status_code):
+                logger.debug("alt %s %s: status-filtered (%d)", method, path, sig.status_code)
                 continue
             if is_known_bad_site(sig):
+                logger.debug("alt %s %s: known bad site", method, path)
                 continue
             if self._matches_any_ancestor(sig, path, method, path_len):
+                logger.debug("alt %s %s: matches ancestor baseline", method, path)
                 continue
 
             node = self._tree.lookup_baseline(path, method)
             if node is None:
+                logger.debug("alt %s %s: no baseline", method, path)
                 continue
             bl_prefix, method_baseline = node
             if len(bl_prefix) < len(match_prefix):
+                logger.debug("alt %s %s: baseline at %s more distant than match at %s",
+                             method, path, bl_prefix, match_prefix)
                 continue
             if matches_baseline(sig, method_baseline, path_len) is not None:
+                logger.debug("alt %s %s: matches its own baseline at %s", method, path, bl_prefix)
                 continue
 
+            logger.debug("alt %s %s: deviation (status=%d, ct=%s, len=%d)",
+                         method, path, sig.status_code, sig.content_type, sig.content_length)
             deviations.append((method, sig, method_baseline))
 
         if not deviations:
