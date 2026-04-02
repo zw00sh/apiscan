@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import os
 import sys
 import time
@@ -116,9 +115,6 @@ def _parse_codes(raw: str | None) -> set[int] | None:
 # ---------------------------------------------------------------------------
 
 async def _scan(args: argparse.Namespace) -> None:
-    if args.debug:
-        logging.basicConfig(level=logging.DEBUG, format="%(name)s: %(message)s", stream=sys.stderr)
-
     use_color = supports_color() and not args.no_color
 
     d = DIM if use_color else ""
@@ -209,14 +205,20 @@ async def _scan(args: argparse.Namespace) -> None:
         if progress:
             progress.set_phase(label, phase_total)
 
-    def on_filtered(method: str, path: str, status: int, reason: str) -> None:
-        if not args.debug:
-            return
+    def _debug_print(msg: str) -> None:
         d2 = DIM if use_color else ""
         r2 = RESET if use_color else ""
         if progress:
             print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
-        print(f"{d2}  filtered {method:<7} {status:>3} {path} -- {reason}{r2}", file=sys.stderr)
+        print(f"{d2}  {msg}{r2}", file=sys.stderr)
+
+    def on_filtered(method: str, path: str, status: int, reason: str) -> None:
+        if not args.debug:
+            return
+        _debug_print(f"filtered {method:<7} {status:>3} {path} -- {reason}")
+
+    def on_debug(msg: str) -> None:
+        _debug_print(msg)
 
     def on_recurse(prefix: str, new_routes: int, depth: int) -> None:
         m = MAGENTA if use_color else ""
@@ -255,6 +257,7 @@ async def _scan(args: argparse.Namespace) -> None:
             on_result=on_result_tracking,
             on_progress=on_progress,
             on_filtered=on_filtered,
+            on_debug=on_debug if args.debug else None,
             on_recurse=on_recurse if args.recurse else None,
             tracker=req_tracker,
             recurse=args.recurse,

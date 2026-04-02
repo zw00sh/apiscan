@@ -215,6 +215,7 @@ async def scan(
     on_result: Callable[[ScanResult], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
     on_filtered: Callable[[str, str, int, str], None] | None = None,
+    on_debug: Callable[[str], None] | None = None,
     on_recurse: Callable[[str, int, int], None] | None = None,
     tracker: RequestTracker | None = None,
     recurse: bool = False,
@@ -245,6 +246,7 @@ async def scan(
         status_blacklist=status_blacklist,
         status_whitelist=status_whitelist,
         on_filtered=_inference_filtered,
+        on_debug=on_debug,
         tracker=tracker,
         methods=methods,
     )

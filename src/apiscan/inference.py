@@ -12,12 +12,9 @@ the same pipeline.
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
-
-logger = logging.getLogger(__name__)
 
 from apiscan.kite import Route
 
@@ -250,6 +247,7 @@ class InferenceEngine:
         status_blacklist: set[int] | None = None,
         status_whitelist: set[int] | None = None,
         on_filtered=None,
+        on_debug: Callable[[str], None] | None = None,
         tracker=None,
         methods: list[str] | None = None,
     ) -> None:
@@ -258,11 +256,16 @@ class InferenceEngine:
         self._status_blacklist = status_blacklist
         self._status_whitelist = status_whitelist
         self._on_filtered_cb = on_filtered
+        self._on_debug_cb = on_debug
         self._tracker = tracker
 
     def _on_filtered(self, route: Route, path: str, sig: ResponseSignature, reason: str) -> None:
         if self._on_filtered_cb:
             self._on_filtered_cb(route, path, sig, reason)
+
+    def _debug(self, msg: str) -> None:
+        if self._on_debug_cb:
+            self._on_debug_cb(msg)
 
     def _filter_status(self, status: int) -> bool:
         if self._status_whitelist and status not in self._status_whitelist:
@@ -318,6 +321,8 @@ class InferenceEngine:
         Returns a list of findings (empty if filtered).  Safe for
         concurrent calls from multiple workers.
         """
+        trace: list[str] = []  # collected for single-line debug output
+
         # Pre-filters
         if self._filter_status(sig.status_code):
             self._on_filtered(route, path, sig, f"status filter: {sig.status_code}")
@@ -331,36 +336,32 @@ class InferenceEngine:
         node = self._tree.lookup_baseline(path, route.method)
 
         if node is None:
-            logger.debug("%s %s: no baseline available", route.method, path)
+            self._debug(f"{route.method:<7} {sig.status_code:>3} {path} -- no baseline")
             return [Finding(route=route, signature=sig,
                             reason="no baseline available", confidence="low")]
 
         prefix, baseline = node
         baseline_ref = baseline.signatures[0]
-        logger.debug("%s %s: baseline at %s (status=%d, ct=%s, len=%d)",
-                     route.method, path, prefix, baseline_ref.status_code,
-                     baseline_ref.content_type, baseline_ref.content_length)
+        trace.append(f"bl={prefix}({baseline_ref.status_code})")
 
         # Check nearest baseline, then ancestors.
         # Nearest match → try alternate methods before filtering.
         # Ancestor match → filter (default handler leaking through).
         match_reason = matches_baseline(sig, baseline, path_len)
         if match_reason is not None:
-            logger.debug("%s %s: matches nearest baseline (%s), trying alt methods",
-                         route.method, path, match_reason)
+            trace.append("matches baseline")
             alt_findings = await self._try_alternate_methods(
-                route, path, path_len, prefix, send_fn)
+                route, path, path_len, prefix, send_fn, trace)
             if alt_findings:
-                logger.debug("%s %s: alt methods found %d findings",
-                             route.method, path, len(alt_findings))
                 return alt_findings
             self._on_filtered(route, path, sig, f"baseline match at {prefix}: {match_reason}")
             return []
 
         if self._matches_any_ancestor(sig, path, route.method, path_len):
-            logger.debug("%s %s: matches ancestor baseline, filtering", route.method, path)
             self._on_filtered(route, path, sig, "matches ancestor baseline")
             return []
+
+        trace.append(f"deviates({sig.status_code})")
 
         # Verification: method change probe
         if self._tracker:
@@ -372,10 +373,12 @@ class InferenceEngine:
             method_sig = await send_fn(alt_method, path, None, None)
             method_probe_status = method_sig.status_code
             method_allow = method_sig.allow
-            logger.debug("%s %s: verification %s -> status=%d, allow=%s",
-                         route.method, path, alt_method, method_probe_status, method_allow)
+            verify = f"verify {alt_method}={method_probe_status}"
+            if method_allow:
+                verify += f" allow={method_allow}"
+            trace.append(verify)
         except Exception:
-            logger.debug("%s %s: verification %s failed", route.method, path, alt_method)
+            trace.append(f"verify {alt_method}=err")
 
         # Check for new headers
         new_headers = sig.header_names - baseline_ref.header_names
@@ -392,8 +395,8 @@ class InferenceEngine:
             reason_parts = ["response differs from baseline"]
 
         confidence = _score_confidence(reason_parts)
-        logger.debug("%s %s: finding -> reason=%s, confidence=%s",
-                     route.method, path, ", ".join(reason_parts), confidence)
+        trace.append(f"-> {confidence}")
+        self._debug(f"{route.method:<7} {sig.status_code:>3} {path} -- {', '.join(trace)}")
 
         return [Finding(
             route=route, signature=sig,
@@ -412,6 +415,7 @@ class InferenceEngine:
         path_len: int,
         match_prefix: str,
         send_fn,
+        trace: list[str] | None = None,
     ) -> list[Finding]:
         """Probe all alternate HTTP methods in parallel.
 
@@ -436,36 +440,28 @@ class InferenceEngine:
         deviations: list[tuple[str, ResponseSignature, Baseline]] = []
         for method, sig in results:
             if sig is None:
-                logger.debug("alt %s %s: probe failed", method, path)
                 continue
             if self._filter_status(sig.status_code):
-                logger.debug("alt %s %s: status-filtered (%d)", method, path, sig.status_code)
                 continue
             if is_known_bad_site(sig):
-                logger.debug("alt %s %s: known bad site", method, path)
                 continue
             if self._matches_any_ancestor(sig, path, method, path_len):
-                logger.debug("alt %s %s: matches ancestor baseline", method, path)
                 continue
 
             node = self._tree.lookup_baseline(path, method)
             if node is None:
-                logger.debug("alt %s %s: no baseline", method, path)
                 continue
             bl_prefix, method_baseline = node
             if len(bl_prefix) < len(match_prefix):
-                logger.debug("alt %s %s: baseline at %s more distant than match at %s",
-                             method, path, bl_prefix, match_prefix)
                 continue
             if matches_baseline(sig, method_baseline, path_len) is not None:
-                logger.debug("alt %s %s: matches its own baseline at %s", method, path, bl_prefix)
                 continue
 
-            logger.debug("alt %s %s: deviation (status=%d, ct=%s, len=%d)",
-                         method, path, sig.status_code, sig.content_type, sig.content_length)
             deviations.append((method, sig, method_baseline))
 
         if not deviations:
+            if trace is not None:
+                trace.append(f"alt {'/'.join(alt_methods)}=none")
             return []
 
         # Group deviations by response fingerprint
@@ -483,11 +479,17 @@ class InferenceEngine:
             reason_parts = _build_reason(sig, baseline_ref)
             if not reason_parts:
                 reason_parts = ["responds differently"]
+            confidence = _score_confidence(reason_parts)
             findings.append(Finding(
                 route=replace(route, method=methods_found[0]),
                 signature=sig,
                 reason=f"via {', '.join(methods_found)}: {', '.join(reason_parts)}",
-                confidence=_score_confidence(reason_parts),
+                confidence=confidence,
             ))
+
+        if trace is not None:
+            alt_summary = ", ".join(f"{f.route.method}={f.signature.status_code}" for f in findings)
+            trace.append(f"alt -> {alt_summary}")
+            self._debug(f"{route.method:<7} {sig.status_code:>3} {path} -- {', '.join(trace)}")
 
         return findings
