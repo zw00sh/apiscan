@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.resources
 import os
 import sys
 import time
@@ -40,15 +41,18 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="apiscan",
         description="Method-aware API content discovery using wordlists",
     )
-    sub = p.add_subparsers(dest="command")
+    p.add_argument("-u", "--url", required=True, help="Target base URL")
 
-    # -- scan --
-    sc = sub.add_parser("scan", help="Scan a target using a wordlist")
-    sc.add_argument("-w", "--wordlist", required=True, metavar="PATH",
-                    help="Path to a wordlist file (one path per line)")
-    sc.add_argument("-u", "--url", required=True, help="Target base URL")
+    wordlist = p.add_argument_group("wordlist")
+    wl_mutex = wordlist.add_mutually_exclusive_group()
+    wl_mutex.add_argument("-w", "--wordlist", default=None, metavar="PATH",
+                          help="Custom wordlist file (one path per line)")
+    wl_mutex.add_argument("--short", action="store_true",
+                          help="Use built-in top 1k wordlist (fast)")
+    wl_mutex.add_argument("--long", action="store_true",
+                          help="Use built-in top 100k wordlist (thorough)")
 
-    recursion = sc.add_argument_group("recursion")
+    recursion = p.add_argument_group("recursion")
     recursion.add_argument("--recurse", action="store_true",
                            help="Re-apply the full wordlist under each discovered handler boundary (e.g. /api → /api/users, /api/health)")
     recursion.add_argument("--max-depth", type=int, default=2,
@@ -56,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
     recursion.add_argument("--lookahead", action="store_true",
                            help="Probe common path segments (api, v1, admin, …) one level deeper at leaf nodes to find hidden N+1 boundaries")
 
-    http = sc.add_argument_group("http")
+    http = p.add_argument_group("http")
     http.add_argument("-m", "--methods", default="GET,POST",
                       help="HTTP methods to probe, comma-separated (default: GET,POST). Use GET,POST,PUT,DELETE,PATCH for full coverage")
     http.add_argument("-c", "--concurrency", type=int, default=10,
@@ -70,15 +74,15 @@ def _build_parser() -> argparse.ArgumentParser:
     http.add_argument("-H", "--header", action="append", default=[], metavar="K:V",
                       help="Extra header (repeatable, e.g. -H 'Authorization: Bearer TOKEN')")
 
-    filtering = sc.add_argument_group("filtering")
-    filtering.add_argument("--status-codes", default=None,
-                           help="Whitelist status codes, comma-separated (e.g. 200,301,403)")
-    filtering.add_argument("--blacklist-codes", default=None,
-                           help="Blacklist status codes, comma-separated (e.g. 404,500)")
+    filtering = p.add_argument_group("filtering")
+    filtering.add_argument("-i", "--include", default=None, metavar="CODES",
+                           help="Only report these status codes, comma-separated (e.g. 200,301,403)")
+    filtering.add_argument("-e", "--exclude", default=None, metavar="CODES",
+                           help="Never report these status codes, comma-separated (e.g. 429,500)")
     filtering.add_argument("--no-skip-wildcard-siblings", action="store_true",
                            help="Probe all segment-prefix siblings individually instead of skipping them when a wildcard handler is detected")
 
-    output = sc.add_argument_group("output")
+    output = p.add_argument_group("output")
     output.add_argument("-o", "--output", default=None, metavar="PATH",
                         help="Write CSV results to file (includes curl replay column)")
     output.add_argument("--replay-proxy", default=None, metavar="URL",
@@ -116,6 +120,21 @@ def _parse_codes(raw: str | None) -> set[int] | None:
 # Scan
 # ---------------------------------------------------------------------------
 
+def _resolve_wordlist(args: argparse.Namespace) -> str:
+    """Return the wordlist path from args, defaulting to the built-in 10k list."""
+    if args.wordlist:
+        return args.wordlist
+    if args.short:
+        name = "api-top-1k.txt"
+    elif args.long:
+        name = "api-top-100k.txt"
+    else:
+        name = "api-top-10k.txt"
+    ref = importlib.resources.files("apiscan") / "wordlists" / name
+    with importlib.resources.as_file(ref) as p:
+        return str(p)
+
+
 async def _scan(args: argparse.Namespace) -> None:
     use_color = supports_color() and not args.no_color
 
@@ -130,7 +149,8 @@ async def _scan(args: argparse.Namespace) -> None:
             print(f"error: unknown method '{m}' (valid: {', '.join(sorted(valid))})", file=sys.stderr)
             sys.exit(1)
 
-    routes = load_wordlist(args.wordlist)
+    wordlist_path = _resolve_wordlist(args)
+    routes = load_wordlist(wordlist_path)
 
     if not args.quiet:
         print_banner(args.url, len(routes), scan_methods, use_color,
@@ -247,8 +267,8 @@ async def _scan(args: argparse.Namespace) -> None:
             rate_limit=args.rate,
             timeout=args.timeout,
             max_redirects=args.max_redirects,
-            status_blacklist=_parse_codes(args.blacklist_codes),
-            status_whitelist=_parse_codes(args.status_codes),
+            status_blacklist=_parse_codes(args.exclude),
+            status_whitelist=_parse_codes(args.include),
             extra_headers=_parse_headers(args.header),
             on_phase=on_phase,
             on_result=on_result_tracking,
@@ -309,17 +329,8 @@ def cli() -> None:
     args = parser.parse_args()
 
     try:
-        if args.command == "scan":
-            try:
-                asyncio.run(_scan(args))
-            except KeyboardInterrupt:
-                # _scan handles its own interrupt for summary/tree/hints
-                sys.exit(130)
-        else:
-            parser.print_help()
-            sys.exit(1)
+        asyncio.run(_scan(args))
     except KeyboardInterrupt:
-        print(f"\n\n  interrupted", file=sys.stderr)
         sys.exit(130)
 
 

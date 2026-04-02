@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from apiscan.__main__ import _build_parser
 
 
@@ -10,7 +12,7 @@ class TestShortFlags:
 
     def _parse(self, *args: str):
         parser = _build_parser()
-        return parser.parse_args(["scan", *args])
+        return parser.parse_args([*args])
 
     def test_url(self):
         ns = self._parse("-u", "http://x", "-w", "/tmp/wl.txt")
@@ -59,3 +61,45 @@ class TestShortFlags:
         assert ns.rate == 10.0
         assert ns.timeout == 3.0
         assert ns.quiet is True
+
+    def test_include_exclude(self):
+        ns = self._parse("-u", "http://x", "-i", "200,301", "-e", "500")
+        assert ns.include == "200,301"
+        assert ns.exclude == "500"
+
+
+class TestWordlistSelection:
+    """--short, --long, and -w are mutually exclusive; default is 10k."""
+
+    def _parse(self, *args: str):
+        parser = _build_parser()
+        return parser.parse_args([*args])
+
+    def test_default_no_wordlist(self):
+        ns = self._parse("-u", "http://x")
+        assert ns.wordlist is None
+        assert ns.short is False
+        assert getattr(ns, "long") is False
+
+    def test_short_flag(self):
+        ns = self._parse("-u", "http://x", "--short")
+        assert ns.short is True
+        assert ns.wordlist is None
+
+    def test_long_flag(self):
+        ns = self._parse("-u", "http://x", "--long")
+        assert getattr(ns, "long") is True
+        assert ns.wordlist is None
+
+    def test_custom_wordlist(self):
+        ns = self._parse("-u", "http://x", "-w", "/tmp/custom.txt")
+        assert ns.wordlist == "/tmp/custom.txt"
+        assert ns.short is False
+
+    def test_short_and_wordlist_mutex(self):
+        with pytest.raises(SystemExit):
+            self._parse("-u", "http://x", "--short", "-w", "/tmp/wl.txt")
+
+    def test_short_and_long_mutex(self):
+        with pytest.raises(SystemExit):
+            self._parse("-u", "http://x", "--short", "--long")
