@@ -7,10 +7,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from apiscan.kite import FilterStats
 
 # ---------------------------------------------------------------------------
 # ANSI colors
@@ -174,23 +171,17 @@ BANNER = " ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █\n █�
 
 
 def print_banner(target: str, route_count: int,
-                 unsafe_keywords: bool,
-                 stats: FilterStats, use_color: bool = True) -> None:
+                 methods: list[str], use_color: bool = True) -> None:
     b = BOLD if use_color else ""
     r = RESET if use_color else ""
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
-    y = YELLOW if use_color else ""
-    g = GREEN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
     print(f" {d}api content discovery · v0.15.0{r}\n")
-    print(f"  target:  {target}")
-    print(f"  routes:  {route_count}")
-
-    if unsafe_keywords:
-        print(f"  filter:  {y}{b}keywords disabled{r} {d}-- no keyword filter{r}")
-    elif stats.keyword_filtered:
-        print(f"  filter:  {g}{b}keywords active{r} {d}-- {stats.keyword_filtered} routes filtered by keyword{r}")
+    print(f"  target:   {target}")
+    print(f"  routes:   {route_count}")
+    g = GREEN if use_color else ""
+    print(f"  methods:  {g}{b}{', '.join(methods)}{r}")
     print()
 
 
@@ -259,6 +250,7 @@ class ProgressTracker:
         self._last_print = 0.0
         self._start = time.monotonic()
         self._window: deque[float] = deque()
+        self._finished = False
 
     @property
     def route_total(self) -> int:
@@ -272,6 +264,8 @@ class ProgressTracker:
 
     def tick_request(self) -> None:
         """Record a completed HTTP request for req/s calculation."""
+        if self._finished:
+            return
         now = time.monotonic()
         self._window.append(now)
         cutoff = now - 3.0
@@ -290,6 +284,14 @@ class ProgressTracker:
             self._print(now)
             self._last_print = now
 
+    def finish(self) -> None:
+        """Print final status line and stop further updates."""
+        if self._finished:
+            return
+        self._finished = True
+        self._print(time.monotonic())
+        print(file=sys.stderr)
+
     def _print(self, now: float) -> None:
         d = DIM if self._use_color else ""
         c = CYAN if self._use_color else ""
@@ -304,6 +306,14 @@ class ProgressTracker:
         reqs_sent = self._tracker.sent if self._tracker else 0
         reqs_total = self._tracker.planned if self._tracker else 0
 
+        # Queue depth and stage from tracker
+        queued = 0
+        stage = ""
+        if self._tracker and self._tracker.queue_size:
+            queued = self._tracker.queue_size()
+        if self._tracker and self._tracker.stage:
+            stage = self._tracker.stage()
+
         # Request rate from sliding window
         if len(self._window) > 1:
             span = self._window[-1] - self._window[0]
@@ -311,26 +321,32 @@ class ProgressTracker:
         else:
             rps = 0
 
-        hidden_str = f" {d}| {self.hidden} hidden{r}" if self.hidden else ""
+        hidden_str = f"| {d}{self.hidden} hidden{r} " if self.hidden else ""
+        if queued >= 1000:
+            queue_str = f"{d}({queued / 1000:.1f}k queued){r}"
+        elif queued:
+            queue_str = f"{d}({queued} queued){r}"
+        else:
+            queue_str = ""
 
         # Show if route total grew from recursion
         recurse_str = ""
         if self._tracker and hasattr(self._tracker, 'routes_planned'):
             if self._tracker.routes_planned > self._initial_route_total:
                 added = self._tracker.routes_planned - self._initial_route_total
-                recurse_str = f" {d}| +{added} recursive{r}"
+                recurse_str = f"| {d}+{added} recursive{r} "
+
+        stage_str = f"| {d}{stage}{r} " if stage else ""
 
         print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
         line = (f"[{g}{route_bar}{r}{d}{route_pct:02.0f}%{r}] "
                 f"|   {d}{self.routes_completed}/{self.route_total} routes{r} "
-                f"| {d}{reqs_sent}/{reqs_total} reqs{r} "
-                f"{d}({rps:.0f} req/s){r} "
-                f"| {c}{self.findings} found{r}"
+                f"| {d}{rps:.0f} req/s{r} {queue_str} "
+                f"| {c}{self.findings} found{r} "
+                f"{stage_str}"
                 f"{recurse_str}"
                 f"{hidden_str}")
         print(f"\r{line}", end="", flush=True, file=sys.stderr)
-        if self.routes_completed == self.route_total:
-            print(file=sys.stderr)
 
 
 def print_summary(findings: int, total_candidates: int, total_requests: int,

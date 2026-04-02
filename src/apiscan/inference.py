@@ -38,6 +38,7 @@ class ResponseSignature:
     word_count: int
     line_count: int
     header_names: frozenset[str]
+    allow: str = ""
 
 
 @dataclass
@@ -94,6 +95,7 @@ def compute_signature(
         word_count=word_count,
         line_count=line_count,
         header_names=frozenset(k.lower() for k in headers),
+        allow=headers.get("allow", headers.get("Allow", "")),
     )
 
 
@@ -177,13 +179,17 @@ def _build_reason(
     baseline_ref: ResponseSignature,
     *,
     method_probe_status: int | None = None,
+    allow_header: str = "",
     new_headers: frozenset[str] | None = None,
 ) -> list[str]:
     parts: list[str] = []
     if sig.content_type != baseline_ref.content_type:
         parts.append(f"content-type: {baseline_ref.content_type} -> {sig.content_type}")
     if method_probe_status == 405:
-        parts.append("method-sensitive: 405 Method Not Allowed")
+        label = f"method-sensitive: 405 Method Not Allowed"
+        if allow_header:
+            label += f" (allow: {allow_header})"
+        parts.append(label)
     elif method_probe_status is not None and method_probe_status != sig.status_code:
         parts.append(f"method-sensitive: {method_probe_status} on alternate verb")
     if sig.status_code != baseline_ref.status_code:
@@ -221,7 +227,7 @@ def _score_confidence(reason_parts: list[str]) -> str:
 # Probe helpers
 # ---------------------------------------------------------------------------
 
-_ALTERNATE_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"]
+DEFAULT_METHODS = ["GET", "POST"]
 
 
 def _random_segment() -> str:
@@ -242,8 +248,10 @@ class InferenceEngine:
         status_whitelist: set[int] | None = None,
         on_filtered=None,
         tracker=None,
+        methods: list[str] | None = None,
     ) -> None:
         self._tree = tree
+        self._methods = methods or DEFAULT_METHODS
         self._status_blacklist = status_blacklist
         self._status_whitelist = status_whitelist
         self._on_filtered_cb = on_filtered
@@ -340,10 +348,12 @@ class InferenceEngine:
         if self._tracker:
             self._tracker.plan(1)
         method_probe_status: int | None = None
-        alt_method = [m for m in _ALTERNATE_METHODS if m != route.method][0]
+        method_allow: str = ""
+        alt_method = [m for m in self._methods if m != route.method][0]
         try:
             method_sig = await send_fn(alt_method, path, None, None)
             method_probe_status = method_sig.status_code
+            method_allow = method_sig.allow
         except Exception:
             pass
 
@@ -356,6 +366,7 @@ class InferenceEngine:
         reason_parts = _build_reason(
             sig, baseline_ref,
             method_probe_status=method_probe_status,
+            allow_header=method_allow,
             new_headers=new_headers if new_headers else None,
         )
         if not reason_parts:
@@ -383,7 +394,7 @@ class InferenceEngine:
         return 400, that's one finding with both methods in the reason.
         """
         path_len = len(path.lstrip("/"))
-        alt_methods = [m for m in _ALTERNATE_METHODS if m != route.method]
+        alt_methods = [m for m in self._methods if m != route.method]
         if self._tracker:
             self._tracker.plan(len(alt_methods))
 

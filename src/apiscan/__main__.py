@@ -14,7 +14,7 @@ import warnings
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from apiscan.kite import Route, apply_safety_filter, load_kite, route_from_dict, route_to_dict
+from apiscan.kite import Route, load_kite, route_from_dict, route_to_dict
 from apiscan.wordlist import load_wordlist
 from apiscan.output import (
     BOLD,
@@ -234,10 +234,6 @@ def _build_parser() -> argparse.ArgumentParser:
     scan_mode.add_argument("--short", action="store_true",
                            help="Deduplicated scan (~30k routes appearing in 2+ APIs)")
 
-    safety = sc.add_argument_group("safety")
-    safety.add_argument("--unsafe-keywords", action="store_true",
-                        help="Disable keyword filtering for dangerous paths")
-
     recursion = sc.add_argument_group("recursion")
     recursion.add_argument("--recurse", action="store_true",
                            help="Re-apply wordlist under discovered handler boundaries")
@@ -247,6 +243,8 @@ def _build_parser() -> argparse.ArgumentParser:
                            help="Probe common path segments one level deeper to find hidden boundaries")
 
     http = sc.add_argument_group("http")
+    http.add_argument("--methods", default="GET,POST",
+                      help="HTTP methods to probe, comma-separated (default: GET,POST)")
     http.add_argument("--concurrency", type=int, default=10,
                       help="Max concurrent requests (default: 10)")
     http.add_argument("--rate", type=float, default=None,
@@ -339,6 +337,13 @@ async def _scan(args: argparse.Namespace) -> None:
     g = GREEN if use_color else ""
     c2 = CYAN if use_color else ""
 
+    scan_methods = [m.strip().upper() for m in args.methods.split(",") if m.strip()]
+    valid = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
+    for m in scan_methods:
+        if m not in valid:
+            print(f"error: unknown method '{m}' (valid: {', '.join(sorted(valid))})", file=sys.stderr)
+            sys.exit(1)
+
     routes: list[Route] = []
 
     # Load .kite routes (unless --wordlist is the sole source)
@@ -387,18 +392,8 @@ async def _scan(args: argparse.Namespace) -> None:
         routes.extend(wl_routes)
 
     if not args.quiet:
-        print(f"\r  {d}filtering {len(routes):,} routes...{' ' * 40}{r}", end="", flush=True)
-    unsafe_keywords = args.unsafe_keywords
-    filtered_routes, stats = apply_safety_filter(
-        routes, unsafe_methods=True, unsafe_keywords=unsafe_keywords,
-    )
-
-    # Route ordering is handled by complexity phasing in the scanner —
-    # bare paths first, then progressively heavier. Seeded shuffle within each phase.
-
-    if not args.quiet:
         print(f"\r{' ' * 80}\r", end="")  # clear the status line
-        print_banner(args.url, len(filtered_routes), unsafe_keywords, stats, use_color)
+        print_banner(args.url, len(routes), scan_methods, use_color)
 
     from apiscan.scanner import RequestTracker
     req_tracker = RequestTracker(
@@ -406,7 +401,7 @@ async def _scan(args: argparse.Namespace) -> None:
     )
 
     csv_writer = CSVWriter(args.output, replay_proxy=args.replay_proxy) if args.output else None
-    progress = ProgressTracker(len(filtered_routes), use_color, tracker=req_tracker) if not args.quiet else None
+    progress = ProgressTracker(len(routes), use_color, tracker=req_tracker) if not args.quiet else None
     # Re-bind the tick callback now that progress exists
     req_tracker._on_tick = progress.tick_request if progress else None
 
@@ -484,7 +479,7 @@ async def _scan(args: argparse.Namespace) -> None:
 
     findings, scan_tree = await scan(
         target_url=args.url,
-        routes=filtered_routes,
+        routes=routes,
         concurrency=args.concurrency,
         rate_limit=args.rate,
         timeout=args.timeout,
@@ -501,9 +496,13 @@ async def _scan(args: argparse.Namespace) -> None:
         recurse=args.recurse,
         max_depth=args.max_depth,
         lookahead=args.lookahead,
+        methods=scan_methods,
     )
 
     elapsed = time.monotonic() - start
+
+    if progress:
+        progress.finish()
 
     if replay_client:
         await replay_client.aclose()

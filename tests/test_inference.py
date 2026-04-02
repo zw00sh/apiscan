@@ -359,7 +359,7 @@ class TestInferenceProcess:
     @pytest.mark.asyncio
     async def test_alternate_methods_grouped(self):
         """Alternate method findings should be grouped by response fingerprint."""
-        tree, engine = _make_engine()
+        tree, engine = _make_engine(methods=["GET", "POST", "PUT"])
         tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html",
                                                       content_length=50)))
         tree.set_baseline("/", "POST", _baseline(_sig(status_code=404, content_type="text/html",

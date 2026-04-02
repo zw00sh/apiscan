@@ -17,22 +17,21 @@ from dataclasses import dataclass, field
 from apiscan.inference import (
     Baseline,
     ResponseSignature,
-    _ALTERNATE_METHODS,
+    DEFAULT_METHODS,
     _random_segment,
     build_baseline,
     matches_baseline,
 )
 from apiscan.kite import Route
 
-# Top 20 non-leaf path segments from routes-large.kite, by frequency.
-# Used by --lookahead to discover N+1 boundaries that require combining
-# multiple path segments (e.g. /users/v1 from flat wordlists).
-# Top 20 covers the high-value patterns; the long tail adds cost with
-# diminishing returns (#1 api=445k occurrences, #20 search=4.3k).
+# Structural path segments for --lookahead boundary discovery.
+# Focused on namespace/version/access-control prefixes — the scaffolding
+# that indicates different handlers or services.  Resource-level segments
+# (users, orders, etc.) are covered by the wordlist + recursion instead.
+# Derived from routes-large.kite and httparchive API routes, both positions.
 _LOOKAHEAD_SEGMENTS = [
-    "api", "v1", "user", "v2", "admin", "users", "app", "rest", "order",
-    "auth", "services", "account", "wx", "customer", "product", "sys", "v3",
-    "web", "report", "search",
+    "api", "v1", "v2", "rest", "admin", "auth", "public", "app", "v3",
+    "services", "sys",
 ]
 
 
@@ -168,12 +167,14 @@ class ScanTree:
     # Initialization (parallel)
     # ------------------------------------------------------------------
 
-    async def initialize(self, send_fn) -> None:
+    async def initialize(self, send_fn, methods: list[str] | None = None) -> None:
         """Establish root baselines by probing random paths.
 
         Sends 2 random-path probes per method in parallel to capture the
         default handler response for each HTTP verb.
         """
+        methods = methods or DEFAULT_METHODS
+
         async def _probe(method: str, path: str) -> tuple[str, ResponseSignature | None]:
             try:
                 sig = await send_fn(method, path, None, None)
@@ -182,7 +183,7 @@ class ScanTree:
                 return method, None
 
         tasks = []
-        for method in _ALTERNATE_METHODS:
+        for method in methods:
             tasks.append(_probe(method, f"/{_random_segment()}"))
             tasks.append(_probe(method, f"/{_random_segment()}"))
 
@@ -202,6 +203,7 @@ class ScanTree:
 
     async def probe_prefix(
         self, prefix: str, send_fn, tracker=None,
+        methods: list[str] | None = None,
     ) -> BoundaryGroup | None:
         """Probe a prefix for handler boundaries across all methods.
 
@@ -213,10 +215,11 @@ class ScanTree:
         or ``None``.  Does NOT handle recursion or scheduling — the caller
         decides what to do with the result.
         """
+        methods = methods or DEFAULT_METHODS
         node = self._resolve_or_create(prefix)
 
         # Determine which methods need probing (skip already-probed)
-        methods_to_probe = [m for m in _ALTERNATE_METHODS
+        methods_to_probe = [m for m in methods
                             if m not in node.baselines
                             and self.lookup_baseline(prefix, m) is not None
                             and (self.lookup_baseline(prefix, m) or (None,))[0] != prefix]
@@ -253,7 +256,7 @@ class ScanTree:
             return method, probe_sig, ancestor_baseline
 
         # Fire all method probes in parallel
-        results = await asyncio.gather(*[_probe_method(m) for m in _ALTERNATE_METHODS])
+        results = await asyncio.gather(*[_probe_method(m) for m in methods])
 
         # Collect methods that need a second variance probe
         discoveries = [(m, sig, bl) for m, sig, bl in results if sig is not None]

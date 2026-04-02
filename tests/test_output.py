@@ -6,7 +6,6 @@ import csv
 import os
 import tempfile
 
-from apiscan.kite import FilterStats
 from apiscan.output import (
     CSVWriter,
     ScanResult,
@@ -167,32 +166,16 @@ class TestCSVWriter:
             os.unlink(path)
 
 
-class TestFilterStatsMessage:
-    def test_keywords_active_banner(self, capsys):
-        stats = FilterStats(
-            total=100, kept=90, method_filtered=0, keyword_filtered=10,
-            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
-        )
-        print_banner("http://example.com", 90, False, stats=stats, use_color=False)
-        output = capsys.readouterr().out
-        assert "keywords active" in output.lower()
-        assert "10 routes filtered by keyword" in output
-
-    def test_keywords_disabled_banner(self, capsys):
-        stats = FilterStats(
-            total=100, kept=100, method_filtered=0, keyword_filtered=0,
-            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
-        )
-        print_banner("http://example.com", 100, True, stats=stats, use_color=False)
-        output = capsys.readouterr().out
-        assert "keywords disabled" in output.lower()
-
-    def test_no_filter_line_when_nothing_filtered(self, capsys):
-        stats = FilterStats(
-            total=100, kept=100, method_filtered=0, keyword_filtered=0,
-            method_breakdown={"GET": 60, "POST": 25, "DELETE": 15},
-        )
-        print_banner("http://example.com", 100, False, stats=stats, use_color=False)
+class TestBanner:
+    def test_banner_shows_methods(self, capsys):
+        print_banner("http://example.com", 90, ["GET", "POST"], use_color=False)
         output = capsys.readouterr().out
         assert "target:" in output
         assert "routes:" in output
+        assert "methods:" in output
+        assert "GET, POST" in output
+
+    def test_banner_custom_methods(self, capsys):
+        print_banner("http://example.com", 100, ["GET", "POST", "PUT"], use_color=False)
+        output = capsys.readouterr().out
+        assert "GET, POST, PUT" in output

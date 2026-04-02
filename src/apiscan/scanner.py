@@ -77,12 +77,20 @@ class _WorkQueue:
     ``heapq`` never compares the work-item dataclasses directly.
     """
 
+    _STAGE_NAMES = {0: "wordlist", 1: "probing", 2: "recursing", 3: "exploring"}
+
     def __init__(self) -> None:
         self._pq: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self._order = itertools.count()
         self._inflight = 0
         self._done = asyncio.Event()
         self._done.set()  # no work yet → "done"
+        self.current_priority = 0
+
+    @property
+    def stage(self) -> str:
+        p = self.current_priority
+        return self._STAGE_NAMES.get(p, self._STAGE_NAMES[3])
 
     def enqueue(self, priority: int, item: Any) -> None:
         self._inflight += 1
@@ -91,7 +99,8 @@ class _WorkQueue:
 
     async def get(self) -> Any:
         """Pull the next item. Raises ``CancelledError`` on shutdown."""
-        _, _, item = await self._pq.get()
+        priority, _, item = await self._pq.get()
+        self.current_priority = priority
         return item
 
     def item_done(self) -> None:
@@ -133,6 +142,8 @@ class RequestTracker:
         self.sent = 0
         self.planned = initial_planned
         self.routes_planned = 0
+        self.queue_size: Callable[[], int] | None = None
+        self.stage: Callable[[], str] | None = None
         self._on_tick = on_tick
 
     def plan(self, n: int) -> None:
@@ -202,8 +213,11 @@ async def scan(
     recurse: bool = False,
     max_depth: int = 2,
     lookahead: bool = False,
+    methods: list[str] | None = None,
 ) -> tuple[list[ScanResult], ScanTree]:
     """Scan *target_url* with the given routes. Returns (findings, tree)."""
+    from apiscan.inference import DEFAULT_METHODS
+    methods = methods or DEFAULT_METHODS
     base_url = target_url.rstrip("/")
     limiter = RateLimiter(rate_limit) if rate_limit else None
     results: list[ScanResult] = []
@@ -212,7 +226,7 @@ async def scan(
 
     tree = ScanTree(routes)
 
-    tracker.plan(10 + len(tree))
+    tracker.plan(len(methods) * 2 + len(tree))
     tracker.plan_routes(len(tree))
 
     def _inference_filtered(route, path, sig, reason):
@@ -225,6 +239,7 @@ async def scan(
         status_whitelist=status_whitelist,
         on_filtered=_inference_filtered,
         tracker=tracker,
+        methods=methods,
     )
 
     async with httpx.AsyncClient(
@@ -254,11 +269,13 @@ async def scan(
                 resp.status_code, dict(resp.headers), resp.content, path,
             )
 
-        await tree.initialize(send_fn)
+        await tree.initialize(send_fn, methods=methods)
 
         # -- Scheduler state ---------------------------------------------
 
         wq = _WorkQueue()
+        tracker.queue_size = lambda: wq._inflight
+        tracker.stage = lambda: wq.stage
         pending_routes: dict[str, list[tuple[int, _RouteWork]]] = {}
         pending_children: dict[str, list[_ProbeWork]] = {}
         probed_prefixes: set[str] = set()
@@ -347,7 +364,7 @@ async def scan(
             probed_prefixes.add(work.prefix)
             prefix_depth[work.prefix] = work.depth
 
-            group = await tree.probe_prefix(work.prefix, send_fn, tracker)
+            group = await tree.probe_prefix(work.prefix, send_fn, tracker, methods=methods)
             if group:
                 _emit_boundary(group)
                 _inject_recursive(work.prefix, work.depth)
@@ -435,7 +452,7 @@ async def scan(
                     on_progress(0)
                 return
 
-            group = await tree.probe_prefix(path, send_fn, tracker)
+            group = await tree.probe_prefix(path, send_fn, tracker, methods=methods)
             if group:
                 _emit_boundary(group)
                 _inject_recursive(path, prefix_depth.get(path, 0))
