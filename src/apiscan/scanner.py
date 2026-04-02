@@ -25,10 +25,12 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from apiscan.inference import (
+    Baseline,
     Finding,
     InferenceEngine,
     ResponseSignature,
     _random_segment,
+    build_baseline,
     compute_signature,
     matches_baseline,
 )
@@ -189,6 +191,7 @@ def _finding_to_result(
         timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
         request_headers=request_headers,
         request_body=request_body,
+        signature=finding.signature,
     )
 
 
@@ -288,6 +291,72 @@ async def scan(
         conn_failures = 0
         wordlist = routes
 
+        # Segment-prefix wildcard tracking
+        segment_prefix_handlers: dict[tuple[str, str], Baseline] = {}
+        suppressed_indices: set[int] = set()
+
+        def _split_path_segment(path: str) -> tuple[str, str]:
+            """Split '/foo/bar' into ('/foo', 'bar')."""
+            parts = path.rstrip("/").rsplit("/", 1)
+            if len(parts) == 2:
+                return (parts[0] or "/", parts[1])
+            return ("/", parts[0].lstrip("/"))
+
+        def _is_segment_suppressed(path: str, sig: ResponseSignature) -> bool:
+            """Check if this path+sig is covered by a known prefix handler."""
+            parent, segment = _split_path_segment(path)
+            path_len = len(path.lstrip("/"))
+            for (hp, hs), bl in segment_prefix_handlers.items():
+                if hp == parent and segment.startswith(hs) and segment != hs:
+                    if matches_baseline(sig, bl, path_len) is not None:
+                        return True
+            return False
+
+        async def _check_segment_prefix(finding: Finding) -> bool:
+            """Probe to detect if this finding is a segment-prefix handler.
+
+            Returns True if the finding should be suppressed (covered by
+            an existing prefix handler).  Returns False if the finding
+            should be emitted (it may itself be registered as a handler).
+            """
+            path = finding.route.template_path
+
+            # Already covered by a known prefix handler?
+            if _is_segment_suppressed(path, finding.signature):
+                return True
+
+            # Probe {path}{random} to see if this is a prefix handler
+            suffix = _random_segment()[:8]
+            probe_path = f"{path}{suffix}"
+            tracker.plan(1)
+            try:
+                probe_sig = await send_fn("GET", probe_path, None, None)
+            except Exception:
+                return False
+
+            finding_bl = build_baseline([finding.signature])
+            probe_len = len(probe_path.lstrip("/"))
+            if matches_baseline(probe_sig, finding_bl, probe_len) is None:
+                return False  # not a prefix handler
+
+            # Register as prefix handler
+            parent, segment = _split_path_segment(path)
+            segment_prefix_handlers[(parent, segment)] = finding_bl
+
+            # Retroactively sweep already-emitted results
+            for i, existing in enumerate(results):
+                if i in suppressed_indices:
+                    continue
+                if existing.signature is None:
+                    continue
+                ep, eseg = _split_path_segment(existing.path)
+                if ep == parent and eseg.startswith(segment) and eseg != segment:
+                    elen = len(existing.path.lstrip("/"))
+                    if matches_baseline(existing.signature, finding_bl, elen) is not None:
+                        suppressed_indices.add(i)
+
+            return False  # the handler itself is emitted
+
         # -- Helpers ------------------------------------------------------
 
         def _emit(finding: Finding, **kw) -> None:
@@ -296,7 +365,7 @@ async def scan(
             if on_result:
                 on_result(result)
 
-        def _emit_boundary(group: BoundaryGroup) -> None:
+        async def _emit_boundary(group: BoundaryGroup) -> None:
             findings = []
             for probe in group.probes:
                 finding = engine.classify_boundary(probe)
@@ -306,12 +375,15 @@ async def scan(
                 return
             method_statuses = [f"{f.route.method}={f.signature.status_code}" for f in findings]
             primary = findings[0]
-            _emit(Finding(
+            boundary_finding = Finding(
                 route=Route(template_path=group.prefix, method="*"),
                 signature=primary.signature,
                 reason=f"boundary: {', '.join(method_statuses)}",
                 confidence=primary.confidence,
-            ))
+            )
+            if await _check_segment_prefix(boundary_finding):
+                return
+            _emit(boundary_finding)
 
         def _is_skipped(prefix: str) -> bool:
             return any(prefix.startswith(sp) for sp in skip_prefixes)
@@ -370,7 +442,7 @@ async def scan(
 
             group = await tree.probe_prefix(work.prefix, send_fn, tracker, methods=methods)
             if group:
-                _emit_boundary(group)
+                await _emit_boundary(group)
                 _inject_recursive(work.prefix, work.depth)
             elif lookahead and not tree._resolve(work.prefix).children:
                 for i, seg in enumerate(_LOOKAHEAD_SEGMENTS):
@@ -458,7 +530,7 @@ async def scan(
 
             group = await tree.probe_prefix(path, send_fn, tracker, methods=methods)
             if group:
-                _emit_boundary(group)
+                await _emit_boundary(group)
                 _inject_recursive(path, prefix_depth.get(path, 0))
 
             redirect_location = str(resp.url) if resp.history else None
@@ -473,12 +545,16 @@ async def scan(
                             wq.enqueue(0, _RouteWork(
                                 route=Route(template_path=redir_path, method=route.method)))
 
+            emitted = 0
             for finding in findings:
+                if await _check_segment_prefix(finding):
+                    continue
                 _emit(finding, redirect_location=redirect_location,
                       request_headers=headers, request_body=body_str)
+                emitted += 1
 
             if on_progress:
-                on_progress(len(findings))
+                on_progress(emitted)
 
         # -- Worker dispatch ----------------------------------------------
 
@@ -521,6 +597,16 @@ async def scan(
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+
+    # Final sweep: remove segment-prefix duplicates discovered during the scan.
+    # Concurrent workers may emit findings before their prefix handler is
+    # registered, so we do one last pass over all results.
+    if segment_prefix_handlers:
+        results = [
+            r for r in results
+            if r.signature is None
+            or not _is_segment_suppressed(r.path, r.signature)
+        ]
 
     return results, tree
 

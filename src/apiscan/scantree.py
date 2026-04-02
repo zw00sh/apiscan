@@ -297,7 +297,7 @@ class ScanTree:
     # Debug: ASCII tree representation
     # ------------------------------------------------------------------
 
-    def format_tree(self) -> str:
+    def format_tree(self, debug: bool) -> str:
         lines: list[str] = []
         self._format_node(self._root, "/", "", True, lines)
         return "\n".join(lines)

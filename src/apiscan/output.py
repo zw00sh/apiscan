@@ -7,6 +7,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ class ScanResult:
     timestamp: str = ""
     request_headers: dict[str, str] | None = None
     request_body: str | None = None
+    signature: Any = None  # ResponseSignature, typed as Any to avoid circular import
 
 
 def build_curl(result: ScanResult, proxy: str | None = None) -> str:
@@ -177,7 +179,7 @@ def print_banner(target: str, route_count: int,
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v0.15.0{r}\n")
+    print(f" {d}api content discovery · v0.16.0{r}\n")
     print(f"  target:   {target}")
     print(f"  routes:   {route_count}")
     g = GREEN if use_color else ""
@@ -334,7 +336,7 @@ class ProgressTracker:
         if self._tracker and hasattr(self._tracker, 'routes_planned') and stage == 'recursing':
             if self._tracker.routes_planned > self._initial_route_total:
                 added = self._tracker.routes_planned - self._initial_route_total
-                recurse_str = f"{d}(+{added} recursive){r} "
+                recurse_str = f"{d}(+{added} routes){r} "
 
         stage_str = f"| {d}{stage}{r} {recurse_str}" if stage else ""
 

@@ -354,3 +354,44 @@ class TestRecursionIntegration:
         # Whether or not it's a boundary, the route itself should be a finding.
         paths = {r.path for r in results}
         assert "/admin/dashboard" in paths
+
+
+class TestSegmentPrefixSuppression:
+    @pytest.mark.asyncio
+    async def test_segment_prefix_suppresses_siblings(self, test_server_url):
+        """When /static is a finding and /static{random} returns the same
+        response, /static.html and /staticfiles should be suppressed."""
+        routes = [
+            Route(template_path="/static", method="GET"),
+            Route(template_path="/static.html", method="GET"),
+            Route(template_path="/staticfiles", method="GET"),
+        ]
+        results, _ = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+        )
+        paths = {r.path for r in results}
+        # /static itself should be a finding (the real handler)
+        assert any(r.path == "/static" for r in results), \
+            f"Expected /static finding, got: {paths}"
+        # /static.html and /staticfiles should be suppressed (same handler)
+        assert "/static.html" not in paths, \
+            f"/static.html should be suppressed, got: {paths}"
+        assert "/staticfiles" not in paths, \
+            f"/staticfiles should be suppressed, got: {paths}"
+
+    @pytest.mark.asyncio
+    async def test_segment_prefix_allows_different_handler(self, test_server_url):
+        """A real endpoint at /staticmap with a different response should
+        survive even though /static is a prefix handler."""
+        routes = [
+            Route(template_path="/static", method="GET"),
+            Route(template_path="/staticmap", method="GET"),
+        ]
+        results, _ = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+        )
+        paths = {r.path for r in results}
+        # /staticmap has a different response (200 json vs 403 json)
+        # so it should NOT be suppressed
+        assert "/staticmap" in paths, \
+            f"Expected /staticmap to survive, got: {paths}"

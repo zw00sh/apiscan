@@ -8,6 +8,8 @@ The test server simulates a multi-service gateway:
 - /deep/secret/*: Sub-handler boundary (401 json) for recursion testing
 - /admin/*: Auth-required service with custom headers
 - /internal/metrics: Standalone plaintext service
+- /static*: Segment-prefix wildcard (matches /static, /static.html, /staticfiles)
+- /staticmap: Distinct handler behind the /static* prefix (different response)
 """
 
 from __future__ import annotations
@@ -183,6 +185,23 @@ async def _app(scope: dict, receive: Any, send: Any) -> None:
                      "headers": [[b"content-type", b"application/json"]]})
         await send({"type": "http.response.body",
                      "body": json.dumps({"error": "not found"}).encode()})
+        return
+
+    # /staticmap — distinct handler behind the /static* prefix (200 json)
+    if path == "/staticmap" and method == "GET":
+        body = json.dumps({"service": "staticmap"}).encode()
+        await send({"type": "http.response.start", "status": 200,
+                     "headers": [[b"content-type", b"application/json"]]})
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    # /static* — segment-prefix wildcard (matches /static, /static.html, /staticfiles, etc.)
+    # Returns a fixed response regardless of exact path (like a real prefix handler).
+    if path.startswith("/static"):
+        body = json.dumps({"error": "forbidden", "handler": "static-assets"}).encode()
+        await send({"type": "http.response.start", "status": 403,
+                     "headers": [[b"content-type", b"application/json"]]})
+        await send({"type": "http.response.body", "body": body})
         return
 
     # Gateway default: 404 text/html with path echoed
