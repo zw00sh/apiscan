@@ -1,7 +1,7 @@
 ```
  ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
  █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
- api content discovery · v0.15.0
+ api content discovery · v0.16.0
 ```
 
 Lightweight API content discovery tool that uses [Kiterunner](https://github.com/assetnote/kiterunner)'s `.kite` wordlist files to find hidden API endpoints.
