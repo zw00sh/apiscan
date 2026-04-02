@@ -85,25 +85,29 @@ class _WorkQueue:
         self._inflight = 0
         self._done = asyncio.Event()
         self._done.set()  # no work yet → "done"
-        self.current_priority = 0
+        self._priority_counts: dict[int, int] = {}
 
     @property
     def stage(self) -> str:
-        p = self.current_priority
-        return self._STAGE_NAMES.get(p, self._STAGE_NAMES[3])
+        """Lowest priority level with active work (queued or processing)."""
+        for p in sorted(self._priority_counts):
+            if self._priority_counts[p] > 0:
+                return self._STAGE_NAMES.get(p, self._STAGE_NAMES[3])
+        return ""
 
     def enqueue(self, priority: int, item: Any) -> None:
         self._inflight += 1
+        self._priority_counts[priority] = self._priority_counts.get(priority, 0) + 1
         self._done.clear()
         self._pq.put_nowait((priority, next(self._order), item))
 
-    async def get(self) -> Any:
-        """Pull the next item. Raises ``CancelledError`` on shutdown."""
+    async def get(self) -> tuple[int, Any]:
+        """Pull the next item. Returns ``(priority, item)``."""
         priority, _, item = await self._pq.get()
-        self.current_priority = priority
-        return item
+        return priority, item
 
-    def item_done(self) -> None:
+    def item_done(self, priority: int) -> None:
+        self._priority_counts[priority] -= 1
         self._inflight -= 1
         if self._inflight == 0:
             self._done.set()
@@ -484,7 +488,7 @@ async def scan(
         async def _worker() -> None:
             while True:
                 try:
-                    item = await wq.get()
+                    priority, item = await wq.get()
                 except asyncio.CancelledError:
                     return
                 try:
@@ -495,14 +499,14 @@ async def scan(
                     elif isinstance(item, _LookaheadWork):
                         await _handle_lookahead(item)
                 except asyncio.CancelledError:
-                    wq.item_done()
+                    wq.item_done(priority)
                     raise
                 except _TRANSIENT_ERRORS:
                     logger.debug("Transient error processing %s", type(item).__name__, exc_info=True)
                 except Exception:
                     logger.exception("Bug in worker processing %s", type(item).__name__)
                     raise
-                wq.item_done()
+                wq.item_done(priority)
 
         # Seed the priority queue
         _seed_queue(tree, wq, pending_routes, pending_children)

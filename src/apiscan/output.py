@@ -339,7 +339,7 @@ class ProgressTracker:
         stage_str = f"| {d}{stage}{r} {recurse_str}" if stage else ""
 
         print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
-        line = (f"[{g}{route_bar}{r}{d}{route_pct:02.0f}%{r}] "
+        line = (f"[{g}{route_bar}{r}{d}{route_pct:2.0f}%{r}] "
                 f"|   {d}{self.routes_completed}/{self.route_total} routes{r} "
                 f"| {d}{rps:.0f} req/s{r} {queue_str} "
                 f"| {c}{self.findings} found{r} "
