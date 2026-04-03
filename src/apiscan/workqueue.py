@@ -93,48 +93,62 @@ class WorkQueue:
             self._deps[key] -= self._completed
         self._push_ready()
 
-    def _push_ready(self) -> None:
-        """Find items with no remaining deps and push them to the ready queue."""
-        changed = True
-        while changed:
-            changed = False
-            newly_ready = [
-                k for k in self._deps
-                if not self._deps[k] and k not in self._queued
-            ]
-            for key in newly_ready:
-                self._queued.add(key)
-                changed = True
+    def _push_ready(self, candidates: list[str] | None = None) -> None:
+        """Push items with no remaining deps to the ready queue.
 
-                # Manual gates: count as inflight but don't go to worker queue
-                if key in self._manual_gates:
-                    self._inflight += 1
-                    self._done.clear()
-                    continue
+        *candidates* is a list of keys to check. When ``None`` (initial
+        prepare), all keys are scanned once.  Cascading releases from
+        virtual nodes and skip_fn are handled via a work-list so only
+        affected keys are visited — never a full scan of ``_deps``.
+        """
+        if candidates is None:
+            # Initial prepare: scan everything once
+            candidates = [k for k in self._deps if not self._deps[k] and k not in self._queued]
 
-                item = self._items.get(key)
-                if item is None:
-                    # Virtual node — auto-complete
-                    self._completed.add(key)
-                    self._release_dependents(key)
-                    continue
+        while candidates:
+            key = candidates.pop()
+            if key in self._queued:
+                continue
+            if self._deps.get(key):
+                continue
+            self._queued.add(key)
 
-                if self.skip_fn and self.skip_fn(key, item):
-                    self.skipped += 1
-                    self._completed.add(key)
-                    self._release_dependents(key)
-                    continue
-
+            # Manual gates: count as inflight but don't go to worker queue
+            if key in self._manual_gates:
                 self._inflight += 1
                 self._done.clear()
-                self._ready.put_nowait((key, item))
+                continue
 
-    def _release_dependents(self, key: str) -> None:
-        """Remove *key* from all dependents' dep sets."""
+            item = self._items.get(key)
+            if item is None:
+                # Virtual node — auto-complete
+                self._completed.add(key)
+                candidates.extend(self._release_dependents(key))
+                continue
+
+            if self.skip_fn and self.skip_fn(key, item):
+                self.skipped += 1
+                self._completed.add(key)
+                candidates.extend(self._release_dependents(key))
+                continue
+
+            self._inflight += 1
+            self._done.clear()
+            self._ready.put_nowait((key, item))
+
+    def _release_dependents(self, key: str) -> list[str]:
+        """Remove *key* from all dependents' dep sets.
+
+        Returns keys whose dep sets became empty (newly ready candidates).
+        """
+        newly_ready: list[str] = []
         for dep_key in self._dependents.get(key, ()):
             deps = self._deps.get(dep_key)
             if deps is not None:
                 deps.discard(key)
+                if not deps and dep_key not in self._queued:
+                    newly_ready.append(dep_key)
+        return newly_ready
 
     @property
     def ready_count(self) -> int:
@@ -154,8 +168,9 @@ class WorkQueue:
         """Mark *key* complete and release its dependents."""
         self._inflight -= 1
         self._completed.add(key)
-        self._release_dependents(key)
-        self._push_ready()
+        candidates = self._release_dependents(key)
+        if candidates:
+            self._push_ready(candidates)
         if self._inflight == 0:
             self._done.set()
 
@@ -178,13 +193,17 @@ class WorkQueue:
         """
         if not items:
             return
+        candidates = []
         for key, item, deps in items:
             self._items[key] = item
             dep_set = set(deps) - self._completed
             self._deps[key] = dep_set
             for dep in dep_set:
                 self._dependents.setdefault(dep, set()).add(key)
-        self._push_ready()
+            if not dep_set:
+                candidates.append(key)
+        if candidates:
+            self._push_ready(candidates)
 
     async def wait(self) -> None:
         """Block until all work (static + dynamic) is complete."""

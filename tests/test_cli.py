@@ -121,3 +121,28 @@ class TestJsonOutput:
     def test_json_and_quiet_mutex(self):
         with pytest.raises(SystemExit):
             self._parse("-u", "http://x", "-j", "-q")
+
+
+class TestRecursionFlags:
+    def _parse(self, *args: str):
+        parser = _build_parser()
+        return parser.parse_args([*args])
+
+    def test_recurse_flag(self):
+        ns = self._parse("-u", "http://x", "--recurse")
+        assert ns.recurse is True
+        assert ns.recurse_all is False
+
+    def test_recurse_all_flag(self):
+        ns = self._parse("-u", "http://x", "--recurse-all")
+        assert ns.recurse_all is True
+        assert ns.recurse is False
+
+    def test_recurse_and_recurse_all_mutex(self):
+        with pytest.raises(SystemExit):
+            self._parse("-u", "http://x", "--recurse", "--recurse-all")
+
+    def test_neither_recurse(self):
+        ns = self._parse("-u", "http://x")
+        assert ns.recurse is False
+        assert ns.recurse_all is False

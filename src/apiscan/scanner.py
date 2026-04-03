@@ -116,7 +116,556 @@ def _finding_to_result(
 
 
 # ---------------------------------------------------------------------------
-# Main scan engine
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def _split_path_segment(path: str) -> tuple[str, str]:
+    """Split '/foo/bar' into ('/foo', 'bar')."""
+    parts = path.rstrip("/").rsplit("/", 1)
+    if len(parts) == 2:
+        return (parts[0] or "/", parts[1])
+    return ("/", parts[0].lstrip("/"))
+
+
+# ---------------------------------------------------------------------------
+# Segment-prefix wildcard tracker
+# ---------------------------------------------------------------------------
+
+class SegmentPrefixTracker:
+    """Detects and suppresses segment-prefix wildcard handlers.
+
+    A segment-prefix handler is a route like ``/static`` that also handles
+    ``/static.html``, ``/staticfiles``, etc.  When detected, sibling paths
+    that share the prefix and return the same response are suppressed.
+    """
+
+    def __init__(self) -> None:
+        self.handlers: dict[tuple[str, str], Baseline] = {}
+        self._suppressed: set[int] = set()
+        self.gates: set[str] = set()
+
+    def should_skip(self, key: str, item: Any) -> bool:
+        """WorkQueue skip_fn: skip probes/routes covered by a known wildcard."""
+        if isinstance(item, ProbeWork):
+            path = item.prefix
+        elif isinstance(item, RouteWork):
+            path = item.route.template_path
+        else:
+            return False
+        parent, segment = _split_path_segment(path)
+        for (hp, hs) in self.handlers:
+            if hp == parent and segment.startswith(hs) and segment != hs:
+                return True
+        return False
+
+    def is_suppressed(self, path: str, sig: ResponseSignature) -> bool:
+        """Check if path+sig is covered by a known prefix handler."""
+        parent, segment = _split_path_segment(path)
+        path_len = len(path.lstrip("/"))
+        for (hp, hs), bl in self.handlers.items():
+            if hp == parent and segment.startswith(hs) and segment != hs:
+                if matches_baseline(sig, bl, path_len) is not None:
+                    return True
+        return False
+
+    def complete_gate(self, path: str, wq: WorkQueue) -> None:
+        """Complete a segment gate node if *path* is a gate."""
+        if path in self.gates:
+            wq.item_done(f"segment:{path}")
+            self.gates.discard(path)
+
+    async def check(
+        self,
+        finding: Finding,
+        results: list[ScanResult],
+        send_fn: Callable,
+        tracker: RequestTracker,
+        wq: WorkQueue,
+    ) -> bool:
+        """Probe *finding* to detect if it is a segment-prefix handler.
+
+        Returns True if the finding should be suppressed, False if it
+        should be emitted.  Completes the ``segment:{path}`` gate node
+        to release superset siblings.
+        """
+        path = finding.route.template_path
+        parent, segment = _split_path_segment(path)
+        handler_key = (parent, segment)
+
+        if self.is_suppressed(path, finding.signature):
+            self.complete_gate(path, wq)
+            return True
+
+        # Probe {path}{random} to see if this is a prefix handler
+        suffix = _random_segment()[:8]
+        probe_path = f"{path}{suffix}"
+        tracker.plan(1)
+        try:
+            probe_sig = await send_fn("GET", probe_path, None, None)
+        except Exception:
+            self.complete_gate(path, wq)
+            return False
+
+        finding_bl = build_baseline([finding.signature])
+        probe_len = len(probe_path.lstrip("/"))
+        if matches_baseline(probe_sig, finding_bl, probe_len) is None:
+            self.complete_gate(path, wq)
+            return False  # not a prefix handler
+
+        # Register as prefix handler
+        self.handlers[handler_key] = finding_bl
+
+        # Retroactively sweep already-emitted results
+        for i, existing in enumerate(results):
+            if i in self._suppressed:
+                continue
+            if existing.signature is None:
+                continue
+            ep, eseg = _split_path_segment(existing.path)
+            if ep == parent and eseg.startswith(segment) and eseg != segment:
+                elen = len(existing.path.lstrip("/"))
+                if matches_baseline(existing.signature, finding_bl, elen) is not None:
+                    self._suppressed.add(i)
+
+        self.complete_gate(path, wq)
+        return False  # the handler itself is emitted
+
+    def sweep(self, results: list[ScanResult]) -> list[ScanResult]:
+        """Final pass: remove results covered by prefix handlers."""
+        if not self.handlers:
+            return results
+        return [
+            r for i, r in enumerate(results)
+            if i not in self._suppressed
+            and (r.signature is None or not self.is_suppressed(r.path, r.signature))
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Scan session
+# ---------------------------------------------------------------------------
+
+class ScanSession:
+    """Encapsulates one scan run.
+
+    Config and callbacks are stored as instance attributes. Mutable scan
+    state (results, connection failures, prefix tracking, etc.) lives on
+    the instance so that former closures become regular methods.
+    """
+
+    def __init__(
+        self,
+        target_url: str,
+        routes: list[Route],
+        *,
+        concurrency: int = 10,
+        rate_limit: float | None = None,
+        timeout: float = 10.0,
+        max_redirects: int = 3,
+        status_blacklist: set[int] | None = None,
+        status_whitelist: set[int] | None = None,
+        quarantine_threshold: int = 50,
+        extra_headers: dict[str, str] | None = None,
+        on_result: Callable[[ScanResult], None] | None = None,
+        on_progress: Callable[[int], None] | None = None,
+        on_filtered: Callable[[str, str, int, str], None] | None = None,
+        on_debug: Callable[[str], None] | None = None,
+        tracker: RequestTracker | None = None,
+        recurse: bool = False,
+        recurse_all: bool = False,
+        max_depth: int = 2,
+        lookahead: bool = False,
+        methods: list[str] | None = None,
+        skip_wildcard_siblings: bool = True,
+    ) -> None:
+        from apiscan.inference import DEFAULT_METHODS
+
+        self._base_url = target_url.rstrip("/")
+        self._wordlist = routes
+        self._concurrency = concurrency
+        self._timeout = timeout
+        self._max_redirects = max_redirects
+        self._quarantine_threshold = quarantine_threshold
+        self._extra_headers = extra_headers or {}
+        self._on_result = on_result
+        self._on_progress = on_progress
+        self._on_filtered = on_filtered
+        self._on_debug = on_debug
+        self._recurse = recurse
+        self._recurse_all = recurse_all
+        self._max_depth = max_depth
+        self._lookahead = lookahead
+        self._methods = methods or DEFAULT_METHODS
+        self._skip_wildcard_siblings = skip_wildcard_siblings
+        self._status_blacklist = status_blacklist
+        self._status_whitelist = status_whitelist
+
+        self._limiter = RateLimiter(rate_limit) if rate_limit else None
+        self._tracker = tracker or RequestTracker()
+
+        # Mutable state — populated during run()
+        self._results: list[ScanResult] = []
+        self._tree: ScanTree | None = None
+        self._engine: InferenceEngine | None = None
+        self._wq: WorkQueue | None = None
+        self._client: httpx.AsyncClient | None = None
+        self._conn_failures = 0
+        self._conn_lock = asyncio.Lock()
+        self._probed_prefixes: set[str] = set()
+        self._prefix_depth: dict[str, int] = {}
+        self._prefixes = SegmentPrefixTracker()
+        self._recurse_suffixes: list[Route] | None = None
+
+    # -- Public entry point --------------------------------------------------
+
+    async def run(self) -> tuple[list[ScanResult], ScanTree]:
+        """Execute the scan. Returns ``(findings, tree)``."""
+        self._tree = ScanTree(self._wordlist)
+
+        if self._recurse and not self._recurse_all:
+            self._recurse_suffixes = self._compute_recurse_suffixes()
+
+        self._tracker.plan(len(self._methods) * 2 + len(self._tree))
+        self._tracker.plan_routes(len(self._tree))
+
+        self._engine = InferenceEngine(
+            tree=self._tree,
+            status_blacklist=self._status_blacklist,
+            status_whitelist=self._status_whitelist,
+            on_filtered=lambda route, path, sig, reason: (
+                self._on_filtered(route.method, path, sig.status_code, reason)
+                if self._on_filtered else None
+            ),
+            on_debug=self._on_debug,
+            tracker=self._tracker,
+            methods=self._methods,
+        )
+
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            max_redirects=self._max_redirects,
+            verify=False,
+            headers=self._extra_headers,
+        ) as self._client:
+            await self._tree.initialize(self._send, methods=self._methods)
+
+            self._wq = WorkQueue()
+            self._tracker.queue_size = lambda: self._wq._inflight
+            self._tracker.skipped_fn = lambda: self._wq.skipped
+            self._tracker.blocked_fn = lambda: self._wq.blocked_count
+            self._prefixes.gates = _build_work_graph(self._tree, self._wq)
+
+            if self._skip_wildcard_siblings:
+                self._wq.skip_fn = self._prefixes.should_skip
+
+            self._wq.prepare()
+
+            workers = [asyncio.create_task(self._worker()) for _ in range(self._concurrency)]
+            try:
+                await self._wq.wait()
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+            finally:
+                for w in workers:
+                    w.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+
+        self._client = None
+        self._results = self._prefixes.sweep(self._results)
+        return self._results, self._tree
+
+    # -- HTTP transport ------------------------------------------------------
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+        body: str | None = None,
+    ) -> ResponseSignature:
+        url = f"{self._base_url}{path}"
+        if self._limiter:
+            await self._limiter.acquire()
+        resp = await self._client.request(
+            method, url,
+            headers=headers or {},
+            content=body.encode() if body else None,
+            timeout=self._timeout,
+        )
+        self._tracker.tick()
+        return compute_signature(
+            resp.status_code, dict(resp.headers), resp.content, path,
+        )
+
+    # -- Result emission -----------------------------------------------------
+
+    def _emit(self, finding: Finding, recurse_info: str | None = None, **kw) -> None:
+        result = _finding_to_result(finding, self._base_url, **kw)
+        if recurse_info:
+            result.recurse_info = recurse_info
+        self._results.append(result)
+        if self._on_result:
+            self._on_result(result)
+
+    async def _emit_boundary(self, group: BoundaryGroup, recurse_info: str | None = None) -> None:
+        findings = []
+        for probe in group.probes:
+            finding = self._engine.classify_boundary(probe)
+            if finding is not None:
+                findings.append(finding)
+        if not findings:
+            return
+        method_statuses = [f"{f.route.method}={f.signature.status_code}" for f in findings]
+        primary = findings[0]
+        boundary_finding = Finding(
+            route=Route(template_path=group.prefix, method="*"),
+            signature=primary.signature,
+            reason=f"boundary: {', '.join(method_statuses)}",
+            confidence=primary.confidence,
+        )
+        if await self._prefixes.check(
+            boundary_finding, self._results, self._send, self._tracker, self._wq,
+        ):
+            return
+        self._emit(boundary_finding, recurse_info=recurse_info)
+
+    # -- Recursion -----------------------------------------------------------
+
+    def _compute_recurse_suffixes(self) -> list[Route]:
+        """Extract unique endpoint suffixes by stripping structural prefixes.
+
+        Structural prefixes are internal tree nodes (path prefixes shared by
+        multiple wordlist entries, like ``/api`` or ``/api/v1``).  Stripping
+        them collapses ``/api/v1/users`` and ``/api/v2/users`` to ``/users``.
+        """
+        structural: set[str] = set()
+
+        def _walk(node, prefix: str) -> None:
+            if node.children:
+                if prefix:
+                    structural.add(prefix)
+                for seg, child in node.children.items():
+                    _walk(child, f"{prefix}/{seg}")
+
+        _walk(self._tree._root, "")
+
+        seen: set[tuple[str, str]] = set()
+        suffixes: list[Route] = []
+        for route in self._wordlist:
+            path = route.template_path
+            parts = path.strip("/").split("/")
+            best = ""
+            current = ""
+            for part in parts[:-1]:
+                current = f"{current}/{part}"
+                if current in structural:
+                    best = current
+            suffix = path[len(best):] if best else path
+            key = (suffix, route.method)
+            if key not in seen:
+                seen.add(key)
+                suffixes.append(Route(template_path=suffix, method=route.method))
+        return suffixes
+
+    def _inject_recursive(self, prefix: str, depth: int) -> str | None:
+        """Inject recursive routes and return info string, or None."""
+        if not self._recurse or depth >= self._max_depth:
+            return None
+        wordlist = self._recurse_suffixes if self._recurse_suffixes is not None else self._wordlist
+        items: list[tuple[str, Any, list[str]]] = []
+        seen_sub: set[str] = set()
+        stripped = 0
+        injected = 0
+        deduped = 0
+        for route in wordlist:
+            route_path = route.template_path
+            if prefix != "/" and route_path.startswith(prefix):
+                route_path = route_path[len(prefix):]
+                stripped += 1
+            new_path = f"{prefix}{route_path}"
+            route_key_pair = (new_path, route.method)
+            if route_key_pair not in self._tree._seen:
+                injected += 1
+                new_route = Route(template_path=new_path, method=route.method)
+                self._tree.insert(new_route)
+                self._tracker.plan(1)
+                self._tracker.plan_routes(1)
+                parts = new_path.rstrip("/").rsplit("/", 1)
+                sub_prefix = parts[0] if len(parts) > 1 and parts[0] else "/"
+                route_key = f"recurse-route:{new_path}:{route.method}"
+                if sub_prefix != prefix and sub_prefix not in seen_sub and sub_prefix not in self._probed_prefixes:
+                    seen_sub.add(sub_prefix)
+                    probe_key = f"recurse-probe:{sub_prefix}"
+                    items.append((probe_key, ProbeWork(prefix=sub_prefix, depth=depth + 1), []))
+                    items.append((route_key, RouteWork(route=new_route), [probe_key]))
+                else:
+                    items.append((route_key, RouteWork(route=new_route), []))
+            else:
+                deduped += 1
+        if self._on_debug and (stripped or injected or deduped):
+            self._on_debug(f"recurse {prefix}: {stripped} stripped, {injected} injected, {deduped} deduped")
+        if items:
+            self._wq.enqueue_recursive_batch(items)
+            return f"recurse (depth {depth + 1}, {injected} new)"
+        return None
+
+    # -- Work handlers -------------------------------------------------------
+
+    async def _handle_probe(self, work: ProbeWork, key: str) -> None:
+        if work.prefix in self._probed_prefixes:
+            return
+        self._probed_prefixes.add(work.prefix)
+        self._prefix_depth[work.prefix] = work.depth
+
+        group = await self._tree.probe_prefix(work.prefix, self._send, self._tracker, methods=self._methods)
+        if group:
+            recurse_info = self._inject_recursive(work.prefix, work.depth)
+            await self._emit_boundary(group, recurse_info=recurse_info)
+        else:
+            self._prefixes.complete_gate(work.prefix, self._wq)
+
+        if not group and self._lookahead and not self._tree._resolve(work.prefix).children:
+            for i, seg in enumerate(_LOOKAHEAD_SEGMENTS):
+                la_key = f"lookahead:{work.prefix}/{seg}"
+                self._wq.enqueue_dynamic(la_key, LookaheadWork(prefix=work.prefix, segment=seg))
+
+    async def _handle_lookahead(self, work: LookaheadWork) -> None:
+        sub_prefix = f"{work.prefix}/{work.segment}"
+        sub_node = self._tree._resolve(sub_prefix)
+        if sub_node and "GET" in sub_node.baselines:
+            return
+        ancestor_baselines = self._tree.ancestor_baselines(work.prefix, "GET")
+        if not ancestor_baselines:
+            return
+        self._tracker.plan(1)
+        probe_path = f"{sub_prefix}/{_random_segment()}"
+        try:
+            sig = await self._send("GET", probe_path, None, None)
+        except Exception:
+            return
+        path_len = len(probe_path.lstrip("/"))
+        for bl in ancestor_baselines:
+            if matches_baseline(sig, bl, path_len) is not None:
+                return
+        depth = 0
+        parts = sub_prefix.rstrip("/").split("/")
+        for i in range(len(parts) - 1, 0, -1):
+            ancestor = "/".join(parts[:i]) or "/"
+            if ancestor in self._prefix_depth:
+                depth = self._prefix_depth[ancestor] + 1
+                break
+        la_probe_key = f"recurse-probe:{sub_prefix}"
+        self._wq.enqueue_dynamic(la_probe_key, ProbeWork(prefix=sub_prefix, depth=depth))
+
+    async def _handle_route(self, work: RouteWork, key: str) -> None:
+        route = work.route
+        async with self._conn_lock:
+            if self._conn_failures >= self._quarantine_threshold:
+                if self._on_progress:
+                    self._on_progress(0)
+                return
+
+        path = route.template_path
+        url = f"{self._base_url}{path}"
+        if len(url) > 2000:
+            url = url[:2000]
+
+        headers: dict[str, str] = {}
+        body_str: str | None = None
+
+        if self._limiter:
+            await self._limiter.acquire()
+        try:
+            resp = await self._client.request(
+                route.method, url,
+                headers=headers,
+                content=body_str.encode() if body_str else None,
+                timeout=self._timeout,
+            )
+        except Exception:
+            async with self._conn_lock:
+                self._conn_failures += 1
+            if self._on_progress:
+                self._on_progress(0)
+            return
+
+        async with self._conn_lock:
+            self._conn_failures = 0
+        self._tracker.tick()
+
+        # Use the initial status code for redirected responses so the
+        # output shows 301/302 instead of the final 200.
+        initial_status = resp.history[0].status_code if resp.history else resp.status_code
+        sig = compute_signature(
+            initial_status, dict(resp.headers), resp.content, path,
+        )
+
+        findings = await self._engine.process(route, sig, path, self._send)
+
+        if not findings:
+            self._prefixes.complete_gate(path, self._wq)
+            if self._on_progress:
+                self._on_progress(0)
+            return
+
+        group = await self._tree.probe_prefix(path, self._send, self._tracker, methods=self._methods)
+        if group:
+            recurse_info = self._inject_recursive(path, self._prefix_depth.get(path, 0))
+            await self._emit_boundary(group, recurse_info=recurse_info)
+
+        redirect_location = str(resp.url) if resp.history else None
+        if resp.history:
+            final_url = str(resp.url)
+            if final_url.startswith(self._base_url):
+                redir_path = final_url[len(self._base_url):]
+                if redir_path and redir_path.startswith("/"):
+                    if (redir_path, route.method) not in self._tree._seen:
+                        self._tree.insert(Route(template_path=redir_path, method=route.method))
+                        self._tracker.plan(1)
+                        redir_key = f"redir-route:{redir_path}:{route.method}"
+                        self._wq.enqueue_dynamic(redir_key, RouteWork(
+                            route=Route(template_path=redir_path, method=route.method)))
+
+        emitted = 0
+        for finding in findings:
+            if await self._prefixes.check(
+                finding, self._results, self._send, self._tracker, self._wq,
+            ):
+                continue
+            self._emit(finding, redirect_location=redirect_location,
+                       request_headers=headers, request_body=body_str)
+            emitted += 1
+
+        if self._on_progress:
+            self._on_progress(emitted)
+
+    # -- Worker dispatch -----------------------------------------------------
+
+    async def _worker(self) -> None:
+        while True:
+            try:
+                key, item = await self._wq.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                if isinstance(item, ProbeWork):
+                    await self._handle_probe(item, key)
+                elif isinstance(item, RouteWork):
+                    await self._handle_route(item, key)
+                elif isinstance(item, LookaheadWork):
+                    await self._handle_lookahead(item)
+            except asyncio.CancelledError:
+                self._wq.item_done(key)
+                raise
+            except _TRANSIENT_ERRORS:
+                pass
+            except Exception:
+                raise
+            self._wq.item_done(key)
+
+
+# ---------------------------------------------------------------------------
+# Public scan function (thin wrapper)
 # ---------------------------------------------------------------------------
 
 async def scan(
@@ -137,427 +686,37 @@ async def scan(
     on_debug: Callable[[str], None] | None = None,
     tracker: RequestTracker | None = None,
     recurse: bool = False,
+    recurse_all: bool = False,
     max_depth: int = 2,
     lookahead: bool = False,
     methods: list[str] | None = None,
     skip_wildcard_siblings: bool = True,
 ) -> tuple[list[ScanResult], ScanTree]:
     """Scan *target_url* with the given routes. Returns (findings, tree)."""
-    from apiscan.inference import DEFAULT_METHODS
-    methods = methods or DEFAULT_METHODS
-    base_url = target_url.rstrip("/")
-    limiter = RateLimiter(rate_limit) if rate_limit else None
-    results: list[ScanResult] = []
-    if tracker is None:
-        tracker = RequestTracker()
-
-    tree = ScanTree(routes)
-
-    tracker.plan(len(methods) * 2 + len(tree))
-    tracker.plan_routes(len(tree))
-
-    def _inference_filtered(route, path, sig, reason):
-        if on_filtered:
-            on_filtered(route.method, path, sig.status_code, reason)
-
-    engine = InferenceEngine(
-        tree=tree,
+    session = ScanSession(
+        target_url,
+        routes,
+        concurrency=concurrency,
+        rate_limit=rate_limit,
+        timeout=timeout,
+        max_redirects=max_redirects,
         status_blacklist=status_blacklist,
         status_whitelist=status_whitelist,
-        on_filtered=_inference_filtered,
+        quarantine_threshold=quarantine_threshold,
+        extra_headers=extra_headers,
+        on_result=on_result,
+        on_progress=on_progress,
+        on_filtered=on_filtered,
         on_debug=on_debug,
         tracker=tracker,
+        recurse=recurse,
+        recurse_all=recurse_all,
+        max_depth=max_depth,
+        lookahead=lookahead,
         methods=methods,
+        skip_wildcard_siblings=skip_wildcard_siblings,
     )
-
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        max_redirects=max_redirects,
-        verify=False,
-        headers=extra_headers or {},
-    ) as client:
-
-        async def send_fn(
-            method: str,
-            path: str,
-            headers: dict[str, str] | None = None,
-            body: str | None = None,
-        ) -> ResponseSignature:
-            url = f"{base_url}{path}"
-            if limiter:
-                await limiter.acquire()
-            resp = await client.request(
-                method, url,
-                headers=headers or {},
-                content=body.encode() if body else None,
-                timeout=timeout,
-            )
-            tracker.tick()
-            return compute_signature(
-                resp.status_code, dict(resp.headers), resp.content, path,
-            )
-
-        await tree.initialize(send_fn, methods=methods)
-
-        # -- Build work graph --------------------------------------------
-
-        wq = WorkQueue()
-        tracker.queue_size = lambda: wq._inflight
-        tracker.skipped_fn = lambda: wq.skipped
-        tracker.blocked_fn = lambda: wq.blocked_count
-        segment_gates = _build_work_graph(tree, wq)
-
-        probed_prefixes: set[str] = set()
-        prefix_depth: dict[str, int] = {}
-        conn_failures = 0
-        conn_lock = asyncio.Lock()
-        wordlist = routes
-
-        # Segment-prefix wildcard tracking
-        segment_prefix_handlers: dict[tuple[str, str], Baseline] = {}
-        suppressed_indices: set[int] = set()
-
-        def _split_path_segment(path: str) -> tuple[str, str]:
-            """Split '/foo/bar' into ('/foo', 'bar')."""
-            parts = path.rstrip("/").rsplit("/", 1)
-            if len(parts) == 2:
-                return (parts[0] or "/", parts[1])
-            return ("/", parts[0].lstrip("/"))
-
-        if skip_wildcard_siblings:
-            def _should_skip(key: str, item: Any) -> bool:
-                """Skip probes/routes covered by a known wildcard handler."""
-                if isinstance(item, ProbeWork):
-                    path = item.prefix
-                elif isinstance(item, RouteWork):
-                    path = item.route.template_path
-                else:
-                    return False
-                parent, segment = _split_path_segment(path)
-                for (hp, hs) in segment_prefix_handlers:
-                    if hp == parent and segment.startswith(hs) and segment != hs:
-                        return True
-                return False
-            wq.skip_fn = _should_skip
-
-        def _is_segment_suppressed(path: str, sig: ResponseSignature) -> bool:
-            """Check if this path+sig is covered by a known prefix handler."""
-            parent, segment = _split_path_segment(path)
-            path_len = len(path.lstrip("/"))
-            for (hp, hs), bl in segment_prefix_handlers.items():
-                if hp == parent and segment.startswith(hs) and segment != hs:
-                    if matches_baseline(sig, bl, path_len) is not None:
-                        return True
-            return False
-
-        async def _check_segment_prefix(finding: Finding) -> bool:
-            """Probe to detect if this finding is a segment-prefix handler.
-
-            Returns True if suppressed, False if the finding should be emitted.
-            Completes the ``segment:{path}`` gate node to release superset
-            siblings when this path is a gate.
-            """
-            path = finding.route.template_path
-            parent, segment = _split_path_segment(path)
-            key = (parent, segment)
-            is_gate = path in segment_gates
-
-            def _complete_gate() -> None:
-                if is_gate:
-                    wq.item_done(f"segment:{path}")
-                    segment_gates.discard(path)
-
-            if _is_segment_suppressed(path, finding.signature):
-                _complete_gate()
-                return True
-
-            # Probe {path}{random} to see if this is a prefix handler
-            suffix = _random_segment()[:8]
-            probe_path = f"{path}{suffix}"
-            tracker.plan(1)
-            try:
-                probe_sig = await send_fn("GET", probe_path, None, None)
-            except Exception:
-                _complete_gate()
-                return False
-
-            finding_bl = build_baseline([finding.signature])
-            probe_len = len(probe_path.lstrip("/"))
-            if matches_baseline(probe_sig, finding_bl, probe_len) is None:
-                _complete_gate()
-                return False  # not a prefix handler
-
-            # Register as prefix handler
-            segment_prefix_handlers[key] = finding_bl
-
-            # Retroactively sweep already-emitted results
-            for i, existing in enumerate(results):
-                if i in suppressed_indices:
-                    continue
-                if existing.signature is None:
-                    continue
-                ep, eseg = _split_path_segment(existing.path)
-                if ep == parent and eseg.startswith(segment) and eseg != segment:
-                    elen = len(existing.path.lstrip("/"))
-                    if matches_baseline(existing.signature, finding_bl, elen) is not None:
-                        suppressed_indices.add(i)
-
-            _complete_gate()
-            return False  # the handler itself is emitted
-
-        # -- Helpers ------------------------------------------------------
-
-        def _emit(finding: Finding, recurse_info: str | None = None, **kw) -> None:
-            result = _finding_to_result(finding, base_url, **kw)
-            if recurse_info:
-                result.recurse_info = recurse_info
-            results.append(result)
-            if on_result:
-                on_result(result)
-
-        async def _emit_boundary(group: BoundaryGroup, recurse_info: str | None = None) -> None:
-            findings = []
-            for probe in group.probes:
-                finding = engine.classify_boundary(probe)
-                if finding is not None:
-                    findings.append(finding)
-            if not findings:
-                return
-            method_statuses = [f"{f.route.method}={f.signature.status_code}" for f in findings]
-            primary = findings[0]
-            boundary_finding = Finding(
-                route=Route(template_path=group.prefix, method="*"),
-                signature=primary.signature,
-                reason=f"boundary: {', '.join(method_statuses)}",
-                confidence=primary.confidence,
-            )
-            if await _check_segment_prefix(boundary_finding):
-                return
-            _emit(boundary_finding, recurse_info=recurse_info)
-
-        def _inject_recursive(prefix: str, depth: int) -> str | None:
-            """Inject recursive routes and return info string, or None."""
-            if not recurse or depth >= max_depth:
-                return None
-            items: list[tuple[str, Any, list[str]]] = []
-            seen_sub: set[str] = set()
-            stripped = 0
-            injected = 0
-            deduped = 0
-            for route in wordlist:
-                route_path = route.template_path
-                if prefix != "/" and route_path.startswith(prefix):
-                    route_path = route_path[len(prefix):]
-                    stripped += 1
-                new_path = f"{prefix}{route_path}"
-                route_key_pair = (new_path, route.method)
-                if route_key_pair not in tree._seen:
-                    injected += 1
-                    new_route = Route(template_path=new_path, method=route.method)
-                    tree.insert(new_route)
-                    tracker.plan(1)
-                    tracker.plan_routes(1)
-                    parts = new_path.rstrip("/").rsplit("/", 1)
-                    sub_prefix = parts[0] if len(parts) > 1 and parts[0] else "/"
-                    route_key = f"recurse-route:{new_path}:{route.method}"
-                    if sub_prefix != prefix and sub_prefix not in seen_sub and sub_prefix not in probed_prefixes:
-                        seen_sub.add(sub_prefix)
-                        probe_key = f"recurse-probe:{sub_prefix}"
-                        items.append((probe_key, ProbeWork(prefix=sub_prefix, depth=depth + 1), []))
-                        items.append((route_key, RouteWork(route=new_route), [probe_key]))
-                    else:
-                        items.append((route_key, RouteWork(route=new_route), []))
-                else:
-                    deduped += 1
-            if on_debug and (stripped or injected or deduped):
-                on_debug(f"recurse {prefix}: {stripped} stripped, {injected} injected, {deduped} deduped")
-            if items:
-                wq.enqueue_recursive_batch(items)
-                return f"recurse (depth {depth + 1}, {injected} new)"
-            return None
-
-        # -- Work handlers ------------------------------------------------
-
-        async def _handle_probe(work: ProbeWork, key: str) -> None:
-            if work.prefix in probed_prefixes:
-                return
-            probed_prefixes.add(work.prefix)
-            prefix_depth[work.prefix] = work.depth
-
-            group = await tree.probe_prefix(work.prefix, send_fn, tracker, methods=methods)
-            if group:
-                recurse_info = _inject_recursive(work.prefix, work.depth)
-                await _emit_boundary(group, recurse_info=recurse_info)
-            else:
-                # No boundary — complete segment gate if this is one
-                if work.prefix in segment_gates:
-                    wq.item_done(f"segment:{work.prefix}")
-                    segment_gates.discard(work.prefix)
-
-            if not group and lookahead and not tree._resolve(work.prefix).children:
-                for i, seg in enumerate(_LOOKAHEAD_SEGMENTS):
-                    la_key = f"lookahead:{work.prefix}/{seg}"
-                    wq.enqueue_dynamic(la_key, LookaheadWork(prefix=work.prefix, segment=seg))
-
-        async def _handle_lookahead(work: LookaheadWork) -> None:
-            sub_prefix = f"{work.prefix}/{work.segment}"
-            sub_node = tree._resolve(sub_prefix)
-            if sub_node and "GET" in sub_node.baselines:
-                return
-            ancestor_baselines = tree.ancestor_baselines(work.prefix, "GET")
-            if not ancestor_baselines:
-                return
-            tracker.plan(1)
-            probe_path = f"{sub_prefix}/{_random_segment()}"
-            try:
-                sig = await send_fn("GET", probe_path, None, None)
-            except Exception:
-                return
-            path_len = len(probe_path.lstrip("/"))
-            for bl in ancestor_baselines:
-                if matches_baseline(sig, bl, path_len) is not None:
-                    return
-            depth = 0
-            parts = sub_prefix.rstrip("/").split("/")
-            for i in range(len(parts) - 1, 0, -1):
-                ancestor = "/".join(parts[:i]) or "/"
-                if ancestor in prefix_depth:
-                    depth = prefix_depth[ancestor] + 1
-                    break
-            la_probe_key = f"recurse-probe:{sub_prefix}"
-            wq.enqueue_dynamic(la_probe_key, ProbeWork(prefix=sub_prefix, depth=depth))
-
-        async def _handle_route(work: RouteWork, key: str) -> None:
-            nonlocal conn_failures
-            route = work.route
-            async with conn_lock:
-                if conn_failures >= quarantine_threshold:
-                    if on_progress:
-                        on_progress(0)
-                    return
-
-            path = route.template_path
-            url = f"{base_url}{path}"
-            if len(url) > 2000:
-                url = url[:2000]
-
-            headers: dict[str, str] = {}
-            body_str: str | None = None
-
-            if limiter:
-                await limiter.acquire()
-            try:
-                resp = await client.request(
-                    route.method, url,
-                    headers=headers,
-                    content=body_str.encode() if body_str else None,
-                    timeout=timeout,
-                )
-            except Exception:
-                async with conn_lock:
-                    conn_failures += 1
-                if on_progress:
-                    on_progress(0)
-                return
-
-            async with conn_lock:
-                conn_failures = 0
-            tracker.tick()
-
-            # Use the initial status code for redirected responses so the
-            # output shows 301/302 instead of the final 200.
-            initial_status = resp.history[0].status_code if resp.history else resp.status_code
-            sig = compute_signature(
-                initial_status, dict(resp.headers), resp.content, path,
-            )
-
-            findings = await engine.process(route, sig, path, send_fn)
-
-            if not findings:
-                # No findings — complete segment gate if applicable
-                if path in segment_gates:
-                    wq.item_done(f"segment:{path}")
-                    segment_gates.discard(path)
-                if on_progress:
-                    on_progress(0)
-                return
-
-            group = await tree.probe_prefix(path, send_fn, tracker, methods=methods)
-            if group:
-                recurse_info = _inject_recursive(path, prefix_depth.get(path, 0))
-                await _emit_boundary(group, recurse_info=recurse_info)
-
-            redirect_location = str(resp.url) if resp.history else None
-            if resp.history:
-                final_url = str(resp.url)
-                if final_url.startswith(base_url):
-                    redir_path = final_url[len(base_url):]
-                    if redir_path and redir_path.startswith("/"):
-                        if (redir_path, route.method) not in tree._seen:
-                            tree.insert(Route(template_path=redir_path, method=route.method))
-                            tracker.plan(1)
-                            redir_key = f"redir-route:{redir_path}:{route.method}"
-                            wq.enqueue_dynamic(redir_key, RouteWork(
-                                route=Route(template_path=redir_path, method=route.method)))
-
-            emitted = 0
-            for finding in findings:
-                if await _check_segment_prefix(finding):
-                    continue
-                _emit(finding, redirect_location=redirect_location,
-                      request_headers=headers, request_body=body_str)
-                emitted += 1
-
-            if on_progress:
-                on_progress(emitted)
-
-        # -- Worker dispatch ----------------------------------------------
-
-        wq.prepare()
-
-        async def _worker() -> None:
-            while True:
-                try:
-                    key, item = await wq.get()
-                except asyncio.CancelledError:
-                    return
-                try:
-                    if isinstance(item, ProbeWork):
-                        await _handle_probe(item, key)
-                    elif isinstance(item, RouteWork):
-                        await _handle_route(item, key)
-                    elif isinstance(item, LookaheadWork):
-                        await _handle_lookahead(item)
-                except asyncio.CancelledError:
-                    wq.item_done(key)
-                    raise
-                except _TRANSIENT_ERRORS:
-                    logger.debug("Transient error processing %s", type(item).__name__, exc_info=True)
-                except Exception:
-                    logger.exception("Bug in worker processing %s", type(item).__name__)
-                    raise
-                wq.item_done(key)
-
-        workers = [asyncio.create_task(_worker()) for _ in range(concurrency)]
-
-        try:
-            await wq.wait()
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            pass
-        finally:
-            for w in workers:
-                w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-
-    # Final sweep: remove segment-prefix duplicates discovered during the scan.
-    if segment_prefix_handlers:
-        results = [
-            r for r in results
-            if r.signature is None
-            or not _is_segment_suppressed(r.path, r.signature)
-        ]
-
-    return results, tree
+    return await session.run()
 
 
 # ---------------------------------------------------------------------------

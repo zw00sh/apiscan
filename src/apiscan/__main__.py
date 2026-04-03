@@ -53,8 +53,11 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Built-in top 100k wordlist (thorough)")
 
     recursion = p.add_argument_group("recursion")
-    recursion.add_argument("--recurse", action="store_true",
-                           help="Re-apply the full wordlist under each discovered handler boundary (e.g. /api → /api/users, /api/health)")
+    recurse_mode = recursion.add_mutually_exclusive_group()
+    recurse_mode.add_argument("--recurse", action="store_true",
+                              help="Recurse into discovered boundaries with smart dedup (strips structural prefixes from wordlist)")
+    recurse_mode.add_argument("--recurse-all", action="store_true",
+                              help="Recurse into discovered boundaries using the full wordlist (no dedup)")
     recursion.add_argument("--max-depth", type=int, default=2,
                            help="Max recursion depth (default: 2)")
     recursion.add_argument("--lookahead", action="store_true",
@@ -159,7 +162,8 @@ async def _scan(args: argparse.Namespace) -> None:
     if not suppress_ui:
         print_banner(args.url, len(routes), scan_methods, use_color,
                      concurrency=args.concurrency, rate_limit=args.rate,
-                     timeout=args.timeout, recurse=args.recurse,
+                     timeout=args.timeout,
+                     recurse=args.recurse or args.recurse_all,
                      lookahead=args.lookahead)
 
     from apiscan.scanner import RequestTracker
@@ -281,7 +285,8 @@ async def _scan(args: argparse.Namespace) -> None:
             on_filtered=on_filtered,
             on_debug=on_debug if args.debug else None,
             tracker=req_tracker,
-            recurse=args.recurse,
+            recurse=args.recurse or args.recurse_all,
+            recurse_all=args.recurse_all,
             max_depth=args.max_depth,
             lookahead=args.lookahead,
             methods=scan_methods,
@@ -325,7 +330,7 @@ async def _scan(args: argparse.Namespace) -> None:
         else:
             wl_tier = "default"
         print_hints(
-            recurse=args.recurse, lookahead=args.lookahead,
+            recurse=args.recurse or args.recurse_all, lookahead=args.lookahead,
             methods=scan_methods, boundaries_found=boundary_count,
             wildcard_skipped=req_tracker.skipped_fn() if req_tracker.skipped_fn else 0,
             wordlist_tier=wl_tier,

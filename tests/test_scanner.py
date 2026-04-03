@@ -183,15 +183,15 @@ class TestRecursionIntegration:
         ]
         results, tree = await scan(
             test_server_url, routes, concurrency=2, timeout=5.0,
-            recurse=True, max_depth=2,
+            recurse=True, recurse_all=True, max_depth=2,
         )
         paths = {r.path for r in results}
         # /deep boundary should be discovered (403 json vs root 404 html)
         boundary_results = [r for r in results if "boundary:" in r.reason]
         assert any("/deep" in r.path for r in boundary_results)
-        # Recursion at /deep injects /deep/secret/thing. The /deep/secret
-        # prefix is itself a boundary (401 vs /deep's 403), discovered via
-        # tree walk probing. /deep/secret should appear as a finding.
+        # Recursion at /deep injects /deep/secret/thing (full path, via
+        # recurse_all). The /deep/secret prefix is itself a boundary
+        # (401 vs /deep's 403), discovered via tree walk probing.
         assert "/deep/secret" in paths or any("/deep/secret" in r.path for r in results)
 
     @pytest.mark.asyncio
@@ -380,6 +380,36 @@ class TestRecursionPrefixStripping:
         msg = recurse_msgs[0]
         assert "stripped" in msg
         assert "injected" in msg
+
+
+class TestSmartRecursionIntegration:
+    @pytest.mark.asyncio
+    async def test_smart_recurse_fewer_requests(self, test_server_url):
+        """Smart recursion should plan fewer requests than recurse_all."""
+        from apiscan.scanner import RequestTracker
+
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/api/v1/endpoint", method="GET"),
+            Route(template_path="/endpoint", method="GET"),
+        ]
+
+        tracker_smart = RequestTracker()
+        await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, recurse_all=False, max_depth=1,
+            tracker=tracker_smart,
+        )
+
+        tracker_full = RequestTracker()
+        await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, recurse_all=True, max_depth=1,
+            tracker=tracker_full,
+        )
+
+        assert tracker_smart.planned < tracker_full.planned, \
+            f"Smart ({tracker_smart.planned}) should plan fewer than full ({tracker_full.planned})"
 
 
 class TestSegmentPrefixSuppression:

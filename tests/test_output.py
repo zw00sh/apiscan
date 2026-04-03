@@ -257,11 +257,12 @@ class TestHints:
         assert "3 handler boundaries" in output
         assert "--recurse" in output
 
-    def test_no_recurse_hint_when_already_set(self, capsys):
+    def test_recurse_all_hint_when_recurse_set(self, capsys):
         print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
                     boundaries_found=3, use_color=False)
         output = capsys.readouterr().err
-        assert "--recurse" not in output
+        assert "--recurse-all" in output
+        assert "re-run with --recurse" not in output
 
     def test_lookahead_hint(self, capsys):
         print_hints(recurse=True, lookahead=False, methods=["GET", "POST", "PUT"],
