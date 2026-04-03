@@ -31,12 +31,14 @@ def _sig(
     word_count: int = 10,
     line_count: int = 2,
     header_names: frozenset[str] | None = None,
+    body_hash: bytes = b"",
 ) -> ResponseSignature:
     return ResponseSignature(
         status_code=status_code, content_type=content_type,
         content_length=content_length, adjusted_content_length=adjusted_content_length,
         adjustment_scale=adjustment_scale, word_count=word_count,
         line_count=line_count, header_names=header_names or frozenset(),
+        body_hash=body_hash,
     )
 
 
@@ -80,6 +82,16 @@ class TestComputeSignature:
         sig = compute_signature(204, {}, b"", "/")
         assert sig.content_length == 0
         assert sig.word_count == 0
+
+    def test_body_hash_present(self):
+        sig = compute_signature(200, {}, b"hello world", "/")
+        assert len(sig.body_hash) == 8
+        assert isinstance(sig.body_hash, bytes)
+
+    def test_body_hash_differs_for_different_bodies(self):
+        sig1 = compute_signature(200, {}, b"body one", "/")
+        sig2 = compute_signature(200, {}, b"body two", "/")
+        assert sig1.body_hash != sig2.body_hash
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +163,80 @@ class TestMatchesBaseline:
 
     def test_empty_baseline(self):
         assert matches_baseline(_sig(), Baseline(), 5) is None
+
+    def test_fuzzy_length_within_tolerance(self):
+        bl = _baseline(_sig(content_length=1000, word_count=10, line_count=2))
+        candidate = _sig(content_length=1040, word_count=10, line_count=2)
+        result = matches_baseline(candidate, bl, 5)
+        assert result is not None
+        assert "fuzzy length" in result
+
+    def test_fuzzy_length_exceeds_tolerance(self):
+        # min(64, 5% of 1000=50) = 50, delta=100 > 50
+        # word/line also differ so word/line fallback doesn't catch it
+        bl = _baseline(_sig(content_length=1000, word_count=10, line_count=2))
+        candidate = _sig(content_length=1100, word_count=15, line_count=3)
+        assert matches_baseline(candidate, bl, 5) is None
+
+    def test_fuzzy_length_small_response(self):
+        # min(64, 5% of 100=5) = 5, delta=10 > 5
+        bl = _baseline(_sig(content_length=100, word_count=10, line_count=2))
+        candidate = _sig(content_length=110, word_count=15, line_count=3)
+        assert matches_baseline(candidate, bl, 5) is None
+
+    def test_fuzzy_length_requires_word_line_match(self):
+        bl = _baseline(_sig(content_length=1000, word_count=10, line_count=2))
+        candidate = _sig(content_length=1010, word_count=15, line_count=2)
+        assert matches_baseline(candidate, bl, 5) is None
+
+    def test_fuzzy_length_reason_format(self):
+        bl = _baseline(_sig(content_length=1000, word_count=10, line_count=2))
+        candidate = _sig(content_length=1030, word_count=10, line_count=2)
+        result = matches_baseline(candidate, bl, 5)
+        assert "fuzzy length=1030±30" in result
+        assert "baseline=1000" in result
+
+    def test_hash_match_same_length(self):
+        """Hash match fires when length/words/lines all differ from baseline
+        but the body hash and content_length match a baseline signature."""
+        h = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        # Use two baseline sigs with different lengths to make content_length unstable
+        bl = _baseline(
+            _sig(content_length=500, word_count=10, line_count=2, body_hash=h),
+            _sig(content_length=520, word_count=12, line_count=3, body_hash=h),
+        )
+        # Candidate has same hash + same length as first baseline sig
+        candidate = _sig(content_length=500, word_count=99, line_count=99, body_hash=h)
+        result = matches_baseline(candidate, bl, 5)
+        assert result is not None
+        assert "body hash" in result
+
+    def test_hash_no_match_different_length(self):
+        h = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        bl = _baseline(
+            _sig(content_length=500, word_count=10, line_count=2, body_hash=h),
+            _sig(content_length=520, word_count=12, line_count=3, body_hash=h),
+        )
+        candidate = _sig(content_length=600, word_count=99, line_count=99, body_hash=h)
+        assert matches_baseline(candidate, bl, 5) is None
+
+    def test_hash_no_match_different_hash(self):
+        bl = _baseline(
+            _sig(content_length=500, word_count=10, line_count=2, body_hash=b"\x01" * 8),
+            _sig(content_length=520, word_count=12, line_count=3, body_hash=b"\x01" * 8),
+        )
+        candidate = _sig(content_length=500, word_count=99, line_count=99, body_hash=b"\x02" * 8)
+        assert matches_baseline(candidate, bl, 5) is None
+
+    def test_hash_reason_format(self):
+        h = b"\xab\xcd\x12\x34\x56\x78\x9a\xbc"
+        bl = _baseline(
+            _sig(content_length=500, word_count=10, line_count=2, body_hash=h),
+            _sig(content_length=520, word_count=12, line_count=3, body_hash=h),
+        )
+        candidate = _sig(content_length=500, word_count=99, line_count=99, body_hash=h)
+        result = matches_baseline(candidate, bl, 5)
+        assert "body hash=abcd1234" in result
 
 
 # ---------------------------------------------------------------------------

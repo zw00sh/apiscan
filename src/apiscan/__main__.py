@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.resources
+import json as _json
 import os
 import sys
 import time
@@ -92,8 +93,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Show why routes are filtered (noisy)")
     output.add_argument("--no-color", action="store_true",
                         help="Disable ANSI colors")
-    output.add_argument("-q", "--quiet", action="store_true",
-                        help="Suppress banner, progress, and summary — output only discovered URLs")
+    output_mode = output.add_mutually_exclusive_group()
+    output_mode.add_argument("-q", "--quiet", action="store_true",
+                             help="Suppress banner, progress, and summary — output only discovered URLs")
+    output_mode.add_argument("-j", "--json", action="store_true",
+                             help="Output findings as JSON Lines (one object per line)")
 
     return p
 
@@ -135,7 +139,8 @@ def _resolve_wordlist(args: argparse.Namespace) -> str:
 
 
 async def _scan(args: argparse.Namespace) -> None:
-    use_color = supports_color() and not args.no_color
+    suppress_ui = args.quiet or args.json
+    use_color = supports_color() and not args.no_color and not suppress_ui
 
     d = DIM if use_color else ""
     r = RESET if use_color else ""
@@ -151,7 +156,7 @@ async def _scan(args: argparse.Namespace) -> None:
     wordlist_path = _resolve_wordlist(args)
     routes = load_wordlist(wordlist_path)
 
-    if not args.quiet:
+    if not suppress_ui:
         print_banner(args.url, len(routes), scan_methods, use_color,
                      concurrency=args.concurrency, rate_limit=args.rate,
                      timeout=args.timeout, recurse=args.recurse,
@@ -163,7 +168,7 @@ async def _scan(args: argparse.Namespace) -> None:
     )
 
     csv_writer = CSVWriter(args.output, replay_proxy=args.replay_proxy) if args.output else None
-    progress = ProgressTracker(len(routes), use_color, tracker=req_tracker) if not args.quiet else None
+    progress = ProgressTracker(len(routes), use_color, tracker=req_tracker) if not suppress_ui else None
     # Re-bind the tick callback now that progress exists
     req_tracker._on_tick = progress.tick_request if progress else None
 
@@ -199,6 +204,21 @@ async def _scan(args: argparse.Namespace) -> None:
             csv_writer.write_result(result)
         if replay_client:
             asyncio.create_task(_replay(result))
+        if args.json:
+            print(_json.dumps({
+                "url": result.url,
+                "method": result.method,
+                "path": result.path,
+                "status_code": result.status_code,
+                "content_length": result.content_length,
+                "word_count": result.word_count,
+                "line_count": result.line_count,
+                "redirect_location": result.redirect_location,
+                "reason": result.reason,
+                "confidence": result.confidence,
+                "timestamp": result.timestamp,
+            }), flush=True)
+            return
         if args.quiet:
             print(result.url)
             return
@@ -287,7 +307,7 @@ async def _scan(args: argparse.Namespace) -> None:
         print(scan_tree.format_tree(debug=True), file=sys.stderr)
         print(f"{d}--- end tree ---{r}\n", file=sys.stderr)
 
-    if not args.quiet:
+    if not suppress_ui:
         if interrupted:
             print(f"\n  {d}interrupted{r}", file=sys.stderr)
         print_summary(len(findings), req_tracker.routes_planned, req_tracker.sent, elapsed, use_color)

@@ -343,6 +343,45 @@ class TestRecursionIntegration:
         assert "/admin/dashboard" in paths
 
 
+class TestRecursionPrefixStripping:
+    @pytest.mark.asyncio
+    async def test_no_prefix_stacking(self, test_server_url):
+        """Recursion should not produce /deep/deep/endpoint from a wordlist
+        entry /deep/endpoint when /deep is a boundary."""
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/endpoint", method="GET"),
+        ]
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=2,
+        )
+        paths = {r.path for r in results}
+        assert "/deep/deep/endpoint" not in paths, \
+            f"/deep/deep/endpoint should not exist (prefix-stripped), got: {paths}"
+        # But /deep should still be found as a boundary
+        assert any("/deep" in r.path for r in results if "boundary:" in r.reason)
+
+    @pytest.mark.asyncio
+    async def test_debug_shows_strip_counts(self, test_server_url):
+        """on_debug should receive a message with strip/inject/dedup counts."""
+        routes = [
+            Route(template_path="/deep/endpoint", method="GET"),
+            Route(template_path="/endpoint", method="GET"),
+        ]
+        debug_msgs: list[str] = []
+        results, tree = await scan(
+            test_server_url, routes, concurrency=2, timeout=5.0,
+            recurse=True, max_depth=1,
+            on_debug=lambda msg: debug_msgs.append(msg),
+        )
+        recurse_msgs = [m for m in debug_msgs if "recurse" in m and "stripped" in m]
+        assert len(recurse_msgs) >= 1, f"Expected recurse debug msg, got: {debug_msgs}"
+        msg = recurse_msgs[0]
+        assert "stripped" in msg
+        assert "injected" in msg
+
+
 class TestSegmentPrefixSuppression:
     @pytest.mark.asyncio
     async def test_segment_prefix_suppresses_siblings(self, test_server_url):

@@ -103,3 +103,21 @@ class TestWordlistSelection:
     def test_short_and_long_mutex(self):
         with pytest.raises(SystemExit):
             self._parse("-u", "http://x", "--short", "--long")
+
+
+class TestJsonOutput:
+    def _parse(self, *args: str):
+        parser = _build_parser()
+        return parser.parse_args([*args])
+
+    def test_json_flag(self):
+        ns = self._parse("-u", "http://x", "-j")
+        assert ns.json is True
+
+    def test_json_long_flag(self):
+        ns = self._parse("-u", "http://x", "--json")
+        assert ns.json is True
+
+    def test_json_and_quiet_mutex(self):
+        with pytest.raises(SystemExit):
+            self._parse("-u", "http://x", "-j", "-q")

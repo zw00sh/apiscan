@@ -1,8 +1,8 @@
 """Async HTTP scanning engine with dependency-aware scheduling.
 
-Work is scheduled via a DAG built from ``graphlib.TopologicalSorter``.
+Work is scheduled via a dependency-tracking DAG (see :mod:`apiscan.workqueue`).
 Each work item declares its dependencies (e.g. a route depends on its
-prefix probe) and the sorter releases items as their deps complete.
+prefix probe) and the queue releases items as their deps complete.
 
 Baseline management is handled by :mod:`apiscan.scantree`.
 Response classification is handled by :mod:`apiscan.inference`.
@@ -11,15 +11,10 @@ Response classification is handled by :mod:`apiscan.inference`.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
-from dataclasses import dataclass
-from graphlib import TopologicalSorter
 from typing import Any, Callable
 
 import httpx
-
-logger = logging.getLogger(__name__)
 
 from apiscan.inference import (
     Baseline,
@@ -34,200 +29,12 @@ from apiscan.inference import (
 from apiscan.kite import Route
 from apiscan.output import ScanResult
 from apiscan.scantree import BoundaryGroup, ScanTree, _LOOKAHEAD_SEGMENTS
-
-
-# ---------------------------------------------------------------------------
-# Work items
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _ProbeWork:
-    """Probe a prefix for handler boundaries."""
-    prefix: str = ""
-    depth: int = 0
-
-
-@dataclass
-class _RouteWork:
-    """Scan a route against its baseline."""
-    route: Route = None
-
-
-@dataclass
-class _LookaheadWork:
-    """Lightweight GET probe for a single lookahead segment."""
-    prefix: str = ""
-    segment: str = ""
+from apiscan.workqueue import LookaheadWork, ProbeWork, RouteWork, WorkQueue
 
 
 # Transient errors that a worker should swallow (network, timeout, server).
 # Programming errors (TypeError, KeyError, AttributeError, etc.) propagate.
 _TRANSIENT_ERRORS = (httpx.HTTPError, OSError, TimeoutError)
-
-
-# ---------------------------------------------------------------------------
-# Work queue — dependency-aware scheduling via TopologicalSorter
-# ---------------------------------------------------------------------------
-
-_STAGE_ORDER = ["probing", "wordlist", "recursing", "lookahead"]
-
-
-class _WorkQueue:
-    """Dependency-aware work queue backed by ``graphlib.TopologicalSorter``.
-
-    Items are declared with ``add(key, item, *deps)`` before calling
-    ``prepare()``.  Workers pull ready items via ``get()`` and signal
-    completion with ``item_done(key)``, which releases dependents.
-
-    Dynamic work (recursion, lookahead, redirects) whose dependencies
-    are already satisfied is added via ``enqueue_dynamic()``.
-    """
-
-    def __init__(self) -> None:
-        self._ts = TopologicalSorter()
-        self._ready: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-        self._items: dict[str, Any] = {}
-        self._inflight = 0
-        self._done = asyncio.Event()
-        self._done.set()
-        # Virtual nodes: auto-complete when deps are met (no work item).
-        self._virtual: set[str] = set()
-        # Manual gates: become ready when deps are met, but require
-        # explicit item_done() from scan logic to complete.
-        self._manual_gates: set[str] = set()
-        # Keys added via enqueue_dynamic / enqueue_recursive_batch (not in main sorter).
-        self._dynamic_keys: set[str] = set()
-        # Post-prepare dynamic sorters for recursive batches.
-        self._dynamic_sorters: list[TopologicalSorter] = []
-        # Skip callback: if set, checked before releasing dependents.
-        self.skip_fn: Callable[[str, Any], bool] | None = None
-        self.skipped = 0
-
-    def add(self, key: str, item: Any, *deps: str) -> None:
-        """Declare a work item with dependencies (before prepare)."""
-        self._items[key] = item
-        self._ts.add(key, *deps)
-
-    def add_manual_gate(self, key: str, *deps: str) -> None:
-        """Declare a gate node completed explicitly via ``item_done``.
-
-        Unlike regular items, manual gates do NOT get pushed to the
-        worker queue.  They become ready when their deps are met, but
-        require scan logic to call ``item_done(key)`` to complete them
-        and release their dependents.
-        """
-        self._manual_gates.add(key)
-        self._ts.add(key, *deps)
-
-    def prepare(self) -> None:
-        """Finalise the static graph and push initially-ready items."""
-        self._ts.prepare()
-        self._push_ready()
-
-    def _push_ready(self) -> None:
-        recurse = False
-        for key in self._ts.get_ready():
-            if key in self._manual_gates:
-                # Gate is ready but needs explicit item_done().
-                self._inflight += 1
-                self._done.clear()
-                continue
-            item = self._items.get(key)
-            if item is None:
-                self._ts.done(key)
-                recurse = True
-                continue
-            if self.skip_fn and self.skip_fn(key, item):
-                self.skipped += 1
-                self._ts.done(key)
-                recurse = True
-                continue
-            self._inflight += 1
-            self._done.clear()
-            self._ready.put_nowait((key, item))
-        if recurse:
-            self._push_ready()
-
-    @property
-    def ready_count(self) -> int:
-        """Items ready to be pulled by workers."""
-        return self._ready.qsize()
-
-    @property
-    def blocked_count(self) -> int:
-        """Items waiting on unsatisfied dependencies."""
-        # Total items minus ready minus completed
-        return max(0, self._inflight - self._ready.qsize())
-
-    async def get(self) -> tuple[str, Any]:
-        """Pull the next ready item. Returns ``(key, item)``."""
-        return await self._ready.get()
-
-    def item_done(self, key: str) -> None:
-        """Mark *key* complete and release its dependents."""
-        self._inflight -= 1
-        if key not in self._dynamic_keys:
-            self._ts.done(key)
-            self._push_ready()
-        # Also check dynamic sorters
-        for ds in self._dynamic_sorters:
-            try:
-                ds.done(key)
-            except ValueError:
-                continue
-            for dk in ds.get_ready():
-                item = self._items.get(dk)
-                if item is None:
-                    continue
-                if self.skip_fn and self.skip_fn(dk, item):
-                    self.skipped += 1
-                    ds.done(dk)
-                    continue
-                self._inflight += 1
-                self._done.clear()
-                self._ready.put_nowait((dk, item))
-        if self._inflight == 0:
-            self._done.set()
-
-    def enqueue_dynamic(self, key: str, item: Any) -> None:
-        """Add work whose dependencies are already satisfied."""
-        self._items[key] = item
-        self._dynamic_keys.add(key)
-        self._inflight += 1
-        self._done.clear()
-        self._ready.put_nowait((key, item))
-
-    def enqueue_recursive_batch(
-        self, items: list[tuple[str, Any, list[str]]],
-    ) -> None:
-        """Add a batch of items with internal dependencies.
-
-        Each entry is ``(key, item, dep_keys)``.  A mini sorter resolves
-        internal ordering; items with no deps go straight to the ready queue.
-        """
-        if not items:
-            return
-        mini = TopologicalSorter()
-        for key, item, deps in items:
-            self._items[key] = item
-            self._dynamic_keys.add(key)
-            mini.add(key, *deps)
-        mini.prepare()
-        for key in mini.get_ready():
-            item = self._items[key]
-            if self.skip_fn and self.skip_fn(key, item):
-                self.skipped += 1
-                mini.done(key)
-                continue
-            self._inflight += 1
-            self._done.clear()
-            self._ready.put_nowait((key, item))
-        if mini.is_active():
-            self._dynamic_sorters.append(mini)
-
-    async def wait(self) -> None:
-        """Block until all work (static + dynamic) is complete."""
-        await self._done.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +201,7 @@ async def scan(
 
         # -- Build work graph --------------------------------------------
 
-        wq = _WorkQueue()
+        wq = WorkQueue()
         tracker.queue_size = lambda: wq._inflight
         tracker.skipped_fn = lambda: wq.skipped
         tracker.blocked_fn = lambda: wq.blocked_count
@@ -420,9 +227,9 @@ async def scan(
         if skip_wildcard_siblings:
             def _should_skip(key: str, item: Any) -> bool:
                 """Skip probes/routes covered by a known wildcard handler."""
-                if isinstance(item, _ProbeWork):
+                if isinstance(item, ProbeWork):
                     path = item.prefix
-                elif isinstance(item, _RouteWork):
+                elif isinstance(item, RouteWork):
                     path = item.route.template_path
                 else:
                     return False
@@ -534,10 +341,18 @@ async def scan(
                 return None
             items: list[tuple[str, Any, list[str]]] = []
             seen_sub: set[str] = set()
+            stripped = 0
+            injected = 0
+            deduped = 0
             for route in wordlist:
-                new_path = f"{prefix}{route.template_path}"
+                route_path = route.template_path
+                if prefix != "/" and route_path.startswith(prefix):
+                    route_path = route_path[len(prefix):]
+                    stripped += 1
+                new_path = f"{prefix}{route_path}"
                 route_key_pair = (new_path, route.method)
                 if route_key_pair not in tree._seen:
+                    injected += 1
                     new_route = Route(template_path=new_path, method=route.method)
                     tree.insert(new_route)
                     tracker.plan(1)
@@ -548,19 +363,22 @@ async def scan(
                     if sub_prefix != prefix and sub_prefix not in seen_sub and sub_prefix not in probed_prefixes:
                         seen_sub.add(sub_prefix)
                         probe_key = f"recurse-probe:{sub_prefix}"
-                        items.append((probe_key, _ProbeWork(prefix=sub_prefix, depth=depth + 1), []))
-                        items.append((route_key, _RouteWork(route=new_route), [probe_key]))
+                        items.append((probe_key, ProbeWork(prefix=sub_prefix, depth=depth + 1), []))
+                        items.append((route_key, RouteWork(route=new_route), [probe_key]))
                     else:
-                        items.append((route_key, _RouteWork(route=new_route), []))
+                        items.append((route_key, RouteWork(route=new_route), []))
+                else:
+                    deduped += 1
+            if on_debug and (stripped or injected or deduped):
+                on_debug(f"recurse {prefix}: {stripped} stripped, {injected} injected, {deduped} deduped")
             if items:
                 wq.enqueue_recursive_batch(items)
-                route_count = sum(1 for k, _, _ in items if k.startswith("recurse-route:"))
-                return f"recurse (depth {depth + 1})"
+                return f"recurse (depth {depth + 1}, {injected} new)"
             return None
 
         # -- Work handlers ------------------------------------------------
 
-        async def _handle_probe(work: _ProbeWork, key: str) -> None:
+        async def _handle_probe(work: ProbeWork, key: str) -> None:
             if work.prefix in probed_prefixes:
                 return
             probed_prefixes.add(work.prefix)
@@ -579,9 +397,9 @@ async def scan(
             if not group and lookahead and not tree._resolve(work.prefix).children:
                 for i, seg in enumerate(_LOOKAHEAD_SEGMENTS):
                     la_key = f"lookahead:{work.prefix}/{seg}"
-                    wq.enqueue_dynamic(la_key, _LookaheadWork(prefix=work.prefix, segment=seg))
+                    wq.enqueue_dynamic(la_key, LookaheadWork(prefix=work.prefix, segment=seg))
 
-        async def _handle_lookahead(work: _LookaheadWork) -> None:
+        async def _handle_lookahead(work: LookaheadWork) -> None:
             sub_prefix = f"{work.prefix}/{work.segment}"
             sub_node = tree._resolve(sub_prefix)
             if sub_node and "GET" in sub_node.baselines:
@@ -607,9 +425,9 @@ async def scan(
                     depth = prefix_depth[ancestor] + 1
                     break
             la_probe_key = f"recurse-probe:{sub_prefix}"
-            wq.enqueue_dynamic(la_probe_key, _ProbeWork(prefix=sub_prefix, depth=depth))
+            wq.enqueue_dynamic(la_probe_key, ProbeWork(prefix=sub_prefix, depth=depth))
 
-        async def _handle_route(work: _RouteWork, key: str) -> None:
+        async def _handle_route(work: RouteWork, key: str) -> None:
             nonlocal conn_failures
             route = work.route
             async with conn_lock:
@@ -679,7 +497,7 @@ async def scan(
                             tree.insert(Route(template_path=redir_path, method=route.method))
                             tracker.plan(1)
                             redir_key = f"redir-route:{redir_path}:{route.method}"
-                            wq.enqueue_dynamic(redir_key, _RouteWork(
+                            wq.enqueue_dynamic(redir_key, RouteWork(
                                 route=Route(template_path=redir_path, method=route.method)))
 
             emitted = 0
@@ -704,11 +522,11 @@ async def scan(
                 except asyncio.CancelledError:
                     return
                 try:
-                    if isinstance(item, _ProbeWork):
+                    if isinstance(item, ProbeWork):
                         await _handle_probe(item, key)
-                    elif isinstance(item, _RouteWork):
+                    elif isinstance(item, RouteWork):
                         await _handle_route(item, key)
-                    elif isinstance(item, _LookaheadWork):
+                    elif isinstance(item, LookaheadWork):
                         await _handle_lookahead(item)
                 except asyncio.CancelledError:
                     wq.item_done(key)
@@ -746,7 +564,7 @@ async def scan(
 # Work graph construction
 # ---------------------------------------------------------------------------
 
-def _build_work_graph(tree: ScanTree, wq: _WorkQueue) -> set[str]:
+def _build_work_graph(tree: ScanTree, wq: WorkQueue) -> set[str]:
     """Traverse the tree and declare all work items + dependency edges.
 
     Returns the set of paths that have a ``segment:{path}`` manual gate
@@ -759,20 +577,20 @@ def _build_work_graph(tree: ScanTree, wq: _WorkQueue) -> set[str]:
             # Root node: routes have no prefix dependency
             for route in sorted(node.routes, key=lambda r: r.template_path):
                 key = f"route:{route.template_path}:{route.method}"
-                wq.add(key, _RouteWork(route=route))
+                wq.add(key, RouteWork(route=route))
         else:
             probe_key = f"probe:{prefix}"
 
             if parent_prefix == "":
                 # First-level prefix: no parent probe dependency
-                wq.add(probe_key, _ProbeWork(prefix=prefix, depth=0))
+                wq.add(probe_key, ProbeWork(prefix=prefix, depth=0))
             else:
                 parent_probe = f"probe:{parent_prefix}"
-                wq.add(probe_key, _ProbeWork(prefix=prefix, depth=0), parent_probe)
+                wq.add(probe_key, ProbeWork(prefix=prefix, depth=0), parent_probe)
 
             for route in sorted(node.routes, key=lambda r: r.template_path):
                 route_key = f"route:{route.template_path}:{route.method}"
-                wq.add(route_key, _RouteWork(route=route), probe_key)
+                wq.add(route_key, RouteWork(route=route), probe_key)
 
         # Visit children in sorted order, detecting segment-prefix gates
         sorted_segs = sorted(node.children)
@@ -805,13 +623,13 @@ def _build_work_graph(tree: ScanTree, wq: _WorkQueue) -> set[str]:
                 probe_key = f"probe:{child_prefix}"
                 segment_key = f"segment:{gate_path}"
                 if parent_prefix == "":
-                    wq.add(probe_key, _ProbeWork(prefix=child_prefix, depth=0), segment_key)
+                    wq.add(probe_key, ProbeWork(prefix=child_prefix, depth=0), segment_key)
                 else:
                     parent_probe = f"probe:{parent_prefix}"
-                    wq.add(probe_key, _ProbeWork(prefix=child_prefix, depth=0), segment_key, parent_probe)
+                    wq.add(probe_key, ProbeWork(prefix=child_prefix, depth=0), segment_key, parent_probe)
                 for route in sorted(child_node.routes, key=lambda r: r.template_path):
                     route_key = f"route:{route.template_path}:{route.method}"
-                    wq.add(route_key, _RouteWork(route=route), probe_key)
+                    wq.add(route_key, RouteWork(route=route), probe_key)
                 # Recurse into deferred node's children
                 for subseg in sorted(child_node.children):
                     sub_prefix = f"{child_prefix}/{subseg}"

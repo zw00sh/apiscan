@@ -12,6 +12,7 @@ the same pipeline.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable
 from uuid import uuid4
@@ -39,6 +40,7 @@ class ResponseSignature:
     line_count: int
     header_names: frozenset[str]
     allow: str = ""
+    body_hash: bytes = b""
 
 
 @dataclass
@@ -73,6 +75,7 @@ def compute_signature(
     content_type = raw_ct.split(";", 1)[0].strip().lower()
 
     content_length = len(body)
+    body_hash = hashlib.sha256(body[:1024]).digest()[:8]
     word_count = body.count(b" ") + (1 if body else 0)
     line_count = body.count(b"\n") + (1 if body else 0)
 
@@ -96,6 +99,7 @@ def compute_signature(
         line_count=line_count,
         header_names=frozenset(k.lower() for k in headers),
         allow=headers.get("allow", headers.get("Allow", "")),
+        body_hash=body_hash,
     )
 
 
@@ -147,9 +151,25 @@ def matches_baseline(
         if sig.content_length == expected:
             return f"status={ref.status_code}, scaled length={sig.content_length}"
 
+    # Fuzzy length: words+lines match but length differs slightly (timestamps, nonces)
+    if ("content_length" in stable and ref.content_length > 0
+            and "word_count" in stable and "line_count" in stable
+            and sig.word_count == ref.word_count and sig.line_count == ref.line_count):
+        tolerance = min(64, max(1, int(ref.content_length * 0.05)))
+        delta = abs(sig.content_length - ref.content_length)
+        if 0 < delta <= tolerance:
+            return f"status={ref.status_code}, fuzzy length={sig.content_length}±{delta} (baseline={ref.content_length})"
+
     if ("word_count" in stable and "line_count" in stable
             and sig.word_count == ref.word_count and sig.line_count == ref.line_count):
         return f"status={ref.status_code}, words={sig.word_count}, lines={sig.line_count}"
+
+    # Body hash dedup: identical first 1024 bytes + same length
+    if sig.body_hash and sig.content_length > 0:
+        for bl_sig in baseline.signatures:
+            if (bl_sig.body_hash == sig.body_hash
+                    and bl_sig.content_length == sig.content_length):
+                return f"status={ref.status_code}, body hash={sig.body_hash.hex()[:8]}"
 
     return None
 
@@ -362,6 +382,8 @@ class InferenceEngine:
             return []
 
         trace.append(f"deviates({sig.status_code})")
+        if sig.body_hash:
+            trace.append(f"hash={sig.body_hash.hex()[:8]}")
 
         # Verification: method change probe
         if self._tracker:
