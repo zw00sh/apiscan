@@ -1,7 +1,7 @@
 ```
  ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
  █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
- api content discovery · v1.0.0
+ api content discovery · v1.0.1
 ```
 
 Method-aware API content discovery tool. Ships with curated wordlists built from 26k+ Swagger specs, HTTP Archive traffic data, and SecLists.

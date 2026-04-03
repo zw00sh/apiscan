@@ -90,7 +90,6 @@ class _WorkQueue:
         self._inflight = 0
         self._done = asyncio.Event()
         self._done.set()
-        self._stage_counts: dict[str, int] = {}
         # Virtual nodes: auto-complete when deps are met (no work item).
         self._virtual: set[str] = set()
         # Manual gates: become ready when deps are met, but require
@@ -143,36 +142,11 @@ class _WorkQueue:
                 self._ts.done(key)
                 recurse = True
                 continue
-            stage = self._stage_for_key(key)
-            self._stage_counts[stage] = self._stage_counts.get(stage, 0) + 1
             self._inflight += 1
             self._done.clear()
             self._ready.put_nowait((key, item))
         if recurse:
             self._push_ready()
-
-    @staticmethod
-    def _stage_for_key(key: str) -> str:
-        if key.startswith("probe:"):
-            return "probing"
-        if key.startswith("route:"):
-            return "wordlist"
-        if key.startswith("lookahead:"):
-            return "lookahead"
-        if key.startswith("recurse-route:") or key.startswith("recurse-probe:"):
-            return "recursing"
-        return "wordlist"
-
-    @property
-    def stage(self) -> str:
-        """Stage with the most active work items."""
-        best = ""
-        best_count = 0
-        for s, count in self._stage_counts.items():
-            if count > best_count:
-                best = s
-                best_count = count
-        return best
 
     @property
     def ready_count(self) -> int:
@@ -191,8 +165,6 @@ class _WorkQueue:
 
     def item_done(self, key: str) -> None:
         """Mark *key* complete and release its dependents."""
-        stage = self._stage_for_key(key)
-        self._stage_counts[stage] = max(0, self._stage_counts.get(stage, 0) - 1)
         self._inflight -= 1
         if key not in self._dynamic_keys:
             self._ts.done(key)
@@ -211,19 +183,16 @@ class _WorkQueue:
                     self.skipped += 1
                     ds.done(dk)
                     continue
-                s = self._stage_for_key(dk)
-                self._stage_counts[s] = self._stage_counts.get(s, 0) + 1
                 self._inflight += 1
                 self._done.clear()
                 self._ready.put_nowait((dk, item))
         if self._inflight == 0:
             self._done.set()
 
-    def enqueue_dynamic(self, key: str, item: Any, stage: str = "wordlist") -> None:
+    def enqueue_dynamic(self, key: str, item: Any) -> None:
         """Add work whose dependencies are already satisfied."""
         self._items[key] = item
         self._dynamic_keys.add(key)
-        self._stage_counts[stage] = self._stage_counts.get(stage, 0) + 1
         self._inflight += 1
         self._done.clear()
         self._ready.put_nowait((key, item))
@@ -250,7 +219,6 @@ class _WorkQueue:
                 self.skipped += 1
                 mini.done(key)
                 continue
-            self._stage_counts["recursing"] = self._stage_counts.get("recursing", 0) + 1
             self._inflight += 1
             self._done.clear()
             self._ready.put_nowait((key, item))
@@ -293,7 +261,6 @@ class RequestTracker:
         self.planned = initial_planned
         self.routes_planned = 0
         self.queue_size: Callable[[], int] | None = None
-        self.stage: Callable[[], str] | None = None
         self.skipped_fn: Callable[[], int] | None = None
         self.blocked_fn: Callable[[], int] | None = None
         self._on_tick = on_tick
@@ -351,7 +318,6 @@ async def scan(
     *,
     concurrency: int = 10,
     rate_limit: float | None = None,
-    on_phase: Callable[[str, int], None] | None = None,
     timeout: float = 10.0,
     max_redirects: int = 3,
     status_blacklist: set[int] | None = None,
@@ -362,7 +328,6 @@ async def scan(
     on_progress: Callable[[int], None] | None = None,
     on_filtered: Callable[[str, str, int, str], None] | None = None,
     on_debug: Callable[[str], None] | None = None,
-    on_recurse: Callable[[str, int, int], None] | None = None,
     tracker: RequestTracker | None = None,
     recurse: bool = False,
     max_depth: int = 2,
@@ -431,7 +396,6 @@ async def scan(
 
         wq = _WorkQueue()
         tracker.queue_size = lambda: wq._inflight
-        tracker.stage = lambda: wq.stage
         tracker.skipped_fn = lambda: wq.skipped
         tracker.blocked_fn = lambda: wq.blocked_count
         segment_gates = _build_work_graph(tree, wq)
@@ -536,13 +500,15 @@ async def scan(
 
         # -- Helpers ------------------------------------------------------
 
-        def _emit(finding: Finding, **kw) -> None:
+        def _emit(finding: Finding, recurse_info: str | None = None, **kw) -> None:
             result = _finding_to_result(finding, base_url, **kw)
+            if recurse_info:
+                result.recurse_info = recurse_info
             results.append(result)
             if on_result:
                 on_result(result)
 
-        async def _emit_boundary(group: BoundaryGroup) -> None:
+        async def _emit_boundary(group: BoundaryGroup, recurse_info: str | None = None) -> None:
             findings = []
             for probe in group.probes:
                 finding = engine.classify_boundary(probe)
@@ -560,11 +526,12 @@ async def scan(
             )
             if await _check_segment_prefix(boundary_finding):
                 return
-            _emit(boundary_finding)
+            _emit(boundary_finding, recurse_info=recurse_info)
 
-        def _inject_recursive(prefix: str, depth: int) -> None:
+        def _inject_recursive(prefix: str, depth: int) -> str | None:
+            """Inject recursive routes and return info string, or None."""
             if not recurse or depth >= max_depth:
-                return
+                return None
             items: list[tuple[str, Any, list[str]]] = []
             seen_sub: set[str] = set()
             for route in wordlist:
@@ -588,8 +555,8 @@ async def scan(
             if items:
                 wq.enqueue_recursive_batch(items)
                 route_count = sum(1 for k, _, _ in items if k.startswith("recurse-route:"))
-                if on_recurse:
-                    on_recurse(prefix, route_count, depth + 1)
+                return f"recurse (depth {depth + 1})"
+            return None
 
         # -- Work handlers ------------------------------------------------
 
@@ -601,8 +568,8 @@ async def scan(
 
             group = await tree.probe_prefix(work.prefix, send_fn, tracker, methods=methods)
             if group:
-                await _emit_boundary(group)
-                _inject_recursive(work.prefix, work.depth)
+                recurse_info = _inject_recursive(work.prefix, work.depth)
+                await _emit_boundary(group, recurse_info=recurse_info)
             else:
                 # No boundary — complete segment gate if this is one
                 if work.prefix in segment_gates:
@@ -612,7 +579,7 @@ async def scan(
             if not group and lookahead and not tree._resolve(work.prefix).children:
                 for i, seg in enumerate(_LOOKAHEAD_SEGMENTS):
                     la_key = f"lookahead:{work.prefix}/{seg}"
-                    wq.enqueue_dynamic(la_key, _LookaheadWork(prefix=work.prefix, segment=seg), stage="lookahead")
+                    wq.enqueue_dynamic(la_key, _LookaheadWork(prefix=work.prefix, segment=seg))
 
         async def _handle_lookahead(work: _LookaheadWork) -> None:
             sub_prefix = f"{work.prefix}/{work.segment}"
@@ -640,7 +607,7 @@ async def scan(
                     depth = prefix_depth[ancestor] + 1
                     break
             la_probe_key = f"recurse-probe:{sub_prefix}"
-            wq.enqueue_dynamic(la_probe_key, _ProbeWork(prefix=sub_prefix, depth=depth), stage="probing")
+            wq.enqueue_dynamic(la_probe_key, _ProbeWork(prefix=sub_prefix, depth=depth))
 
         async def _handle_route(work: _RouteWork, key: str) -> None:
             nonlocal conn_failures
@@ -679,8 +646,11 @@ async def scan(
                 conn_failures = 0
             tracker.tick()
 
+            # Use the initial status code for redirected responses so the
+            # output shows 301/302 instead of the final 200.
+            initial_status = resp.history[0].status_code if resp.history else resp.status_code
             sig = compute_signature(
-                resp.status_code, dict(resp.headers), resp.content, path,
+                initial_status, dict(resp.headers), resp.content, path,
             )
 
             findings = await engine.process(route, sig, path, send_fn)
@@ -696,8 +666,8 @@ async def scan(
 
             group = await tree.probe_prefix(path, send_fn, tracker, methods=methods)
             if group:
-                await _emit_boundary(group)
-                _inject_recursive(path, prefix_depth.get(path, 0))
+                recurse_info = _inject_recursive(path, prefix_depth.get(path, 0))
+                await _emit_boundary(group, recurse_info=recurse_info)
 
             redirect_location = str(resp.url) if resp.history else None
             if resp.history:
@@ -724,9 +694,6 @@ async def scan(
                 on_progress(emitted)
 
         # -- Worker dispatch ----------------------------------------------
-
-        if on_phase:
-            on_phase("scanning", len(tree))
 
         wq.prepare()
 

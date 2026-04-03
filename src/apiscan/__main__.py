@@ -17,7 +17,6 @@ from apiscan.output import (
     CYAN,
     DIM,
     GREEN,
-    MAGENTA,
     RESET,
     CSVWriter,
     ProgressTracker,
@@ -39,18 +38,18 @@ from apiscan.scanner import scan
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="apiscan",
-        description="Method-aware API content discovery using wordlists",
+        description="Method-aware API content discovery (default: built-in 10k wordlist)",
     )
     p.add_argument("-u", "--url", required=True, help="Target base URL")
 
-    wordlist = p.add_argument_group("wordlist")
+    wordlist = p.add_argument_group("wordlist (default: built-in 10k)")
     wl_mutex = wordlist.add_mutually_exclusive_group()
     wl_mutex.add_argument("-w", "--wordlist", default=None, metavar="PATH",
                           help="Custom wordlist file (one path per line)")
     wl_mutex.add_argument("--short", action="store_true",
-                          help="Use built-in top 1k wordlist (fast)")
+                          help="Built-in top 1k wordlist (fast)")
     wl_mutex.add_argument("--long", action="store_true",
-                          help="Use built-in top 100k wordlist (thorough)")
+                          help="Built-in top 100k wordlist (thorough)")
 
     recursion = p.add_argument_group("recursion")
     recursion.add_argument("--recurse", action="store_true",
@@ -218,10 +217,6 @@ async def _scan(args: argparse.Namespace) -> None:
         if progress:
             progress.update(findings_delta)
 
-    def on_phase(label: str, phase_total: int) -> None:
-        if progress:
-            progress.set_phase(label, phase_total)
-
     def _debug_print(msg: str) -> None:
         d2 = DIM if use_color else ""
         r2 = RESET if use_color else ""
@@ -236,15 +231,6 @@ async def _scan(args: argparse.Namespace) -> None:
 
     def on_debug(msg: str) -> None:
         _debug_print(msg)
-
-    def on_recurse(prefix: str, new_routes: int, depth: int) -> None:
-        m = MAGENTA if use_color else ""
-        r2 = RESET if use_color else ""
-        d2 = DIM if use_color else ""
-        b2 = BOLD if use_color else ""
-        if progress:
-            print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
-        print(f"{m}  recurse{r2} {b2}{prefix}/*{r2} {d2}+{new_routes} routes (depth {depth}){r2}", file=sys.stderr)
 
     # Track results via callback so partial results survive Ctrl+C
     all_findings: list[ScanResult] = []
@@ -270,12 +256,10 @@ async def _scan(args: argparse.Namespace) -> None:
             status_blacklist=_parse_codes(args.exclude),
             status_whitelist=_parse_codes(args.include),
             extra_headers=_parse_headers(args.header),
-            on_phase=on_phase,
             on_result=on_result_tracking,
             on_progress=on_progress,
             on_filtered=on_filtered,
             on_debug=on_debug if args.debug else None,
-            on_recurse=on_recurse if args.recurse else None,
             tracker=req_tracker,
             recurse=args.recurse,
             max_depth=args.max_depth,
@@ -312,10 +296,19 @@ async def _scan(args: argparse.Namespace) -> None:
             if tree_str:
                 print(f"\n{tree_str}")
         boundary_count = sum(1 for f in findings if f.reason.startswith("boundary:"))
+        if args.short:
+            wl_tier = "short"
+        elif getattr(args, "long"):
+            wl_tier = "long"
+        elif args.wordlist:
+            wl_tier = "custom"
+        else:
+            wl_tier = "default"
         print_hints(
             recurse=args.recurse, lookahead=args.lookahead,
             methods=scan_methods, boundaries_found=boundary_count,
             wildcard_skipped=req_tracker.skipped_fn() if req_tracker.skipped_fn else 0,
+            wordlist_tier=wl_tier,
             use_color=use_color,
         )
 

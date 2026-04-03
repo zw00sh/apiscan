@@ -85,6 +85,7 @@ class ScanResult:
     word_count: int
     line_count: int
     redirect_location: str | None = None
+    recurse_info: str | None = None
     reason: str = ""
     confidence: str = ""
     timestamp: str = ""
@@ -164,8 +165,10 @@ def format_result(result: ScanResult, use_color: bool = True, verbose: bool = Fa
         hint = f" {DIM}({result.reason}){r}" if use_color else f" ({result.reason})"
         line += hint
     if result.redirect_location:
-        redir = f" -> {result.redirect_location}"
+        redir = f"→ {result.redirect_location}"
         line += f" {DIM}{redir}{r}" if use_color else redir
+    if result.recurse_info:
+        line += f" {MAGENTA}→ {result.recurse_info}{r}" if use_color else f" {result.recurse_info}"
     return line
 
 
@@ -182,7 +185,7 @@ def print_banner(target: str, route_count: int,
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v1.0.0{r}\n")
+    print(f" {d}api content discovery · v1.0.1{r}\n")
     print(f"  target:   {target}")
     print(f"  routes:   {route_count}")
     g = GREEN if use_color else ""
@@ -273,9 +276,6 @@ class ProgressTracker:
             return self._tracker.routes_planned
         return self._initial_route_total
 
-    def set_phase(self, phase: str, phase_total: int) -> None:
-        pass  # kept for API compat
-
     def tick_request(self) -> None:
         """Record a completed HTTP request for req/s calculation."""
         if self._finished:
@@ -320,13 +320,10 @@ class ProgressTracker:
         reqs_sent = self._tracker.sent if self._tracker else 0
         reqs_total = self._tracker.planned if self._tracker else 0
 
-        # Queue depth and stage from tracker
+        # Queue depth from tracker
         queued = 0
-        stage = ""
         if self._tracker and self._tracker.queue_size:
             queued = self._tracker.queue_size()
-        if self._tracker and self._tracker.stage:
-            stage = self._tracker.stage()
 
         # Request rate from sliding window
         if len(self._window) > 1:
@@ -364,21 +361,11 @@ class ProgressTracker:
         else:
             queue_str = ""
 
-        # Show if route total grew from recursion
-        recurse_str = ""
-        if self._tracker and hasattr(self._tracker, 'routes_planned') and stage == 'recursing':
-            if self._tracker.routes_planned > self._initial_route_total:
-                added = self._tracker.routes_planned - self._initial_route_total
-                recurse_str = f"{d}(+{added} routes){r} "
-
-        stage_str = f"| {d}{stage}{r} {recurse_str}" if stage else ""
-
         print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
         line = (f"[{g}{route_bar}{r}{d}{route_pct:2.0f}%{r}] "
                 f"|   {d}{self.routes_completed}/{self.route_total} routes{r} "
                 f"| {d}{rps:.0f} req/s{r} {queue_str} "
                 f"| {c}{self.findings} found{r} "
-                f"{stage_str}"
                 f"{hidden_str}")
         print(f"\r{line}", end="", flush=True, file=sys.stderr)
 
@@ -467,11 +454,17 @@ def format_findings_tree(results: list[ScanResult], use_color: bool = True) -> s
 
 def print_hints(*, recurse: bool, lookahead: bool, methods: list[str],
                 boundaries_found: int, wildcard_skipped: int = 0,
+                wordlist_tier: str = "default",
                 use_color: bool = True) -> None:
     """Print contextual suggestions for improving scan coverage."""
     d = DIM if use_color else ""
     r = RESET if use_color else ""
     hints: list[str] = []
+
+    if wordlist_tier == "short":
+        hints.append("using 1k wordlist — run without --short for 10k coverage")
+    elif wordlist_tier == "default":
+        hints.append("--long for thorough 100k-path coverage")
 
     if not recurse and boundaries_found > 0:
         hints.append(f"{boundaries_found} handler boundaries found — re-run with --recurse to explore them")

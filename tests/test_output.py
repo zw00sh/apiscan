@@ -283,6 +283,19 @@ class TestHints:
 
     def test_no_hints_when_all_enabled(self, capsys):
         print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
-                    boundaries_found=0, use_color=False)
+                    boundaries_found=0, wordlist_tier="long", use_color=False)
         output = capsys.readouterr().err
         assert output.strip() == ""
+
+    def test_short_wordlist_hint(self, capsys):
+        print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
+                    boundaries_found=0, wordlist_tier="short", use_color=False)
+        output = capsys.readouterr().err
+        assert "--short" in output
+        assert "10k" in output
+
+    def test_default_wordlist_hint(self, capsys):
+        print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
+                    boundaries_found=0, wordlist_tier="default", use_color=False)
+        output = capsys.readouterr().err
+        assert "--long" in output
