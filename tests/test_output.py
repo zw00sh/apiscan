@@ -195,17 +195,24 @@ class TestBanner:
         output = capsys.readouterr().out
         assert "unlimited" in output
 
-    def test_banner_features(self, capsys):
+    def test_banner_features_natural_language(self, capsys):
         print_banner("http://example.com", 90, ["GET"], use_color=False,
-                     recurse=True, lookahead=True)
+                     recurse=True, lookahead=True, max_depth=3)
         output = capsys.readouterr().out
-        assert "--recurse" in output
-        assert "--lookahead" in output
+        assert "recursion to depth 3" in output
+        assert "lookahead" in output
 
-    def test_banner_no_features_line_when_none(self, capsys):
-        print_banner("http://example.com", 90, ["GET"], use_color=False)
+    def test_banner_lookahead_default(self, capsys):
+        print_banner("http://example.com", 90, ["GET"], use_color=False,
+                     lookahead=True)
         output = capsys.readouterr().out
-        assert "features:" not in output
+        assert "features: lookahead" in output
+
+    def test_banner_no_lookahead(self, capsys):
+        print_banner("http://example.com", 90, ["GET"], use_color=False,
+                     lookahead=False)
+        output = capsys.readouterr().out
+        assert "lookahead disabled" in output
 
 
 class TestFindingsTree:
@@ -264,11 +271,12 @@ class TestHints:
         assert "--recurse-all" in output
         assert "re-run with --recurse" not in output
 
-    def test_lookahead_hint(self, capsys):
-        print_hints(recurse=True, lookahead=False, methods=["GET", "POST", "PUT"],
+    def test_no_lookahead_hint(self, capsys):
+        """Lookahead is now default — no hint to enable it."""
+        print_hints(recurse=True, lookahead=True, methods=["GET", "POST", "PUT"],
                     boundaries_found=0, use_color=False)
         output = capsys.readouterr().err
-        assert "--lookahead" in output
+        assert "--lookahead" not in output
 
     def test_methods_hint_for_default(self, capsys):
         print_hints(recurse=True, lookahead=True, methods=["GET", "POST"],

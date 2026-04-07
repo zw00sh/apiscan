@@ -179,7 +179,7 @@ def print_banner(target: str, route_count: int,
                  methods: list[str], use_color: bool = True, *,
                  concurrency: int = 10, rate_limit: float | None = None,
                  timeout: float = 10.0, recurse: bool = False,
-                 lookahead: bool = False) -> None:
+                 lookahead: bool = True, max_depth: int = 2) -> None:
     b = BOLD if use_color else ""
     r = RESET if use_color else ""
     d = DIM if use_color else ""
@@ -193,12 +193,13 @@ def print_banner(target: str, route_count: int,
     rate_str = f"{rate_limit:.0f} req/s" if rate_limit else "unlimited"
     print(f"  http:     {concurrency} workers, {rate_str}, {timeout}s timeout")
     features = []
-    if recurse:
-        features.append("--recurse")
     if lookahead:
-        features.append("--lookahead")
-    if features:
-        print(f"  features: {', '.join(features)}")
+        features.append("lookahead")
+    else:
+        features.append("lookahead disabled")
+    if recurse:
+        features.append(f"recursion to depth {max_depth}")
+    print(f"  features: {', '.join(features)}")
     print()
 
 
@@ -477,9 +478,6 @@ def print_hints(*, recurse: bool, lookahead: bool, methods: list[str],
 
     if wildcard_skipped > 0:
         hints.append(f"{wildcard_skipped} wildcard siblings skipped — use --no-skip-wildcard-siblings to probe them individually")
-
-    if not lookahead:
-        hints.append("--lookahead probes common segments one level deeper")
 
     if sorted(methods) == ["GET", "POST"]:
         hints.append("-m GET,POST,PUT,DELETE,PATCH for broader method coverage")

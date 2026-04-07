@@ -146,3 +146,17 @@ class TestRecursionFlags:
         ns = self._parse("-u", "http://x")
         assert ns.recurse is False
         assert ns.recurse_all is False
+
+
+class TestLookaheadFlags:
+    def _parse(self, *args: str):
+        parser = _build_parser()
+        return parser.parse_args([*args])
+
+    def test_lookahead_default_enabled(self):
+        ns = self._parse("-u", "http://x")
+        assert ns.no_lookahead is False
+
+    def test_no_lookahead_disables(self):
+        ns = self._parse("-u", "http://x", "--no-lookahead")
+        assert ns.no_lookahead is True
