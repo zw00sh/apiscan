@@ -361,7 +361,7 @@ class ProgressTracker:
         else:
             queue_str = ""
 
-        print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
+        print(f"\033[2K\r", end="", file=sys.stderr, flush=True)
         line = (f"[{g}{route_bar}{r}{d}{route_pct:2.0f}%{r}] "
                 f"|   {d}{self.routes_completed}/{self.route_total} routes{r} "
                 f"| {d}{rps:.0f} req/s{r} {queue_str} "
@@ -371,12 +371,16 @@ class ProgressTracker:
 
 
 def print_summary(findings: int, total_candidates: int, total_requests: int,
-                  elapsed: float, use_color: bool = True) -> None:
+                  elapsed: float, use_color: bool = True,
+                  errors: int = 0) -> None:
     d = DIM if use_color else ""
     r = RESET if use_color else ""
     b = BOLD if use_color else ""
     avg_rps = total_requests / elapsed if elapsed > 0 else 0
     print(f"\n{b}{findings} findings{r} from {total_candidates} candidates in {total_requests} requests {d}({elapsed:.1f}s, {avg_rps:.0f} avg req/s){r}")
+    if errors:
+        y = YELLOW if use_color else ""
+        print(f"  {y}{errors} connection errors{r}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

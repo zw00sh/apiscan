@@ -399,7 +399,7 @@ class InferenceEngine:
             if method_allow:
                 verify += f" allow={method_allow}"
             trace.append(verify)
-        except Exception:
+        except Exception:  # send_fn tracks errors; note in trace
             trace.append(f"verify {alt_method}=err")
 
         # Check for new headers
@@ -451,7 +451,7 @@ class InferenceEngine:
         async def _probe(method: str) -> tuple[str, ResponseSignature | None]:
             try:
                 return method, await send_fn(method, path, None, None)
-            except Exception:
+            except Exception:  # send_fn tracks errors; skip failed probes
                 return method, None
 
         results = await asyncio.gather(*[_probe(m) for m in alt_methods])

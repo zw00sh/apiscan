@@ -205,6 +205,11 @@ class WorkQueue:
         if candidates:
             self._push_ready(candidates)
 
+    def drain(self) -> None:
+        """Mark all remaining work complete immediately."""
+        self._inflight = 0
+        self._done.set()
+
     async def wait(self) -> None:
         """Block until all work (static + dynamic) is complete."""
         await self._done.wait()

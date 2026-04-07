@@ -315,7 +315,8 @@ async def _scan(args: argparse.Namespace) -> None:
     if not suppress_ui:
         if interrupted:
             print(f"\n  {d}interrupted{r}", file=sys.stderr)
-        print_summary(len(findings), req_tracker.routes_planned, req_tracker.sent, elapsed, use_color)
+        print_summary(len(findings), req_tracker.routes_planned, req_tracker.sent, elapsed, use_color,
+                      errors=req_tracker.errors)
         if findings:
             tree_str = format_findings_tree(findings, use_color)
             if tree_str:

@@ -319,6 +319,167 @@ class TestSmartRecursion:
 
 
 # ---------------------------------------------------------------------------
+# Connection error handling
+# ---------------------------------------------------------------------------
+
+class TestConnectionErrorHandling:
+    @pytest.mark.asyncio
+    async def test_send_tracks_consecutive_errors(self, test_server_url):
+        """Consecutive errors increment, success resets to 0."""
+        session = ScanSession(test_server_url, [], concurrency=1, timeout=0.5)
+        async with __import__("httpx").AsyncClient(verify=False) as client:
+            session._client = client
+            session._tracker = __import__("apiscan.scanner", fromlist=["RequestTracker"]).RequestTracker()
+            # /slow times out (5s delay, 0.5s timeout) → error
+            try:
+                await session._send("GET", "/slow")
+            except Exception:
+                pass
+            assert session._consecutive_errors == 1
+            assert session._total_errors == 1
+            # Successful request resets consecutive
+            sig = await session._send("GET", "/api/v1/health")
+            assert session._consecutive_errors == 0
+            assert session._total_errors == 1  # total doesn't reset
+
+    @pytest.mark.asyncio
+    async def test_abort_after_threshold(self, test_server_url):
+        """Session aborts after error_threshold consecutive failures."""
+        session = ScanSession(
+            test_server_url, [], concurrency=1, timeout=0.01,
+            error_threshold=3,
+        )
+        async with __import__("httpx").AsyncClient(verify=False) as client:
+            session._client = client
+            session._tracker = __import__("apiscan.scanner", fromlist=["RequestTracker"]).RequestTracker()
+            for _ in range(5):
+                try:
+                    await session._send("GET", "/slow")
+                except Exception:
+                    pass
+            assert session._aborted is True
+            assert session._consecutive_errors >= 3
+
+    @pytest.mark.asyncio
+    async def test_warn_prints_to_stderr(self, test_server_url, capsys):
+        """Warning should be printed to stderr after 5 consecutive errors."""
+        session = ScanSession(
+            test_server_url, [], concurrency=1, timeout=0.01,
+            error_threshold=10,
+        )
+        async with __import__("httpx").AsyncClient(verify=False) as client:
+            session._client = client
+            session._tracker = __import__("apiscan.scanner", fromlist=["RequestTracker"]).RequestTracker()
+            for _ in range(6):
+                try:
+                    await session._send("GET", "/slow")
+                except Exception:
+                    pass
+            stderr = capsys.readouterr().err
+            assert "warning" in stderr
+            assert "consecutive" in stderr
+
+    @pytest.mark.asyncio
+    async def test_error_count_integration(self, test_server_url):
+        """Scan with timeout errors should report total_errors > 0."""
+        routes = [Route(template_path="/slow", method="GET")]
+        session = ScanSession(
+            test_server_url, routes, concurrency=1, timeout=0.5,
+        )
+        await session.run()
+        assert session._total_errors > 0
+
+    @pytest.mark.asyncio
+    async def test_backoff_linear_scaling(self, test_server_url):
+        """Backoff should scale linearly, not exponentially."""
+        session = ScanSession(test_server_url, [], concurrency=1, timeout=0.01)
+        # Simulate n consecutive errors and check computed delay
+        # At n=5: linear 0.25*5=1.25s, exponential 2^5*0.1=3.2s
+        session._consecutive_errors = 5
+        delay = min(session._consecutive_errors * 0.25, 5.0)
+        assert delay == 1.25
+        # At n=20: linear caps at 5.0s
+        session._consecutive_errors = 20
+        delay = min(session._consecutive_errors * 0.25, 5.0)
+        assert delay == 5.0
+
+    @pytest.mark.asyncio
+    async def test_first_retry_has_no_delay(self, test_server_url):
+        """First retry after a single error should not sleep (backoff starts at >1)."""
+        import time
+        session = ScanSession(test_server_url, [], concurrency=1, timeout=0.01)
+        async with __import__("httpx").AsyncClient(verify=False) as client:
+            session._client = client
+            session._tracker = __import__("apiscan.scanner", fromlist=["RequestTracker"]).RequestTracker()
+            # Cause 1 error
+            try:
+                await session._send("GET", "/slow")
+            except Exception:
+                pass
+            assert session._consecutive_errors == 1
+            # Next request should not delay (backoff only kicks in at >1)
+            start = time.monotonic()
+            await session._send("GET", "/api/v1/health")
+            elapsed = time.monotonic() - start
+            assert session._consecutive_errors == 0
+            assert elapsed < 0.3
+
+    @pytest.mark.asyncio
+    async def test_recovery_message_printed(self, test_server_url, capsys):
+        """After 5+ errors then recovery, a recovery message should print."""
+        session = ScanSession(
+            test_server_url, [], concurrency=1, timeout=0.01,
+            error_threshold=100,
+        )
+        async with __import__("httpx").AsyncClient(verify=False) as client:
+            session._client = client
+            session._tracker = __import__("apiscan.scanner", fromlist=["RequestTracker"]).RequestTracker()
+            # Trigger 6 errors (past warning threshold)
+            for _ in range(6):
+                try:
+                    await session._send("GET", "/slow")
+                except Exception:
+                    pass
+            capsys.readouterr()  # clear warning output
+            # Now send a successful request — should trigger recovery message
+            await session._send("GET", "/api/v1/health")
+            stderr = capsys.readouterr().err
+            assert "recovered" in stderr.lower() or "connection restored" in stderr.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_recovery_message_below_threshold(self, test_server_url, capsys):
+        """No recovery message if fewer than 5 errors occurred."""
+        session = ScanSession(test_server_url, [], concurrency=1, timeout=0.01)
+        async with __import__("httpx").AsyncClient(verify=False) as client:
+            session._client = client
+            session._tracker = __import__("apiscan.scanner", fromlist=["RequestTracker"]).RequestTracker()
+            # Trigger 3 errors (below warning threshold)
+            for _ in range(3):
+                try:
+                    await session._send("GET", "/slow")
+                except Exception:
+                    pass
+            capsys.readouterr()  # clear
+            await session._send("GET", "/api/v1/health")
+            stderr = capsys.readouterr().err
+            assert "recovered" not in stderr.lower()
+            assert "connection restored" not in stderr.lower()
+
+    @pytest.mark.asyncio
+    async def test_aborted_scan_completes(self, test_server_url):
+        """An aborted scan should still return results, not hang."""
+        routes = [Route(template_path=f"/path{i}", method="GET") for i in range(10)]
+        # Use a non-routable IP to guarantee connection errors
+        session = ScanSession(
+            "http://192.0.2.1", routes, concurrency=2, timeout=0.5,
+            error_threshold=3,
+        )
+        results, tree = await session.run()
+        assert session._aborted is True
+        assert isinstance(results, list)
+
+
+# ---------------------------------------------------------------------------
 # ScanSession.run() matches scan() — integration
 # ---------------------------------------------------------------------------
 

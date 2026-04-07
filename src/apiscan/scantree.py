@@ -179,7 +179,7 @@ class ScanTree:
             try:
                 sig = await send_fn(method, path, None, None)
                 return method, sig
-            except Exception:
+            except Exception:  # send_fn tracks errors; skip failed probes
                 return method, None
 
         tasks = []
@@ -242,7 +242,7 @@ class ScanTree:
             probe_path = f"{prefix.rstrip('/')}/{_random_segment()}"
             try:
                 probe_sig = await send_fn(method, probe_path, None, None)
-            except Exception:
+            except Exception:  # send_fn tracks errors; skip failed probes
                 return method, None, None
 
             # Check against ALL ancestor baselines, not just nearest.
@@ -272,7 +272,7 @@ class ScanTree:
             try:
                 sig = await send_fn(method, extra_path, None, None)
                 return method, sig
-            except Exception:
+            except Exception:  # send_fn tracks errors; skip failed probes
                 return method, None
 
         variance_results = await asyncio.gather(*[_variance_probe(m) for m, _, _ in discoveries])

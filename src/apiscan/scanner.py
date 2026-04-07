@@ -11,6 +11,7 @@ Response classification is handled by :mod:`apiscan.inference`.
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from typing import Any, Callable
 
@@ -65,6 +66,7 @@ class RequestTracker:
 
     def __init__(self, initial_planned: int = 0, on_tick: Callable[[], None] | None = None) -> None:
         self.sent = 0
+        self.errors = 0
         self.planned = initial_planned
         self.routes_planned = 0
         self.queue_size: Callable[[], int] | None = None
@@ -202,7 +204,7 @@ class SegmentPrefixTracker:
         tracker.plan(1)
         try:
             probe_sig = await send_fn("GET", probe_path, None, None)
-        except Exception:
+        except Exception:  # send_fn tracks errors; skip failed probes
             self.complete_gate(path, wq)
             return False
 
@@ -264,7 +266,7 @@ class ScanSession:
         max_redirects: int = 3,
         status_blacklist: set[int] | None = None,
         status_whitelist: set[int] | None = None,
-        quarantine_threshold: int = 50,
+        error_threshold: int = 50,
         extra_headers: dict[str, str] | None = None,
         on_result: Callable[[ScanResult], None] | None = None,
         on_progress: Callable[[int], None] | None = None,
@@ -285,7 +287,7 @@ class ScanSession:
         self._concurrency = concurrency
         self._timeout = timeout
         self._max_redirects = max_redirects
-        self._quarantine_threshold = quarantine_threshold
+        self._error_threshold = error_threshold
         self._extra_headers = extra_headers or {}
         self._on_result = on_result
         self._on_progress = on_progress
@@ -309,8 +311,9 @@ class ScanSession:
         self._engine: InferenceEngine | None = None
         self._wq: WorkQueue | None = None
         self._client: httpx.AsyncClient | None = None
-        self._conn_failures = 0
-        self._conn_lock = asyncio.Lock()
+        self._consecutive_errors = 0
+        self._total_errors = 0
+        self._aborted = False
         self._probed_prefixes: set[str] = set()
         self._prefix_depth: dict[str, int] = {}
         self._prefixes = SegmentPrefixTracker()
@@ -348,6 +351,8 @@ class ScanSession:
             headers=self._extra_headers,
         ) as self._client:
             await self._tree.initialize(self._send, methods=self._methods)
+            if self._aborted:
+                return self._results, self._tree
 
             self._wq = WorkQueue()
             self._tracker.queue_size = lambda: self._wq._inflight
@@ -376,6 +381,44 @@ class ScanSession:
 
     # -- HTTP transport ------------------------------------------------------
 
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        body: str | None = None,
+    ) -> httpx.Response:
+        """Raw HTTP request with error tracking and backoff."""
+        if self._limiter:
+            await self._limiter.acquire()
+        errors_before = self._consecutive_errors
+        if errors_before > 1:
+            delay = min(errors_before * 0.25, 5.0)
+            await asyncio.sleep(delay)
+        try:
+            resp = await self._client.request(
+                method, url,
+                headers=headers or {},
+                content=body.encode() if body else None,
+                timeout=self._timeout,
+            )
+        except _TRANSIENT_ERRORS:
+            self._total_errors += 1
+            self._tracker.errors += 1
+            self._consecutive_errors += 1
+            self._warn_on_errors()
+            if self._consecutive_errors >= self._error_threshold:
+                self._aborted = True
+                if self._wq:
+                    self._wq.drain()
+            raise
+        if errors_before >= 5:
+            print(f"\033[2K\r  connection restored after {errors_before} errors",
+                  file=sys.stderr)
+        self._consecutive_errors = 0
+        self._tracker.tick()
+        return resp
+
     async def _send(
         self,
         method: str,
@@ -383,19 +426,26 @@ class ScanSession:
         headers: dict[str, str] | None = None,
         body: str | None = None,
     ) -> ResponseSignature:
+        """Send request and return ResponseSignature."""
         url = f"{self._base_url}{path}"
-        if self._limiter:
-            await self._limiter.acquire()
-        resp = await self._client.request(
-            method, url,
-            headers=headers or {},
-            content=body.encode() if body else None,
-            timeout=self._timeout,
-        )
-        self._tracker.tick()
+        resp = await self._request(method, url, headers, body)
         return compute_signature(
             resp.status_code, dict(resp.headers), resp.content, path,
         )
+
+    def _warn_on_errors(self) -> None:
+        """Print escalating warnings to stderr."""
+        n = self._consecutive_errors
+        msg = None
+        if n == 5:
+            msg = f"  warning: {n} consecutive connection errors"
+        elif n == 20:
+            msg = f"  warning: {n} consecutive errors, backing off"
+        elif n == self._error_threshold:
+            msg = f"  error: {n} consecutive errors, aborting scan"
+        if msg:
+            # Erase progress bar line, print warning, let progress redraw
+            print(f"\033[2K\r{msg}", file=sys.stderr)
 
     # -- Result emission -----------------------------------------------------
 
@@ -541,7 +591,7 @@ class ScanSession:
         probe_path = f"{sub_prefix}/{_random_segment()}"
         try:
             sig = await self._send("GET", probe_path, None, None)
-        except Exception:
+        except Exception:  # _send tracks errors; skip failed probes
             return
         path_len = len(probe_path.lstrip("/"))
         for bl in ancestor_baselines:
@@ -559,12 +609,6 @@ class ScanSession:
 
     async def _handle_route(self, work: RouteWork, key: str) -> None:
         route = work.route
-        async with self._conn_lock:
-            if self._conn_failures >= self._quarantine_threshold:
-                if self._on_progress:
-                    self._on_progress(0)
-                return
-
         path = route.template_path
         url = f"{self._base_url}{path}"
         if len(url) > 2000:
@@ -573,25 +617,12 @@ class ScanSession:
         headers: dict[str, str] = {}
         body_str: str | None = None
 
-        if self._limiter:
-            await self._limiter.acquire()
         try:
-            resp = await self._client.request(
-                route.method, url,
-                headers=headers,
-                content=body_str.encode() if body_str else None,
-                timeout=self._timeout,
-            )
-        except Exception:
-            async with self._conn_lock:
-                self._conn_failures += 1
+            resp = await self._request(route.method, url, headers, body_str)
+        except _TRANSIENT_ERRORS:
             if self._on_progress:
                 self._on_progress(0)
             return
-
-        async with self._conn_lock:
-            self._conn_failures = 0
-        self._tracker.tick()
 
         # Use the initial status code for redirected responses so the
         # output shows 301/302 instead of the final 200.
@@ -647,6 +678,8 @@ class ScanSession:
                 key, item = await self._wq.get()
             except asyncio.CancelledError:
                 return
+            if self._aborted:
+                return
             try:
                 if isinstance(item, ProbeWork):
                     await self._handle_probe(item, key)
@@ -678,7 +711,7 @@ async def scan(
     max_redirects: int = 3,
     status_blacklist: set[int] | None = None,
     status_whitelist: set[int] | None = None,
-    quarantine_threshold: int = 50,
+    error_threshold: int = 50,
     extra_headers: dict[str, str] | None = None,
     on_result: Callable[[ScanResult], None] | None = None,
     on_progress: Callable[[int], None] | None = None,
@@ -702,7 +735,7 @@ async def scan(
         max_redirects=max_redirects,
         status_blacklist=status_blacklist,
         status_whitelist=status_whitelist,
-        quarantine_threshold=quarantine_threshold,
+        error_threshold=error_threshold,
         extra_headers=extra_headers,
         on_result=on_result,
         on_progress=on_progress,
