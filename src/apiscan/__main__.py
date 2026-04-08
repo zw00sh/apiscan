@@ -67,8 +67,11 @@ def _build_parser() -> argparse.ArgumentParser:
                                 "wordlists miss. Disable to reduce noise or request count")
 
     http = p.add_argument_group("http")
-    http.add_argument("-m", "--methods", default="GET,POST",
-                      help="HTTP methods to probe, comma-separated (default: GET,POST). Use GET,POST,PUT,DELETE,PATCH for full coverage")
+    method_group = http.add_mutually_exclusive_group()
+    method_group.add_argument("-m", "--methods", default="GET,POST",
+                              help="HTTP methods to probe, comma-separated (default: GET,POST)")
+    method_group.add_argument("--all-methods", action="store_true", default=False,
+                              help="Probe all standard methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)")
     http.add_argument("-c", "--concurrency", type=int, default=10,
                       help="Max concurrent requests (default: 10)")
     http.add_argument("-r", "--rate", type=float, default=None,
@@ -152,7 +155,10 @@ async def _scan(args: argparse.Namespace) -> None:
     r = RESET if use_color else ""
     c2 = CYAN if use_color else ""
 
-    scan_methods = [m.strip().upper() for m in args.methods.split(",") if m.strip()]
+    if args.all_methods:
+        scan_methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+    else:
+        scan_methods = [m.strip().upper() for m in args.methods.split(",") if m.strip()]
     valid = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
     for m in scan_methods:
         if m not in valid:

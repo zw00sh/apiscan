@@ -190,7 +190,7 @@ def print_banner(target: str, route_count: int,
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v1.2.0{r}\n")
+    print(f" {d}api content discovery · v1.3.0{r}\n")
     print(f"  target:   {target}")
     print(f"  routes:   {route_count}")
     g = GREEN if use_color else ""
@@ -487,7 +487,7 @@ def print_hints(*, recurse: bool, lookahead: bool, methods: list[str],
         hints.append(f"{wildcard_skipped} wildcard siblings skipped — use --no-skip-wildcard-siblings to probe them individually")
 
     if sorted(methods) == ["GET", "POST"]:
-        hints.append("-m GET,POST,PUT,DELETE,PATCH for broader method coverage")
+        hints.append("--all-methods or -m GET,POST,PUT,DELETE,PATCH for broader method coverage")
 
     if not hints:
         return

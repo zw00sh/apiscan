@@ -160,3 +160,26 @@ class TestLookaheadFlags:
     def test_no_lookahead_disables(self):
         ns = self._parse("-u", "http://x", "--no-lookahead")
         assert ns.no_lookahead is True
+
+
+class TestMethodFlags:
+    def _parse(self, *args: str):
+        parser = _build_parser()
+        return parser.parse_args([*args])
+
+    def test_default_methods(self):
+        ns = self._parse("-u", "http://x")
+        assert ns.methods == "GET,POST"
+        assert ns.all_methods is False
+
+    def test_custom_methods(self):
+        ns = self._parse("-u", "http://x", "-m", "GET,PUT")
+        assert ns.methods == "GET,PUT"
+
+    def test_all_methods_flag(self):
+        ns = self._parse("-u", "http://x", "--all-methods")
+        assert ns.all_methods is True
+
+    def test_all_methods_and_m_mutex(self):
+        with pytest.raises(SystemExit):
+            self._parse("-u", "http://x", "-m", "GET", "--all-methods")
