@@ -71,7 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     method_group.add_argument("-m", "--methods", default="GET,POST",
                               help="HTTP methods to probe, comma-separated (default: GET,POST)")
     method_group.add_argument("--all-methods", action="store_true", default=False,
-                              help="Probe all standard methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)")
+                              help="Probe all methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)")
     http.add_argument("-c", "--concurrency", type=int, default=10,
                       help="Max concurrent requests (default: 10)")
     http.add_argument("-r", "--rate", type=float, default=None,

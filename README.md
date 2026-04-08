@@ -1,7 +1,7 @@
 ```
  ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
  █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
- api content discovery · v1.3.0
+ api content discovery · v1.3.1
 ```
 
 Method-aware API content discovery tool. Ships with curated wordlists built from 26k+ Swagger specs, HTTP Archive traffic data, and SecLists.
@@ -48,7 +48,7 @@ apiscan -u https://target.com -w /path/to/wordlist.txt
 | `--short` | off | Use built-in top 1k wordlist (fast) |
 | `--long` | off | Use built-in top 100k wordlist (thorough) |
 | `-m, --methods` | GET,POST | HTTP methods to probe (comma-separated) |
-| `--all-methods` | off | Probe all standard methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS) |
+| `--all-methods` | off | Probe all methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS) |
 | `-c, --concurrency` | 10 | Max concurrent requests |
 | `-r, --rate` | unlimited | Requests per second cap |
 | `-t, --timeout` | 10s | Per-request timeout |
