@@ -280,6 +280,7 @@ class ScanSession:
         lookahead: bool = False,
         methods: list[str] | None = None,
         skip_wildcard_siblings: bool = True,
+        proxy: str | None = None,
     ) -> None:
         from apiscan.inference import DEFAULT_METHODS
 
@@ -302,6 +303,7 @@ class ScanSession:
         self._skip_wildcard_siblings = skip_wildcard_siblings
         self._status_blacklist = status_blacklist
         self._status_whitelist = status_whitelist
+        self._proxy = proxy
 
         self._limiter = RateLimiter(rate_limit) if rate_limit else None
         self._tracker = tracker or RequestTracker()
@@ -345,12 +347,16 @@ class ScanSession:
             methods=self._methods,
         )
 
-        async with httpx.AsyncClient(
+        client_kwargs: dict = dict(
             follow_redirects=True,
             max_redirects=self._max_redirects,
             verify=False,
             headers=self._extra_headers,
-        ) as self._client:
+        )
+        if self._proxy:
+            client_kwargs["proxy"] = self._proxy
+
+        async with httpx.AsyncClient(**client_kwargs) as self._client:
             await self._tree.initialize(self._send, methods=self._methods)
             if self._aborted:
                 return self._results, self._tree
@@ -744,6 +750,7 @@ async def scan(
     lookahead: bool = False,
     methods: list[str] | None = None,
     skip_wildcard_siblings: bool = True,
+    proxy: str | None = None,
 ) -> tuple[list[ScanResult], ScanTree]:
     """Scan *target_url* with the given routes. Returns (findings, tree)."""
     session = ScanSession(
@@ -768,6 +775,7 @@ async def scan(
         lookahead=lookahead,
         methods=methods,
         skip_wildcard_siblings=skip_wildcard_siblings,
+        proxy=proxy,
     )
     return await session.run()
 

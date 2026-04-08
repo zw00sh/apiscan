@@ -82,6 +82,8 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Max redirects to follow (default: 3)")
     http.add_argument("-H", "--header", action="append", default=[], metavar="K:V",
                       help="Extra header (repeatable, e.g. -H 'Authorization: Bearer TOKEN')")
+    http.add_argument("--proxy", default=None, metavar="URL",
+                      help="Route all requests through a proxy (e.g. http://127.0.0.1:8080)")
 
     filtering = p.add_argument_group("filtering")
     filtering.add_argument("-i", "--include", default=None, metavar="CODES",
@@ -307,6 +309,7 @@ async def _scan(args: argparse.Namespace) -> None:
             lookahead=not args.no_lookahead,
             methods=scan_methods,
             skip_wildcard_siblings=not args.no_skip_wildcard_siblings,
+            proxy=args.proxy,
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         interrupted = True

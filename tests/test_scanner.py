@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 import pytest
 
 from apiscan.kite import Route
 from apiscan.output import ScanResult
-from apiscan.scanner import RateLimiter, scan
+from apiscan.scanner import RateLimiter, ScanSession, scan
 
 
 class TestRateLimiter:
@@ -466,3 +467,58 @@ class TestSegmentPrefixSuppression:
         paths = {r.path for r in results}
         assert "/staticmap" in paths, \
             f"Expected /staticmap to survive with skip disabled, got: {paths}"
+
+
+class TestProxy:
+    @pytest.mark.asyncio
+    async def test_proxy_passed_to_httpx_client(self):
+        """The proxy= kwarg should be forwarded to the httpx.AsyncClient."""
+        import httpx
+
+        captured = {}
+        _orig_init = httpx.AsyncClient.__init__
+
+        def _spy_init(self_client, *args, **kwargs):
+            captured.update(kwargs)
+            return _orig_init(self_client, *args, **kwargs)
+
+        routes = [Route(template_path="/test", method="GET")]
+        session = ScanSession(
+            "http://127.0.0.1:1",  # won't actually connect
+            routes,
+            proxy="http://127.0.0.1:8080",
+        )
+
+        with patch.object(httpx.AsyncClient, "__init__", _spy_init):
+            try:
+                await session.run()
+            except Exception:
+                pass  # connection will fail, that's fine
+
+        assert captured.get("proxy") == "http://127.0.0.1:8080"
+
+    @pytest.mark.asyncio
+    async def test_no_proxy_by_default(self):
+        """Without proxy= the httpx client should not get a proxy kwarg."""
+        import httpx
+
+        captured = {}
+        _orig_init = httpx.AsyncClient.__init__
+
+        def _spy_init(self_client, *args, **kwargs):
+            captured.update(kwargs)
+            return _orig_init(self_client, *args, **kwargs)
+
+        routes = [Route(template_path="/test", method="GET")]
+        session = ScanSession(
+            "http://127.0.0.1:1",
+            routes,
+        )
+
+        with patch.object(httpx.AsyncClient, "__init__", _spy_init):
+            try:
+                await session.run()
+            except Exception:
+                pass
+
+        assert "proxy" not in captured
