@@ -119,6 +119,18 @@ class TestBuildBaseline:
         bl = build_baseline([])
         assert len(bl.signatures) == 0
 
+    def test_body_hash_stable(self):
+        h = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        bl = _baseline(_sig(body_hash=h), _sig(body_hash=h))
+        assert "body_hash" in bl.stable_fields
+
+    def test_body_hash_unstable(self):
+        bl = _baseline(
+            _sig(body_hash=b"\x01" * 8),
+            _sig(body_hash=b"\x02" * 8),
+        )
+        assert "body_hash" not in bl.stable_fields
+
 
 # ---------------------------------------------------------------------------
 # matches_baseline
@@ -239,6 +251,21 @@ class TestMatchesBaseline:
         candidate = _sig(content_length=500, word_count=99, line_count=99, body_hash=h)
         result = matches_baseline(candidate, bl, 5)
         assert "body hash=abcd1234" in result
+
+    def test_stable_hash_mismatch_no_match(self):
+        """Same word/line counts but different body hash → not a baseline match.
+        This is the GraphQL-style error body scenario."""
+        h = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        bl = _baseline(_sig(body_hash=h), _sig(body_hash=h))
+        candidate = _sig(body_hash=b"\xaa" * 8)  # same word/line/length, different hash
+        assert matches_baseline(candidate, bl, 5) is None
+
+    def test_stable_hash_same_hash_still_matches(self):
+        """Same hash + same shape → still a baseline match (no regression)."""
+        h = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+        bl = _baseline(_sig(body_hash=h), _sig(body_hash=h))
+        candidate = _sig(body_hash=h)
+        assert matches_baseline(candidate, bl, 5) is not None
 
 
 # ---------------------------------------------------------------------------

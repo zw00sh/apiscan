@@ -126,6 +126,7 @@ def compute_signature(
 _BASELINE_COMPARABLE = (
     "status_code", "content_type", "content_length",
     "adjusted_content_length", "word_count", "line_count",
+    "body_hash",
 )
 
 
@@ -158,6 +159,8 @@ def matches_baseline(
     if "status_code" in stable and sig.status_code != ref.status_code:
         return None
     if "content_type" in stable and sig.content_type != ref.content_type:
+        return None
+    if "body_hash" in stable and sig.body_hash and sig.body_hash != ref.body_hash:
         return None
 
     if "content_length" in stable and sig.content_length == ref.content_length:
