@@ -449,10 +449,13 @@ class ScanSession:
 
     # -- Result emission -----------------------------------------------------
 
-    def _emit(self, finding: Finding, recurse_info: str | None = None, **kw) -> None:
+    def _emit(self, finding: Finding, recurse_info: str | None = None,
+              is_boundary: bool = False, boundary_info: str | None = None, **kw) -> None:
         result = _finding_to_result(finding, self._base_url, **kw)
         if recurse_info:
             result.recurse_info = recurse_info
+        result.is_boundary = is_boundary
+        result.boundary_info = boundary_info
         self._results.append(result)
         if self._on_result:
             self._on_result(result)
@@ -465,19 +468,35 @@ class ScanSession:
                 findings.append(finding)
         if not findings:
             return
+
+        statuses = {f.signature.status_code for f in findings}
         method_statuses = [f"{f.route.method}={f.signature.status_code}" for f in findings]
-        primary = findings[0]
-        boundary_finding = Finding(
-            route=Route(template_path=group.prefix, method="*"),
-            signature=primary.signature,
-            reason=f"boundary: {', '.join(method_statuses)}",
-            confidence=primary.confidence,
-        )
-        if await self._prefixes.check(
-            boundary_finding, self._results, self._send, self._tracker, self._wq,
-        ):
-            return
-        self._emit(boundary_finding, recurse_info=recurse_info)
+        boundary_info = f"boundary: {', '.join(method_statuses)}"
+
+        if len(statuses) == 1:
+            # Uniform response — emit single wildcard finding, keep primary's reason
+            primary = findings[0]
+            boundary_finding = Finding(
+                route=Route(template_path=group.prefix, method="*"),
+                signature=primary.signature,
+                reason=primary.reason,
+                confidence=primary.confidence,
+            )
+            if await self._prefixes.check(
+                boundary_finding, self._results, self._send, self._tracker, self._wq,
+            ):
+                return
+            self._emit(boundary_finding, recurse_info=recurse_info,
+                       is_boundary=True, boundary_info=boundary_info)
+        else:
+            # Mixed responses — emit per-method findings, each keeps own reason
+            for finding in findings:
+                if await self._prefixes.check(
+                    finding, self._results, self._send, self._tracker, self._wq,
+                ):
+                    continue
+                self._emit(finding, recurse_info=recurse_info,
+                           is_boundary=True, boundary_info=boundary_info)
 
     # -- Recursion -----------------------------------------------------------
 

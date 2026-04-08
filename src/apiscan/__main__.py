@@ -222,6 +222,8 @@ async def _scan(args: argparse.Namespace) -> None:
                 "word_count": result.word_count,
                 "line_count": result.line_count,
                 "redirect_location": result.redirect_location,
+                "is_boundary": result.is_boundary,
+                "boundary_info": result.boundary_info,
                 "reason": result.reason,
                 "confidence": result.confidence,
                 "timestamp": result.timestamp,
@@ -325,7 +327,7 @@ async def _scan(args: argparse.Namespace) -> None:
             tree_str = format_findings_tree(findings, use_color)
             if tree_str:
                 print(f"\n{tree_str}")
-        boundary_count = sum(1 for f in findings if f.reason.startswith("boundary:"))
+        boundary_count = sum(1 for f in findings if f.is_boundary)
         if args.short:
             wl_tier = "short"
         elif getattr(args, "long"):

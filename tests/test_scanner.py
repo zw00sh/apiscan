@@ -146,7 +146,7 @@ class TestScanIntegration:
         ]
         results, tree = await scan(test_server_url, routes, concurrency=1, timeout=5.0)
         # The /admin boundary should be reported (403 json vs 404 html root)
-        boundary_results = [r for r in results if "boundary:" in r.reason]
+        boundary_results = [r for r in results if r.is_boundary]
         assert len(boundary_results) >= 1
 
     @pytest.mark.asyncio
@@ -187,7 +187,7 @@ class TestRecursionIntegration:
         )
         paths = {r.path for r in results}
         # /deep boundary should be discovered (403 json vs root 404 html)
-        boundary_results = [r for r in results if "boundary:" in r.reason]
+        boundary_results = [r for r in results if r.is_boundary]
         assert any("/deep" in r.path for r in boundary_results)
         # Recursion at /deep injects /deep/secret/thing (full path, via
         # recurse_all). The /deep/secret prefix is itself a boundary
@@ -287,7 +287,7 @@ class TestRecursionIntegration:
             recurse=True, max_depth=2,
         )
         # The /deep boundary and /deep/secret sub-boundary should be found
-        boundary_paths = {r.path for r in results if "boundary:" in r.reason}
+        boundary_paths = {r.path for r in results if r.is_boundary}
         assert "/deep" in boundary_paths or any("/deep" in p for p in boundary_paths)
 
     @pytest.mark.asyncio
@@ -360,7 +360,7 @@ class TestRecursionPrefixStripping:
         assert "/deep/deep/endpoint" not in paths, \
             f"/deep/deep/endpoint should not exist (prefix-stripped), got: {paths}"
         # But /deep should still be found as a boundary
-        assert any("/deep" in r.path for r in results if "boundary:" in r.reason)
+        assert any("/deep" in r.path for r in results if r.is_boundary)
 
     @pytest.mark.asyncio
     async def test_debug_shows_strip_counts(self, test_server_url):

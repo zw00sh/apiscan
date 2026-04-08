@@ -122,6 +122,17 @@ class TestFormatResult:
         assert len(pre1) == len(pre2)
 
 
+    def test_boundary_info_shown_without_verbose(self):
+        r = _make_result(boundary_info="GET=403, POST=404")
+        line = format_result(r, use_color=False, verbose=False)
+        assert "GET=403, POST=404" in line
+
+    def test_boundary_info_not_shown_when_none(self):
+        r = _make_result()
+        line = format_result(r, use_color=False, verbose=False)
+        assert "boundary" not in line.lower()
+
+
 class TestCSVWriter:
     def test_write_and_read(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
@@ -161,7 +172,8 @@ class TestCSVWriter:
                 expected = [
                     "timestamp", "url", "method", "path", "status_code",
                     "content_length", "word_count", "line_count",
-                    "redirect_location", "reason", "confidence", "curl",
+                    "redirect_location", "is_boundary", "boundary_info",
+                    "reason", "confidence", "curl",
                 ]
                 assert header == expected
         finally:

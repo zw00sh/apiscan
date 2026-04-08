@@ -89,6 +89,8 @@ class ScanResult:
     reason: str = ""
     confidence: str = ""
     timestamp: str = ""
+    is_boundary: bool = False
+    boundary_info: str | None = None
     request_headers: dict[str, str] | None = None
     request_body: str | None = None
     signature: Any = None  # ResponseSignature, typed as Any to avoid circular import
@@ -161,6 +163,9 @@ def format_result(result: ScanResult, use_color: bool = True, verbose: bool = Fa
 
     line = f"{sc} | {method} | {size} {lines} {words} | {path}"
 
+    if result.boundary_info:
+        info = f"({result.boundary_info})"
+        line += f" {DIM}{info}{r}" if use_color else f" {info}"
     if verbose and result.reason:
         hint = f" {DIM}({result.reason}){r}" if use_color else f" ({result.reason})"
         line += hint
@@ -210,7 +215,8 @@ def print_banner(target: str, route_count: int,
 _CSV_COLUMNS = [
     "timestamp", "url", "method", "path", "status_code",
     "content_length", "word_count", "line_count",
-    "redirect_location", "reason", "confidence", "curl",
+    "redirect_location", "is_boundary", "boundary_info",
+    "reason", "confidence", "curl",
 ]
 
 
@@ -226,6 +232,7 @@ class CSVWriter:
             result.timestamp, result.url, result.method, result.path,
             result.status_code, result.content_length, result.word_count,
             result.line_count, result.redirect_location or "",
+            result.is_boundary, result.boundary_info or "",
             result.reason, result.confidence, build_curl(result, self._proxy),
         ])
 

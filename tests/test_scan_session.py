@@ -13,7 +13,7 @@ from apiscan.scanner import (
     _split_path_segment,
     scan,
 )
-from apiscan.scantree import ScanTree
+from apiscan.scantree import BoundaryGroup, BoundaryProbe, ScanTree
 from apiscan.workqueue import LookaheadWork, ProbeWork, RouteWork, WorkQueue
 
 
@@ -316,6 +316,132 @@ class TestSmartRecursion:
         session = self._make_session(routes)
         suffixes = session._compute_recurse_suffixes()
         assert len(suffixes) == len(routes)
+
+
+# ---------------------------------------------------------------------------
+# Boundary emission
+# ---------------------------------------------------------------------------
+
+class TestEmitBoundary:
+    def _session_with_engine(self, url, routes):
+        session = ScanSession(url, routes, concurrency=1, timeout=5.0)
+        session._tree = ScanTree(routes)
+        session._engine = __import__("apiscan.inference", fromlist=["InferenceEngine"]).InferenceEngine(
+            tree=session._tree, methods=["GET", "POST"],
+        )
+        session._results = []
+        session._prefixes = SegmentPrefixTracker()
+        session._wq = WorkQueue()
+        return session
+
+    @pytest.mark.asyncio
+    async def test_uniform_status_emits_wildcard(self, test_server_url):
+        """When all boundary probes have the same status, emit one * finding."""
+        session = self._session_with_engine(test_server_url,
+                                            [Route(template_path="/auth/login", method="GET")])
+        ancestor = _sig(status_code=404, content_length=50)
+        group = BoundaryGroup(
+            prefix="/auth",
+            probes=(
+                BoundaryProbe(prefix="/auth", method="GET",
+                              signature=_sig(status_code=401, content_length=30),
+                              ancestor_signature=ancestor),
+                BoundaryProbe(prefix="/auth", method="POST",
+                              signature=_sig(status_code=401, content_length=30),
+                              ancestor_signature=ancestor),
+            ),
+        )
+        await session._emit_boundary(group)
+        assert len(session._results) == 1
+        assert session._results[0].method == "*"
+
+    @pytest.mark.asyncio
+    async def test_mixed_status_emits_per_method(self, test_server_url):
+        """When boundary probes differ in status, emit per-method findings."""
+        session = self._session_with_engine(test_server_url,
+                                            [Route(template_path="/files/upload", method="GET")])
+        ancestor = _sig(status_code=404, content_length=50)
+        group = BoundaryGroup(
+            prefix="/files",
+            probes=(
+                BoundaryProbe(prefix="/files", method="GET",
+                              signature=_sig(status_code=403, content_length=30),
+                              ancestor_signature=ancestor),
+                BoundaryProbe(prefix="/files", method="POST",
+                              signature=_sig(status_code=404, content_length=60),
+                              ancestor_signature=ancestor),
+            ),
+        )
+        await session._emit_boundary(group)
+        methods = {r.method for r in session._results}
+        assert "GET" in methods
+        assert "POST" in methods
+        assert "*" not in methods
+        assert len(session._results) == 2
+
+    @pytest.mark.asyncio
+    async def test_boundary_results_have_is_boundary(self, test_server_url):
+        """All boundary results should have is_boundary=True."""
+        session = self._session_with_engine(test_server_url,
+                                            [Route(template_path="/auth/login", method="GET")])
+        ancestor = _sig(status_code=404, content_length=50)
+        group = BoundaryGroup(
+            prefix="/auth",
+            probes=(
+                BoundaryProbe(prefix="/auth", method="GET",
+                              signature=_sig(status_code=401, content_length=30),
+                              ancestor_signature=ancestor),
+                BoundaryProbe(prefix="/auth", method="POST",
+                              signature=_sig(status_code=401, content_length=30),
+                              ancestor_signature=ancestor),
+            ),
+        )
+        await session._emit_boundary(group)
+        for r in session._results:
+            assert r.is_boundary is True
+
+    @pytest.mark.asyncio
+    async def test_boundary_info_contains_method_summary(self, test_server_url):
+        """boundary_info should hold the method=status summary."""
+        session = self._session_with_engine(test_server_url,
+                                            [Route(template_path="/files/upload", method="GET")])
+        ancestor = _sig(status_code=404, content_length=50)
+        group = BoundaryGroup(
+            prefix="/files",
+            probes=(
+                BoundaryProbe(prefix="/files", method="GET",
+                              signature=_sig(status_code=403, content_length=30),
+                              ancestor_signature=ancestor),
+                BoundaryProbe(prefix="/files", method="POST",
+                              signature=_sig(status_code=404, content_length=60),
+                              ancestor_signature=ancestor),
+            ),
+        )
+        await session._emit_boundary(group)
+        for r in session._results:
+            assert r.boundary_info is not None
+            assert "GET=403" in r.boundary_info
+            assert "POST=404" in r.boundary_info
+
+    @pytest.mark.asyncio
+    async def test_boundary_preserves_classify_reason(self, test_server_url):
+        """reason should hold the real inference reason, not the boundary summary."""
+        session = self._session_with_engine(test_server_url,
+                                            [Route(template_path="/auth/login", method="GET")])
+        ancestor = _sig(status_code=404, content_length=50)
+        group = BoundaryGroup(
+            prefix="/auth",
+            probes=(
+                BoundaryProbe(prefix="/auth", method="GET",
+                              signature=_sig(status_code=401, content_length=30),
+                              ancestor_signature=ancestor),
+            ),
+        )
+        await session._emit_boundary(group)
+        result = session._results[0]
+        # reason should come from classify_boundary, not be "boundary: ..."
+        assert result.reason.startswith("probe:")
+        assert "boundary:" not in result.reason
 
 
 # ---------------------------------------------------------------------------
