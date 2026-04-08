@@ -409,21 +409,23 @@ class InferenceEngine:
             trace.append(f"hash={sig.body_hash.hex()[:8]}")
 
         # Verification: method change probe
-        if self._tracker:
-            self._tracker.plan(1)
         method_probe_status: int | None = None
         method_allow: str = ""
-        alt_method = [m for m in self._methods if m != route.method][0]
-        try:
-            method_sig = await send_fn(alt_method, path, None, None)
-            method_probe_status = method_sig.status_code
-            method_allow = method_sig.allow
-            verify = f"verify {alt_method}={method_probe_status}"
-            if method_allow:
-                verify += f" allow={method_allow}"
-            trace.append(verify)
-        except Exception:  # send_fn tracks errors; note in trace
-            trace.append(f"verify {alt_method}=err")
+        alt_candidates = [m for m in self._methods if m != route.method]
+        if alt_candidates:
+            if self._tracker:
+                self._tracker.plan(1)
+            alt_method = alt_candidates[0]
+            try:
+                method_sig = await send_fn(alt_method, path, None, None)
+                method_probe_status = method_sig.status_code
+                method_allow = method_sig.allow
+                verify = f"verify {alt_method}={method_probe_status}"
+                if method_allow:
+                    verify += f" allow={method_allow}"
+                trace.append(verify)
+            except Exception:  # send_fn tracks errors; note in trace
+                trace.append(f"verify {alt_method}=err")
 
         # Check for new headers
         new_header_names = sig.header_names - baseline_ref.header_names - _TRANSIENT_HEADERS

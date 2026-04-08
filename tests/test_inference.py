@@ -636,3 +636,62 @@ class TestInferenceProcess:
         result = await engine.process(route, candidate, "/api/users", mock_send)
         assert len(result) == 1
         assert "405" in result[0].reason
+
+
+class TestSingleMethodMode:
+    """Verify the tool works correctly with a single HTTP method."""
+
+    @pytest.mark.asyncio
+    async def test_single_method_does_not_crash(self):
+        """With only one method, process() should not crash on verification."""
+        tree, engine = _make_engine(methods=["GET"])
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+
+        sig = _sig(status_code=200, content_type="application/json",
+                   content_length=100, word_count=10, line_count=5)
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=404, content_type="text/html")
+
+        result = await engine.process(
+            Route(template_path="/api/health", method="GET"),
+            sig, "/api/health", mock_send)
+        assert len(result) >= 1
+
+    @pytest.mark.asyncio
+    async def test_single_method_still_classifies(self):
+        """A single-method scan should still produce findings with reasons."""
+        tree, engine = _make_engine(methods=["GET"])
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+
+        sig = _sig(status_code=200, content_type="application/json",
+                   content_length=100, word_count=10, line_count=5)
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=404, content_type="text/html")
+
+        result = await engine.process(
+            Route(template_path="/api/health", method="GET"),
+            sig, "/api/health", mock_send)
+        assert len(result) == 1
+        assert result[0].reason  # should have a classification reason
+        assert result[0].confidence in ("high", "medium", "low")
+
+    @pytest.mark.asyncio
+    async def test_single_method_alternate_methods_empty(self):
+        """_try_alternate_methods should return empty with a single method."""
+        tree, engine = _make_engine(methods=["GET"])
+        tree.set_baseline("/", "GET", _baseline(_sig(status_code=404, content_type="text/html")))
+
+        # When baseline matches, alternate methods are tried — with one method, none exist
+        sig = _sig(status_code=404, content_type="text/html",
+                   content_length=50, word_count=10, line_count=2)
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=404, content_type="text/html")
+
+        result = await engine.process(
+            Route(template_path="/test", method="GET"),
+            sig, "/test", mock_send)
+        # Matches baseline and no alternate methods → filtered
+        assert len(result) == 0
