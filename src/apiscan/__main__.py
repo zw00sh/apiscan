@@ -98,6 +98,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Replay findings through a proxy (e.g. http://127.0.0.1:8080 for Burp)")
     output.add_argument("-v", "--verbose", action="store_true",
                         help="Show additional details")
+    output.add_argument("--show-headers", action="store_true",
+                        help="Show newly-discovered response headers for each finding")
     output.add_argument("--debug", action="store_true",
                         help="Show why routes are filtered (noisy)")
     output.add_argument("--no-color", action="store_true",
@@ -230,6 +232,7 @@ async def _scan(args: argparse.Namespace) -> None:
                 "redirect_location": result.redirect_location,
                 "is_boundary": result.is_boundary,
                 "boundary_info": result.boundary_info,
+                "new_headers": dict(result.new_headers) if result.new_headers else {},
                 "reason": result.reason,
                 "confidence": result.confidence,
                 "timestamp": result.timestamp,
@@ -247,7 +250,8 @@ async def _scan(args: argparse.Namespace) -> None:
         seen_results.add(display_key)
         if progress:
             print(f"\r{' ' * 120}\r", end="", file=sys.stderr, flush=True)
-        print(format_result(result, use_color, verbose=args.verbose or args.debug))
+        print(format_result(result, use_color, verbose=args.verbose or args.debug,
+                            show_headers=args.show_headers))
 
     def on_progress(findings_delta: int) -> None:
         if progress:

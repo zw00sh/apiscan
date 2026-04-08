@@ -91,6 +91,7 @@ class ScanResult:
     timestamp: str = ""
     is_boundary: bool = False
     boundary_info: str | None = None
+    new_headers: tuple[tuple[str, str], ...] | None = None
     request_headers: dict[str, str] | None = None
     request_body: str | None = None
     signature: Any = None  # ResponseSignature, typed as Any to avoid circular import
@@ -143,7 +144,8 @@ def _fmt_magnitude(value: int, suffix: str, colors: list[str], use_color: bool) 
     return f"{color}{text:>6}{r}"
 
 
-def format_result(result: ScanResult, use_color: bool = True, verbose: bool = False) -> str:
+def format_result(result: ScanResult, use_color: bool = True, verbose: bool = False,
+                   show_headers: bool = False) -> str:
     r = RESET if use_color else ""
 
     # Status code — per-code color
@@ -163,6 +165,10 @@ def format_result(result: ScanResult, use_color: bool = True, verbose: bool = Fa
 
     line = f"{sc} | {method} | {size} {lines} {words} | {path}"
 
+    if show_headers and result.new_headers:
+        for hdr_name, hdr_value in result.new_headers:
+            hdr_line = f"{hdr_name}: {hdr_value}"
+            line += f"\n{' ' * 38}{DIM}{hdr_line}{r}" if use_color else f"\n{' ' * 38}{hdr_line}"
     if result.boundary_info:
         info = f"({result.boundary_info})"
         line += f" {DIM}{info}{r}" if use_color else f" {info}"
@@ -216,7 +222,7 @@ _CSV_COLUMNS = [
     "timestamp", "url", "method", "path", "status_code",
     "content_length", "word_count", "line_count",
     "redirect_location", "is_boundary", "boundary_info",
-    "reason", "confidence", "curl",
+    "new_headers", "reason", "confidence", "curl",
 ]
 
 
@@ -233,6 +239,7 @@ class CSVWriter:
             result.status_code, result.content_length, result.word_count,
             result.line_count, result.redirect_location or "",
             result.is_boundary, result.boundary_info or "",
+            "; ".join(f"{k}: {v}" for k, v in result.new_headers) if result.new_headers else "",
             result.reason, result.confidence, build_curl(result, self._proxy),
         ])
 
@@ -443,7 +450,10 @@ def format_findings_tree(results: list[ScanResult], use_color: bool = True) -> s
         if node["_hits"]:
             # Sort and deduplicate
             pairs = sorted(set(node["_hits"]))
-            parts = [f"{status} {method}" for status, method in pairs]
+            if use_color:
+                parts = [f"{_status_color(status)}{status}{r} {method}" for status, method in pairs]
+            else:
+                parts = [f"{status} {method}" for status, method in pairs]
             hit_str = f" {d}({', '.join(parts)}){r}"
         lines.append(f"{indent}{connector}{c}/{label}{r}{hit_str}")
         child_indent = indent + ("    " if last else "│   ")

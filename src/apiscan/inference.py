@@ -39,6 +39,7 @@ class ResponseSignature:
     word_count: int
     line_count: int
     header_names: frozenset[str]
+    response_headers: tuple[tuple[str, str], ...] = ()
     allow: str = ""
     body_hash: bytes = b""
 
@@ -59,7 +60,21 @@ class Finding:
     signature: ResponseSignature
     reason: str
     confidence: str
+    new_headers: tuple[tuple[str, str], ...] = ()
 
+
+# Headers that vary between requests — excluded from new-header detection.
+_TRANSIENT_HEADERS = frozenset({"date", "content-length", "transfer-encoding", "connection"})
+
+# Standard boilerplate headers — excluded from --show-headers display.
+_UNINTERESTING_HEADERS = _TRANSIENT_HEADERS | frozenset({
+    "content-type", "content-encoding", "accept-ranges",
+    "vary", "age", "cache-control", "etag", "last-modified", "expires", "pragma",
+    "x-content-type-options", "x-frame-options", "strict-transport-security",
+    "referrer-policy", "content-security-policy",
+    "cross-origin-opener-policy", "cross-origin-resource-policy",
+    "cross-origin-embedder-policy", "permissions-policy",
+})
 
 # ---------------------------------------------------------------------------
 # Signal extraction
@@ -98,6 +113,7 @@ def compute_signature(
         word_count=word_count,
         line_count=line_count,
         header_names=frozenset(k.lower() for k in headers),
+        response_headers=tuple((k.lower(), v) for k, v in headers.items()),
         allow=headers.get("allow", headers.get("Allow", "")),
         body_hash=body_hash,
     )
@@ -305,15 +321,22 @@ class InferenceEngine:
         if is_known_bad_site(probe.signature):
             return None
 
-        reason_parts = _build_reason(probe.signature, probe.ancestor_signature)
+        new_header_names = probe.signature.header_names - probe.ancestor_signature.header_names - _TRANSIENT_HEADERS
+        reason_parts = _build_reason(probe.signature, probe.ancestor_signature,
+                                     new_headers=frozenset(new_header_names) if new_header_names else None)
         if not reason_parts:
             reason_parts = [f"handler boundary at {probe.prefix}"]
+
+        interesting = new_header_names - _UNINTERESTING_HEADERS
+        header_map = dict(probe.signature.response_headers)
+        new_hdrs = tuple((k, header_map[k]) for k in sorted(interesting) if k in header_map)
 
         return Finding(
             route=Route(template_path=probe.prefix, method=probe.method),
             signature=probe.signature,
             reason=f"probe: {', '.join(reason_parts)}",
             confidence=_score_confidence(reason_parts),
+            new_headers=new_hdrs,
         )
 
     # ------------------------------------------------------------------
@@ -403,18 +426,22 @@ class InferenceEngine:
             trace.append(f"verify {alt_method}=err")
 
         # Check for new headers
-        new_headers = sig.header_names - baseline_ref.header_names
-        new_headers -= {"date", "content-length", "transfer-encoding", "connection"}
+        new_header_names = sig.header_names - baseline_ref.header_names - _TRANSIENT_HEADERS
 
         # Classification
         reason_parts = _build_reason(
             sig, baseline_ref,
             method_probe_status=method_probe_status,
             allow_header=method_allow,
-            new_headers=new_headers if new_headers else None,
+            new_headers=frozenset(new_header_names) if new_header_names else None,
         )
         if not reason_parts:
             reason_parts = ["response differs from baseline"]
+
+        # Build interesting header name-value pairs for display
+        interesting = new_header_names - _UNINTERESTING_HEADERS
+        header_map = dict(sig.response_headers)
+        new_hdrs = tuple((k, header_map[k]) for k in sorted(interesting) if k in header_map)
 
         confidence = _score_confidence(reason_parts)
         trace.append(f"-> {confidence}")
@@ -424,6 +451,7 @@ class InferenceEngine:
             route=route, signature=sig,
             reason=", ".join(reason_parts),
             confidence=confidence,
+            new_headers=new_hdrs,
         )]
 
     # ------------------------------------------------------------------

@@ -111,6 +111,7 @@ def _finding_to_result(
         reason=finding.reason,
         confidence=finding.confidence,
         timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+        new_headers=finding.new_headers if finding.new_headers else None,
         request_headers=request_headers,
         request_body=request_body,
         signature=finding.signature,

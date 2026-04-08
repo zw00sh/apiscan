@@ -122,6 +122,24 @@ class TestFormatResult:
         assert len(pre1) == len(pre2)
 
 
+    def test_show_headers_multiline(self):
+        r = _make_result(new_headers=(("x-powered-by", "Express"), ("x-request-id", "abc-123")))
+        output = format_result(r, use_color=False, show_headers=True)
+        lines = output.split("\n")
+        assert len(lines) == 3  # main line + 2 header lines
+        assert "x-powered-by: Express" in lines[1]
+        assert "x-request-id: abc-123" in lines[2]
+
+    def test_show_headers_hidden_by_default(self):
+        r = _make_result(new_headers=(("x-request-id", "abc"),))
+        line = format_result(r, use_color=False)
+        assert "x-request-id" not in line
+
+    def test_show_headers_empty_no_extra_lines(self):
+        r = _make_result(new_headers=())
+        output = format_result(r, use_color=False, show_headers=True)
+        assert "\n" not in output
+
     def test_boundary_info_shown_without_verbose(self):
         r = _make_result(boundary_info="GET=403, POST=404")
         line = format_result(r, use_color=False, verbose=False)
@@ -173,7 +191,7 @@ class TestCSVWriter:
                     "timestamp", "url", "method", "path", "status_code",
                     "content_length", "word_count", "line_count",
                     "redirect_location", "is_boundary", "boundary_info",
-                    "reason", "confidence", "curl",
+                    "new_headers", "reason", "confidence", "curl",
                 ]
                 assert header == expected
         finally:

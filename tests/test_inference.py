@@ -31,6 +31,7 @@ def _sig(
     word_count: int = 10,
     line_count: int = 2,
     header_names: frozenset[str] | None = None,
+    response_headers: tuple[tuple[str, str], ...] = (),
     body_hash: bytes = b"",
 ) -> ResponseSignature:
     return ResponseSignature(
@@ -38,6 +39,7 @@ def _sig(
         content_length=content_length, adjusted_content_length=adjusted_content_length,
         adjustment_scale=adjustment_scale, word_count=word_count,
         line_count=line_count, header_names=header_names or frozenset(),
+        response_headers=response_headers,
         body_hash=body_hash,
     )
 
@@ -441,6 +443,74 @@ class TestInferenceProcess:
             sig, "/admin/dashboard", mock_send)
         assert len(result) == 1
         assert "x-request-id" in result[0].reason
+
+    @pytest.mark.asyncio
+    async def test_finding_carries_header_values(self):
+        """Finding.new_headers should contain (name, value) tuples for interesting headers."""
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(header_names=frozenset({"content-type", "date"}))))
+
+        sig = _sig(status_code=401, content_type="application/json",
+                  content_length=60, word_count=4, line_count=1,
+                  header_names=frozenset({"content-type", "date", "x-request-id", "x-powered-by"}),
+                  response_headers=(("content-type", "application/json"), ("date", "Mon, 01 Jan 2026"),
+                                    ("x-request-id", "abc-123"), ("x-powered-by", "Express")))
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=404, content_type="text/html")
+
+        result = await engine.process(
+            Route(template_path="/admin/dashboard", method="GET"),
+            sig, "/admin/dashboard", mock_send)
+        assert len(result) == 1
+        header_dict = dict(result[0].new_headers)
+        assert header_dict["x-request-id"] == "abc-123"
+        assert header_dict["x-powered-by"] == "Express"
+
+    @pytest.mark.asyncio
+    async def test_uninteresting_headers_filtered(self):
+        """Boilerplate headers like cache-control should be excluded from new_headers display."""
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(header_names=frozenset({"content-type"}))))
+
+        sig = _sig(status_code=401, content_type="application/json",
+                  content_length=60, word_count=4, line_count=1,
+                  header_names=frozenset({"content-type", "cache-control", "etag", "x-custom"}),
+                  response_headers=(("content-type", "application/json"),
+                                    ("cache-control", "no-cache"), ("etag", "abc"),
+                                    ("x-custom", "val")))
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=404, content_type="text/html")
+
+        result = await engine.process(
+            Route(template_path="/test", method="GET"),
+            sig, "/test", mock_send)
+        assert len(result) == 1
+        header_names = {k for k, _ in result[0].new_headers}
+        assert "x-custom" in header_names
+        assert "cache-control" not in header_names
+        assert "etag" not in header_names
+
+    @pytest.mark.asyncio
+    async def test_finding_no_new_headers_when_none(self):
+        """Finding.new_headers should be empty when no new headers detected."""
+        tree, engine = _make_engine()
+        tree.set_baseline("/", "GET", _baseline(_sig(
+            header_names=frozenset({"content-type", "date"}))))
+
+        sig = _sig(status_code=401, content_type="application/json",
+                  content_length=60, word_count=4, line_count=1,
+                  header_names=frozenset({"content-type", "date"}))
+
+        async def mock_send(method, path, headers=None, body=None):
+            return _sig(status_code=404, content_type="text/html")
+
+        result = await engine.process(
+            Route(template_path="/test", method="GET"),
+            sig, "/test", mock_send)
+        assert len(result) == 1
+        assert len(result[0].new_headers) == 0
 
     @pytest.mark.asyncio
     async def test_alternate_methods_grouped(self):
