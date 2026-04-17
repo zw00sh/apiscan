@@ -9,6 +9,7 @@ import tempfile
 from apiscan.output import (
     CSVWriter,
     ScanResult,
+    build_curl,
     format_findings_tree,
     format_result,
     print_banner,
@@ -149,6 +150,23 @@ class TestFormatResult:
         r = _make_result()
         line = format_result(r, use_color=False, verbose=False)
         assert "boundary" not in line.lower()
+
+
+class TestBuildCurl:
+    def test_get_omits_x_flag(self):
+        cmd = build_curl(_make_result(method="GET"))
+        assert "-X" not in cmd.split()
+
+    def test_post_includes_x_flag(self):
+        cmd = build_curl(_make_result(method="POST"))
+        assert "-X POST" in cmd
+
+    def test_wildcard_method_does_not_leak_asterisk(self):
+        """Boundary findings use method='*' as a display marker. build_curl must
+        not produce '-X *', which is an invalid HTTP method."""
+        cmd = build_curl(_make_result(method="*"))
+        assert "-X *" not in cmd
+        assert "*" not in cmd.split()
 
 
 class TestCSVWriter:

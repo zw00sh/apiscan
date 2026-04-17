@@ -100,8 +100,11 @@ class ScanResult:
 def build_curl(result: ScanResult, proxy: str | None = None) -> str:
     """Build a curl command that replays the request."""
     parts = ["curl", "-s", "-k"]
-    if result.method != "GET":
-        parts += ["-X", result.method]
+    # Boundary findings use method='*' as a display marker; fall back to GET
+    # so the curl command is actually runnable.
+    method = "GET" if result.method == "*" else result.method
+    if method != "GET":
+        parts += ["-X", method]
     if proxy:
         parts += ["-x", proxy]
     for k, v in (result.request_headers or {}).items():
@@ -196,7 +199,7 @@ def print_banner(target: str, route_count: int,
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v1.5.0{r}\n")
+    print(f" {d}api content discovery · v1.5.1{r}\n")
     print(f"  target:   {target}")
     print(f"  routes:   {route_count}")
     g = GREEN if use_color else ""

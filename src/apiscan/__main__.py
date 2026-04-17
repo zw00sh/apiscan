@@ -136,6 +136,18 @@ def _parse_codes(raw: str | None) -> set[int] | None:
 # Scan
 # ---------------------------------------------------------------------------
 
+def _replay_methods(result: ScanResult, scan_methods: list[str]) -> list[str]:
+    """Methods to use when replaying *result* through the proxy.
+
+    Uniform boundary findings use method='*' as a display marker. For replay
+    we expand it to every scanned method so the user sees one entry per
+    verb in Burp — matching what was actually probed.
+    """
+    if result.method == "*":
+        return list(scan_methods)
+    return [result.method]
+
+
 def _resolve_wordlist(args: argparse.Namespace) -> str:
     """Return the wordlist path from args, defaulting to the built-in 10k list."""
     if args.wordlist:
@@ -207,15 +219,16 @@ async def _scan(args: argparse.Namespace) -> None:
         """Re-send the finding through the replay proxy."""
         if not replay_client:
             return
-        try:
-            await replay_client.request(
-                result.method, result.url,
-                headers=result.request_headers or {},
-                content=result.request_body.encode() if result.request_body else None,
-                timeout=args.timeout,
-            )
-        except Exception:
-            pass  # best-effort replay, don't break the scan
+        for method in _replay_methods(result, scan_methods):
+            try:
+                await replay_client.request(
+                    method, result.url,
+                    headers=result.request_headers or {},
+                    content=result.request_body.encode() if result.request_body else None,
+                    timeout=args.timeout,
+                )
+            except Exception:
+                pass  # best-effort replay, don't break the scan
 
     def on_result(result: ScanResult) -> None:
         if csv_writer:

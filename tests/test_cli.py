@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from apiscan.__main__ import _build_parser
+from apiscan.__main__ import _build_parser, _replay_methods
+from apiscan.output import ScanResult
 
 
 class TestShortFlags:
@@ -183,3 +184,23 @@ class TestMethodFlags:
     def test_all_methods_and_m_mutex(self):
         with pytest.raises(SystemExit):
             self._parse("-u", "http://x", "-m", "GET", "--all-methods")
+
+
+class TestReplayMethods:
+    """_replay_methods expands the wildcard '*' marker on boundary findings
+    so proxy replay sends valid HTTP verbs instead of literal '*'."""
+
+    def _result(self, method: str) -> ScanResult:
+        return ScanResult(
+            url="http://x/p", method=method, path="/p",
+            status_code=200, content_length=0, word_count=0, line_count=0,
+        )
+
+    def test_concrete_method_passes_through(self):
+        assert _replay_methods(self._result("GET"), ["GET", "POST"]) == ["GET"]
+
+    def test_wildcard_expands_to_scan_methods(self):
+        assert _replay_methods(self._result("*"), ["GET", "POST"]) == ["GET", "POST"]
+
+    def test_wildcard_with_single_scan_method(self):
+        assert _replay_methods(self._result("*"), ["POST"]) == ["POST"]
