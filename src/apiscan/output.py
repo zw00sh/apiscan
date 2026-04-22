@@ -199,7 +199,7 @@ def print_banner(target: str, route_count: int,
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v1.5.1{r}\n")
+    print(f" {d}api content discovery · v1.5.2{r}\n")
     print(f"  target:   {target}")
     print(f"  routes:   {route_count}")
     g = GREEN if use_color else ""
@@ -380,8 +380,10 @@ class ProgressTracker:
             queue_str = ""
 
         print(f"\033[2K\r", end="", file=sys.stderr, flush=True)
+        sent_str = f"| {d}{_fmt(reqs_sent)} sent{r} " if reqs_sent else ""
         line = (f"[{g}{route_bar}{r}{d}{route_pct:2.0f}%{r}] "
                 f"|   {d}{self.routes_completed}/{self.route_total} routes{r} "
+                f"{sent_str}"
                 f"| {d}{rps:.0f} req/s{r} {queue_str} "
                 f"| {c}{self.findings} found{r} "
                 f"{hidden_str}")

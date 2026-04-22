@@ -8,6 +8,7 @@ import tempfile
 
 from apiscan.output import (
     CSVWriter,
+    ProgressTracker,
     ScanResult,
     build_curl,
     format_findings_tree,
@@ -261,6 +262,25 @@ class TestBanner:
                      lookahead=False)
         output = capsys.readouterr().out
         assert "lookahead disabled" in output
+
+
+class TestProgressTracker:
+    def test_status_bar_shows_sent_count(self, capsys):
+        """The status bar should display how many HTTP requests have been sent."""
+
+        class FakeTracker:
+            sent = 42
+            planned = 100
+            routes_planned = 50
+            queue_size = None
+            skipped_fn = None
+            blocked_fn = None
+
+        progress = ProgressTracker(50, use_color=False, tracker=FakeTracker())
+        progress.findings = 3
+        progress._print(progress._start + 1.0)
+        output = capsys.readouterr().err
+        assert "42 sent" in output
 
 
 class TestFindingsTree:

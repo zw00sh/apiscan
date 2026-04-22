@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "apiscan"
-version = "1.5.1"
+version = "1.5.2"
 description = "Method-aware API content discovery using wordlists"
 license = "AGPL-3.0-only"
 authors = []
