@@ -20,6 +20,7 @@ from apiscan.output import (
     GREEN,
     RESET,
     CSVWriter,
+    LogWriter,
     ProgressTracker,
     ScanResult,
     format_findings_tree,
@@ -95,7 +96,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     output = p.add_argument_group("output")
     output.add_argument("-o", "--output", default=None, metavar="PATH",
-                        help="Write CSV results to file (includes curl replay column)")
+                        help="Base path for output files (default: <target>_<timestamp>). "
+                             ".csv/.log extensions are appended automatically and may be stripped if present")
+    output.add_argument("--log", action="store_true",
+                        help="Also write a dirsearch-style .log file alongside the CSV")
     output.add_argument("--replay-proxy", default=None, metavar="URL",
                         help="Replay findings through a proxy (e.g. http://127.0.0.1:8080 for Burp)")
     output.add_argument("-v", "--verbose", action="store_true",
@@ -124,6 +128,29 @@ def _parse_headers(raw: list[str]) -> dict[str, str]:
         k, v = h.split(":", 1)
         headers[k.strip()] = v.strip()
     return headers
+
+
+def _sanitize_target(url: str) -> str:
+    """Turn a target URL into a filesystem-safe fragment (host[_port])."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    netloc = parsed.netloc or parsed.path or "scan"
+    # Strip credentials, replace : with _, drop anything path-like
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+    safe = netloc.replace(":", "_").replace("/", "_")
+    return safe or "scan"
+
+
+def _resolve_output_base(output_arg: str | None, url: str, timestamp: str) -> str:
+    """Return the base path (no extension) for CSV/log output files."""
+    if output_arg:
+        base = output_arg
+        for ext in (".csv", ".log"):
+            if base.endswith(ext):
+                return base[: -len(ext)]
+        return base
+    return f"{_sanitize_target(url)}_{timestamp}"
 
 
 def _parse_codes(raw: str | None) -> set[int] | None:
@@ -197,7 +224,18 @@ async def _scan(args: argparse.Namespace) -> None:
         on_tick=lambda: progress.tick_request() if progress else None,
     )
 
-    csv_writer = CSVWriter(args.output, replay_proxy=args.replay_proxy) if args.output else None
+    output_base = _resolve_output_base(args.output, args.url, time.strftime("%Y%m%d_%H%M%S"))
+    csv_path = f"{output_base}.csv"
+    log_path = f"{output_base}.log" if args.log else None
+    csv_writer = CSVWriter(csv_path, replay_proxy=args.replay_proxy)
+    log_writer = LogWriter(log_path, target=args.url, argv=sys.argv) if log_path else None
+    if not suppress_ui:
+        d2 = DIM if use_color else ""
+        r2 = RESET if use_color else ""
+        print(f"  {d2}csv:      {csv_path}{r2}")
+        if log_path:
+            print(f"  {d2}log:      {log_path}{r2}")
+        print()
     progress = ProgressTracker(len(routes), use_color, tracker=req_tracker) if not suppress_ui else None
     # Re-bind the tick callback now that progress exists
     req_tracker._on_tick = progress.tick_request if progress else None
@@ -233,6 +271,8 @@ async def _scan(args: argparse.Namespace) -> None:
     def on_result(result: ScanResult) -> None:
         if csv_writer:
             csv_writer.write_result(result)
+        if log_writer:
+            log_writer.write_result(result)
         if replay_client:
             asyncio.create_task(_replay(result))
         if args.json:
@@ -338,6 +378,9 @@ async def _scan(args: argparse.Namespace) -> None:
 
     if csv_writer:
         csv_writer.close()
+
+    if log_writer:
+        log_writer.close()
 
     if args.debug and scan_tree is not None:
         print(f"\n{d}--- scan tree ---{r}", file=sys.stderr)

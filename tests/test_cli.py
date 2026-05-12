@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from apiscan.__main__ import _build_parser, _replay_methods
+from apiscan.__main__ import _build_parser, _replay_methods, _resolve_output_base, _sanitize_target
 from apiscan.output import ScanResult
 
 
@@ -184,6 +184,60 @@ class TestMethodFlags:
     def test_all_methods_and_m_mutex(self):
         with pytest.raises(SystemExit):
             self._parse("-u", "http://x", "-m", "GET", "--all-methods")
+
+
+class TestLogFlag:
+    def _parse(self, *args: str):
+        parser = _build_parser()
+        return parser.parse_args([*args])
+
+    def test_log_flag_default_off(self):
+        ns = self._parse("-u", "http://x")
+        assert ns.log is False
+
+    def test_log_flag_on(self):
+        ns = self._parse("-u", "http://x", "--log")
+        assert ns.log is True
+
+
+class TestSanitizeTarget:
+    def test_strips_scheme_and_punctuation(self):
+        assert _sanitize_target("https://example.com") == "example.com"
+
+    def test_keeps_port_safely(self):
+        out = _sanitize_target("http://example.com:8080/api")
+        assert "example.com" in out
+        assert "8080" in out
+        assert "/" not in out
+        assert ":" not in out
+
+    def test_empty_returns_fallback(self):
+        assert _sanitize_target("") != ""
+
+
+class TestResolveOutputBase:
+    def test_default_uses_target_and_timestamp(self):
+        base = _resolve_output_base(output_arg=None, url="https://example.com",
+                                     timestamp="20260512_143000")
+        assert "example.com" in base
+        assert "20260512_143000" in base
+
+    def test_output_arg_overrides(self):
+        base = _resolve_output_base(output_arg="/tmp/myrun", url="https://example.com",
+                                     timestamp="20260512_143000")
+        assert base == "/tmp/myrun"
+
+    def test_output_arg_strips_csv_extension(self):
+        base = _resolve_output_base(output_arg="/tmp/myrun.csv",
+                                     url="https://example.com",
+                                     timestamp="20260512_143000")
+        assert base == "/tmp/myrun"
+
+    def test_output_arg_strips_log_extension(self):
+        base = _resolve_output_base(output_arg="/tmp/myrun.log",
+                                     url="https://example.com",
+                                     timestamp="20260512_143000")
+        assert base == "/tmp/myrun"
 
 
 class TestReplayMethods:

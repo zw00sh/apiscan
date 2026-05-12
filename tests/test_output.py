@@ -8,6 +8,7 @@ import tempfile
 
 from apiscan.output import (
     CSVWriter,
+    LogWriter,
     ProgressTracker,
     ScanResult,
     build_curl,
@@ -217,6 +218,73 @@ class TestCSVWriter:
             os.unlink(path)
 
 
+class TestLogWriter:
+    def test_writes_header_and_entries(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            path = f.name
+        try:
+            writer = LogWriter(path, target="https://example.com", argv=["apiscan", "-u", "https://example.com"])
+            writer.write_result(_make_result(status_code=200, method="GET",
+                                              path="/api/users", content_length=1024,
+                                              timestamp="2026-05-12T14:30:01"))
+            writer.write_result(_make_result(status_code=405, method="POST",
+                                              path="/api/admin", content_length=42,
+                                              timestamp="2026-05-12T14:30:02"))
+            writer.close()
+            with open(path) as f:
+                content = f.read()
+            # Header
+            assert "apiscan" in content
+            assert "https://example.com" in content
+            # Entries — dirsearch style: [time] STATUS - METHOD - SIZE - PATH
+            assert "14:30:01" in content
+            assert "200" in content
+            assert "GET" in content
+            assert "/api/users" in content
+            assert "405" in content
+            assert "POST" in content
+            assert "/api/admin" in content
+        finally:
+            os.unlink(path)
+
+    def test_entry_format_dirsearch_style(self):
+        """Each line should follow dirsearch convention: bracketed time, status, size, path."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            path = f.name
+        try:
+            writer = LogWriter(path, target="https://example.com", argv=["apiscan"])
+            writer.write_result(_make_result(status_code=200, method="GET",
+                                              path="/x", content_length=1500,
+                                              timestamp="2026-05-12T09:00:00"))
+            writer.close()
+            with open(path) as f:
+                lines = [ln for ln in f.read().splitlines() if ln and not ln.startswith("#")]
+            assert len(lines) == 1
+            line = lines[0]
+            assert line.startswith("[09:00:00]")
+            assert "200" in line
+            assert "/x" in line
+            assert "1.5KB" in line or "1500B" in line or "1.5K" in line
+        finally:
+            os.unlink(path)
+
+    def test_redirect_location_included(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            path = f.name
+        try:
+            writer = LogWriter(path, target="https://example.com", argv=["apiscan"])
+            writer.write_result(_make_result(status_code=301, method="GET",
+                                              path="/old", redirect_location="/new",
+                                              timestamp="2026-05-12T09:00:00"))
+            writer.close()
+            with open(path) as f:
+                content = f.read()
+            assert "/old" in content
+            assert "/new" in content
+        finally:
+            os.unlink(path)
+
+
 class TestBanner:
     def test_banner_shows_methods(self, capsys):
         print_banner("http://example.com", 90, ["GET", "POST"], use_color=False)
@@ -281,6 +349,41 @@ class TestProgressTracker:
         progress._print(progress._start + 1.0)
         output = capsys.readouterr().err
         assert "42 sent" in output
+
+    def test_status_bar_sent_count_is_exact_no_rounding(self, capsys):
+        """The sent counter must show the exact integer, not '1.5k' style truncation."""
+
+        class FakeTracker:
+            sent = 1523
+            planned = 5000
+            routes_planned = 2000
+            queue_size = None
+            skipped_fn = None
+            blocked_fn = None
+
+        progress = ProgressTracker(2000, use_color=False, tracker=FakeTracker())
+        progress._print(progress._start + 1.0)
+        output = capsys.readouterr().err
+        assert "1523 sent" in output or "1,523 sent" in output
+        assert "1.5k sent" not in output
+
+    def test_status_bar_sent_count_large_value(self, capsys):
+        """A million sent requests still displays exactly."""
+
+        class FakeTracker:
+            sent = 1_234_567
+            planned = 2_000_000
+            routes_planned = 1_000_000
+            queue_size = None
+            skipped_fn = None
+            blocked_fn = None
+
+        progress = ProgressTracker(1_000_000, use_color=False, tracker=FakeTracker())
+        progress._print(progress._start + 1.0)
+        output = capsys.readouterr().err
+        # Either bare or with thousands separators — anything but a truncated form
+        assert ("1234567" in output) or ("1,234,567" in output)
+        assert "1.2M" not in output and "1234.6k" not in output
 
 
 class TestFindingsTree:

@@ -199,7 +199,7 @@ def print_banner(target: str, route_count: int,
     d = DIM if use_color else ""
     c = CYAN if use_color else ""
     print(f"\n{c}{BANNER}{r}")
-    print(f" {d}api content discovery · v1.5.2{r}\n")
+    print(f" {d}api content discovery · v1.6.0{r}\n")
     print(f"  target:   {target}")
     print(f"  routes:   {route_count}")
     g = GREEN if use_color else ""
@@ -245,6 +245,56 @@ class CSVWriter:
             "; ".join(f"{k}: {v}" for k, v in result.new_headers) if result.new_headers else "",
             result.reason, result.confidence, build_curl(result, self._proxy),
         ])
+
+    def close(self) -> None:
+        self._file.close()
+
+
+# ---------------------------------------------------------------------------
+# Log writer (dirsearch-style)
+# ---------------------------------------------------------------------------
+
+def _fmt_size_label(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}MB"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}KB"
+    return f"{n}B"
+
+
+class LogWriter:
+    """Append-style scan log in a dirsearch-compatible format.
+
+    Header records when/how the scan was launched; each finding becomes one
+    line: `[HH:MM:SS] STATUS - METHOD - SIZE - PATH (→ redirect)`.
+    """
+
+    def __init__(self, path: str, target: str, argv: list[str] | None = None) -> None:
+        from apiscan import __version__
+        self._file = open(path, "w")
+        started = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._file.write(f"# apiscan v{__version__} started {started} against {target}\n")
+        if argv:
+            self._file.write(f"# args: {' '.join(argv)}\n")
+        self._file.write("# " + "-" * 60 + "\n")
+        self._file.flush()
+
+    def write_result(self, result: ScanResult) -> None:
+        # Pull HH:MM:SS from the ISO timestamp; fall back to current time.
+        ts = result.timestamp or ""
+        if "T" in ts:
+            clock = ts.split("T", 1)[1][:8]
+        else:
+            clock = time.strftime("%H:%M:%S")
+        size = _fmt_size_label(result.content_length)
+        method = result.method if result.method != "*" else "ANY"
+        line = f"[{clock}] {result.status_code:>3} - {method:<7} - {size:>8} - {result.path}"
+        if result.redirect_location:
+            line += f"  ->  {result.redirect_location}"
+        if result.boundary_info:
+            line += f"  ({result.boundary_info})"
+        self._file.write(line + "\n")
+        self._file.flush()
 
     def close(self) -> None:
         self._file.close()
@@ -380,7 +430,7 @@ class ProgressTracker:
             queue_str = ""
 
         print(f"\033[2K\r", end="", file=sys.stderr, flush=True)
-        sent_str = f"| {d}{_fmt(reqs_sent)} sent{r} " if reqs_sent else ""
+        sent_str = f"| {d}{reqs_sent:,} sent{r} " if reqs_sent else ""
         line = (f"[{g}{route_bar}{r}{d}{route_pct:2.0f}%{r}] "
                 f"|   {d}{self.routes_completed}/{self.route_total} routes{r} "
                 f"{sent_str}"

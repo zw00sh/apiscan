@@ -1,7 +1,7 @@
 ```
  ▄▀█ █▀█ █ █▀ █▀▀ ▄▀█ █▄ █
  █▀█ █▀▀ █ ▄█ █▄▄ █▀█ █ ▀█
- api content discovery · v1.5.2
+ api content discovery · v1.6.0
 ```
 
 Method-aware API content discovery tool. Ships with curated wordlists built from 26k+ Swagger specs, HTTP Archive traffic data, and SecLists.
@@ -39,6 +39,16 @@ Or bring your own wordlist:
 apiscan -u https://target.com -w /path/to/wordlist.txt
 ```
 
+### Output files
+
+By default, results are written to `<target>_<timestamp>.csv` in the current directory. Add `--log` to also emit a dirsearch-style `.log` file. Use `-o BASE` to override the base path — both writers honour it:
+
+```
+apiscan -u https://target.com                     # writes target.com_20260512_143000.csv
+apiscan -u https://target.com --log               # also writes target.com_20260512_143000.log
+apiscan -u https://target.com -o runs/myscan --log  # runs/myscan.csv + runs/myscan.log
+```
+
 ### Flags
 
 | Flag | Default | Description |
@@ -60,7 +70,8 @@ apiscan -u https://target.com -w /path/to/wordlist.txt
 | `--no-lookahead` | off | Disable lookahead probing of common segments at leaf nodes |
 | `-i, --include` | - | Only report these status codes (e.g. `200,301,403`) |
 | `-e, --exclude` | - | Never report these status codes (e.g. `429,500`) |
-| `-o, --output` | - | Write results to CSV (includes curl replay column) |
+| `-o, --output` | `<target>_<timestamp>` | Base path for output files. A `.csv` is always written; `.log` is added when `--log` is set. Trailing `.csv`/`.log` is stripped |
+| `--log` | off | Also write a dirsearch-style `.log` file alongside the CSV |
 | `--replay-proxy` | - | Replay findings through a proxy (e.g. Burp) |
 | `-v, --verbose` | off | Show additional details |
 | `--json` | off | Output findings as JSON lines |
